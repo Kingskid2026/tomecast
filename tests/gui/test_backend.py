@@ -29,6 +29,7 @@ from tomecast.gui import backend as backend_module
 from tomecast.gui.backend import STOPPED_MESSAGE, Backend, safe_file_name, unique_output
 from tomecast.gui.models import ChapterModel, display_title, summarize
 from tomecast.gui.worker import TimedControl, preview_file
+from tomecast.textprep import TextPrep
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # for epub_factory, pdf_factory
 from epub_factory import NavPoint, Page, build_epub, tiny_png
@@ -1780,4 +1781,6 @@ def test_a_pdf_is_voiced_without_its_page_furniture(
     voiced = " ".join(engines.texts)
     assert "THE GIFT OF THE MAGI" not in voiced
     title, paragraphs = SAMPLE_CHAPTERS[2]
-    assert voiced == " ".join([title, *(plain(p) for p in paragraphs)])
+    # Spoken as text prep says it ("III." as "three.", "$8 flat" as "eight-dollar flat").
+    prep = TextPrep.for_language("en")
+    assert voiced == " ".join([prep.heading(title), *(prep.body(plain(p)) for p in paragraphs)])

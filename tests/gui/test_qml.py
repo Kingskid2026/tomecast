@@ -640,7 +640,8 @@ def test_backend_property_list_matches_the_contract(backend: DemoBackend) -> Non
 
 
         "bookHasPages", "skipPageNumbers",
-        "footnotesAtEnd", "previewAvailable", "downloadNote", "stage", "downloadLabel", "chunksDone", "chunksTotal",
+        "footnotesAtEnd", "previewAvailable", "downloadNote", "stage", "downloadLabel",
+        "chunksDone", "chunksTotal",
         "chapterLabel", "timeLeft", "progressLabel", "speedLabel", "nowSpeaking", "paused",
         "outputPath", "audioLength", "doneSummary", "warnings",
     }  # fmt: skip

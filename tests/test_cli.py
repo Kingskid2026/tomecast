@@ -30,8 +30,6 @@ class FakeKokoro:
     gpu_warning: str | None = None  # set: a use_gpu run falls back to the CPU
     texts: ClassVar[list[str]] = []  # everything the voice was asked to say, across all instances
 
-    texts: ClassVar[list[str]] = []  # everything voiced, in order
-
     def __init__(self, root: Path, *, voice: str, speed: float, use_gpu: bool = False) -> None:
         self.label = f"Fake ({voice})"
         self.max_chars = 200
@@ -518,10 +516,10 @@ def test_names_limit_shows_the_most_frequent(
 def test_names_explains_bad_input(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     assert cli.main(["names", str(tmp_path / "missing.epub")]) == 1
     assert "doesn't exist" in capsys.readouterr().err
-    pdf = tmp_path / "book.pdf"
-    pdf.write_bytes(b"%PDF-1.7")
-    assert cli.main(["names", str(pdf)]) == 1
-    assert "can't read .pdf files" in capsys.readouterr().err
+    odt = tmp_path / "book.odt"  # a format Tomecast doesn't read
+    odt.write_bytes(b"PK\x03\x04 not really")
+    assert cli.main(["names", str(odt)]) == 1
+    assert "can't read .odt files" in capsys.readouterr().err
 
 
 # --- preview ----------------------------------------------------------------------------------
@@ -748,9 +746,10 @@ def test_convert_cleanup_options(tmp_path: Path, capsys: pytest.CaptureFixture[s
     assert "Left out: footnote markers (1)." in out
     assert "Converting “A Story”: 3 chapters" in out
     assert " ".join(FakeKokoro.texts) == (
-        "Contents Chapter One ........ 1 Chapter Two ........ 2 Afterword ........ 3 A STORY "
-        "Chapter One It began. It went on. 1 A STORY As stories do. Chapter Two It ended "
-        "without a 2 A STORY period 3"
+        # Kept page numbers and headers are spoken like any text, numbers as words.
+        "Contents Chapter One ........ one Chapter Two ........ two Afterword ........ three "
+        "A STORY Chapter One It began. It went on. one A STORY As stories do. Chapter Two "
+        "It ended without a two A STORY period three"
     )
 
 
