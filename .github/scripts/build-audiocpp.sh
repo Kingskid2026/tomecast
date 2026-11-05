@@ -76,7 +76,7 @@ build_vulkan_tools() {
         read -r name url sha <<<"$entry"
         fetch "$url" "$sha" "$vsrc/$name"
     done
-    rm -rf "$prefix"
+    mkdir -p "$prefix" && find "$prefix" -mindepth 1 -delete # may be a mount point
     cmake -S "$vsrc/vulkan-headers" -B "$work/build-headers" -DCMAKE_INSTALL_PREFIX="$prefix"
     cmake --install "$work/build-headers"
     # Only linked against at build time: at run time the system's own libvulkan.so.1 is used.
@@ -133,9 +133,10 @@ cmake_args=(
     # Portability: AVX2-era CPU kernels instead of -march=native on the build machine.
     -DENGINE_ENABLE_NATIVE_CPU=OFF
     -DGGML_SSE42=ON -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_BMI2=ON
-    # Portability: the C++ and OpenMP runtimes go inside the binary.
-    "-DCMAKE_EXE_LINKER_FLAGS=-static-libstdc++ -static-libgcc -L$static_libs"
-    "-DCMAKE_CXX_STANDARD_LIBRARIES=-ldl -lpthread"
+    # Portability: the C++ and OpenMP runtimes go inside the binary. The static libgomp
+    # needs libdl and libpthread, which glibc 2.28 still has as separate libraries. They're
+    # in the linker flags so CMake's own OpenMP check links the same way.
+    "-DCMAKE_EXE_LINKER_FLAGS=-static-libstdc++ -static-libgcc -L$static_libs -Wl,--no-as-needed -ldl -lpthread"
 )
 if [ "$variant" = vulkan ]; then
     tools=${VULKAN_TOOLS:-$work/vulkan-tools}
@@ -161,7 +162,10 @@ fi
 # --- Build --------------------------------------------------------------------------------
 build="$work/build"
 log "Configuring audio.cpp $AUDIOCPP_VERSION ($variant)"
-cmake -S "$src" -B "$build" "${cmake_args[@]}"
+if ! cmake -S "$src" -B "$build" "${cmake_args[@]}"; then
+    tail -n 150 "$build/CMakeFiles/CMakeConfigureLog.yaml" >&2 || true
+    exit 1
+fi
 log "Building audiocpp_server with $jobs jobs"
 cmake --build "$build" --parallel "$jobs" --target audiocpp_server
 [ -n "${CCACHE_DIR:-}" ] && ccache --show-stats
