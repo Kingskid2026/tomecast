@@ -72,6 +72,8 @@ select = [
 [tool.ruff.lint.per-file-ignores]
 # Tests use real Chinese/Japanese text, whose fullwidth punctuation looks like ASCII.
 "tests/**" = ["RUF001"]
+# Long word lists read better as one string than as a list of strings.
+"src/tomecast/textprep_en.py" = ["SIM905"]
 
 [tool.mypy]
 strict = true

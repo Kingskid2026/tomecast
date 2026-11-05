@@ -89,14 +89,26 @@ Rules, checked in this order:
 Known issue to watch: reading order is the hard part. Even Docling's own reading-order step sometimes moves a list or footnote above a heading ([docling#4433](https://github.com/docling-project/docling/issues/4433)). The chapter-list review screen is the safety net.
 
 ### 3. Text prep
-- Split into sentence-sized chunks for the voice model.
-- Expand numbers, years, dates, "Dr.", "St.", roman numerals in headings ("Chapter XIV" → "Chapter fourteen").
-- **Pronunciation fixes:**
-  - A **global list** plus a **per-book list** of *written → say it as* pairs (e.g. Hermione → her-MY-oh-nee). Stored as plain text so it's easy to edit.
-  - **Name finder:** before converting, list words that appear often but aren't in a dictionary (usually names and places) so the user can check them.
-  - **Try it:** type a word, hear it immediately, adjust the spelling.
-  - Advanced: exact phonetic spellings (IPA) aren't possible yet, because audio.cpp v0.9.4 only accepts them through its C library, not its server. Lower-case respellings work.
-- **Made-up languages:** Kokoro sounds out unknown words with eSpeak NG's spelling rules (checked: "Namárië" becomes /nˈæməɹɹˌɪɛ/), and Ming guesses from the spelling. Both read *something* reasonable, and the list fixes the rest.
+Text prep turns written text into speakable text, deterministically, in **one place**: `plan_chunks` in `convert.py`, between the Book and chunking. The window and the terminal command both go through it. Code: `textprep.py` (the framework and the safety net), `textprep_en.py` (English rules), `pronunciations.py` (the lists) and `names.py` (the name finder).
+
+- **Sentence-sized chunks** come after it (section 4 and "Core guarantee"), so numbers are already words by the time the size cap is checked. That matters: long numbers are the usual reason a chunk hits the 510-phoneme limit.
+- **English rules** (rules are per language; the book's language picks them, and a book with no language set is treated as English):
+  - Numbers: cardinals up to a quadrillion (`1,250` → "one thousand two hundred fifty"), ordinals (`1st`), decimals, negatives, fractions (`3/4`, `1 1/2`, `½`), ranges (`5-7` → "five to seven"). Leading zeros and huge numbers are read digit by digit, and phone numbers digit by digit in groups.
+  - Years only in year-like places: after *in, since, until, by, from, during, between...*, after *War of*, *Panic of* and similar, before AD/BC, in ranges (`1914-18`) and as decades (`1860s`, `'60s`). `1865` → "eighteen sixty-five", `1905` → "nineteen oh five", `2010` → "twenty ten". A bare `1500 men` stays a quantity: "one thousand five hundred men".
+  - Dates (`4 July 1776` → "the fourth of July, seventeen seventy-six"; `July 4, 1776`; `2024-03-05`; US-style `12/25`), times (`3:45 p.m.`, `10 a.m.`, `14:30`), currency (`$5.50` → "five dollars and fifty cents", `£3`, `€10`, `$3.5 million`) and percentages.
+  - Abbreviations: *Mr., Mrs., Ms., Dr., Prof., Rev., Gen., Capt., Lt., Sgt., Mt., Ft., Jr., Sr., Inc., Ltd., e.g., i.e., etc., vs., cf., et al., No. 5, p. 12, Fig. 3, Vol. 2, ch. 4, A.D., B.C.* The ambiguous ones use context: `St.` is Saint before a capitalised word (`St. Paul`) and Street after a capitalised name (`Baker St.`); `Dr.` is Doctor before a name and Drive after a street name; a title like `Gen.` is only expanded when a name follows. When an abbreviation's period also ends the sentence (`etc.`, `p.m.`), the full stop is kept so the chunker still splits there.
+  - Roman numerals: after *Chapter, Book, Part, Act, Volume, Section...* (`Chapter XII` → "Chapter twelve"), after a name as a regnal number (`Henry VIII` → "Henry the eighth"), and as a bare chapter title (`XIV.` → "fourteen."). `Malcolm X`, `Vitamin C` and the pronoun *I* are left alone.
+  - Letters in abbreviations are written out as sounds ("ay em", "pee em", "bee see"), because eSpeak reads a lone capital `A` as the word *a*.
+- **Nothing is ever dropped.** Rules only replace a written form with words that say the same thing. On top of that, every paragraph is checked (`words_lost`): if a rule would lose a word, that paragraph is voiced as written. Tests cover every rule with exact expected output, plus a test that every input word survives or is a known expansion.
+- **Other languages** plug in by registering an object with `heading()` and `body()` in `textprep.RULES`. Until then a book in another language is voiced as written (the pronunciation lists still apply).
+- **Pronunciation fixes** are plain text files of *written → say it as* lines (the exact format is in the README):
+  - A **global list**, `~/.local/share/tomecast/pronunciations.txt`, and a **per-book list** next to the book file (`Title.epub` → `Title.pronunciations.txt`). Next to the book was chosen over a folder keyed by the book's hash because it is easy to find and edit, and it travels with the book. The book's list wins over the global one. The same lists are used by the terminal command, and the window will use them too ([#10](https://github.com/Kingskid2026/tomecast/issues/10)).
+  - Whole-word matching. A left side in lowercase matches any case; one with a capital matches that spelling and its ALL-CAPS version. Fixes are applied *before* the rules, so a fix can cover an abbreviation (`Dr. Who → the Doctor`).
+  - **Right-hand sides are respellings, not phonemes** (see "Phonetic spellings" in section 10 for why). Capitalised syllables are lowercased before voicing because eSpeak spells all-caps words letter by letter.
+  - A line the program can't use (no arrow, or an IPA `/value/`) is skipped with a warning that names the line.
+- **Name finder** (`tomecast names BOOK`, and `names.find_book_names(book)` for the window): lists capitalised words that are used at least 3 times, were seen capitalised somewhere other than at the start of a sentence, are not in the common-word list and are never written in lowercase in the book (so "Table" is not a name). Counts are listed most frequent first, and words that already have a fix are left out. The common-word list (`data/common_words.txt`, about 22,000 words) is built by `scripts/make_wordlist.py` from public-domain Project Gutenberg books, so it has no license of its own.
+- **Hear a word:** `tomecast preview "text"` voices the text with the chosen voice and speed and plays it (pw-play, paplay or aplay), or saves it with `-o file.wav`. It applies the same lists and rules as a conversion, so you hear what the book will sound like; `--raw` says it exactly as typed. There is no `--phonemes` option, for the reason below.
+- **Made-up languages:** Kokoro sounds out unknown words with eSpeak NG's spelling rules (measured in section 10), so it reads *something* reasonable, and the list fixes the rest.
 
 ### 4. Voice engines
 Both sit behind one small interface (`voices()`, `languages()`, `synthesize(chunk, voice, speed)`), so more engines can be added later.
@@ -117,7 +129,7 @@ Both sit behind one small interface (`voices()`, `languages()`, `synthesize(chun
 - 82M parameters, Apache 2.0, 54 voices. Languages: English (US/UK), Spanish, French, Italian, Portuguese, Hindi, Japanese, Chinese.
 - The English file is ~190 MB. Non-English books use a larger multilingual file (~0.93 GB), downloaded only when one shows up.
 - Runs on CPU, or on any graphics card through Vulkan.
-- Pronunciation of unknown words is checked (above). Q8_0 vs BF16 by ear is still open ([#3](https://github.com/Kingskid2026/tomecast/issues/3)).
+- Pronunciation of unknown words, phonetic spellings and Q8_0 vs BF16 are checked in section 10 ([#3](https://github.com/Kingskid2026/tomecast/issues/3)): Q8_0 stays.
 
 **Ming-3.0-tts 0.5B (premium, graphics card)**
 - MIT license. Built-in voices include **UK_George** (labelled "audiobooks") and **US_Emma** (labelled "narration"). Languages: English, Chinese, German, Spanish, French, Korean, Japanese. Output is 44.1 kHz.
@@ -187,7 +199,7 @@ Both sit behind one small interface (`voices()`, `languages()`, `synthesize(chun
   4. Pronunciation tab with the name finder and Try it.
   5. Convert, with progress, time left, and Pause/Resume.
   6. "Open output folder".
-- **Terminal:** `tomecast convert book.epub --voice UK_George --format m4b`, plus `tomecast voices`, `tomecast preview "text"`, `tomecast scan`. Easy for a techy user to script over a folder of books.
+- **Terminal:** `tomecast convert book.epub --voice UK_George --format m4b`, plus `tomecast voices`, `tomecast preview "text"`, `tomecast names book.epub`, `tomecast scan`. Easy for a techy user to script over a folder of books.
 
 ### 9. Install: the app sets everything up itself
 Users paste **one line** into a terminal: `curl -fsSL https://raw.githubusercontent.com/Kingskid2026/tomecast/main/install.sh | sh`. No `sudo`: everything goes into the user's home folder.
@@ -236,12 +248,33 @@ Rules of thumb from the research (2026-11-05):
 
 | Model | File used | Size | Second copy? | Why |
 |---|---|---|---|---|
-| **Kokoro** 82M | Q8_0 or BF16 GGUF (audio.cpp): whichever wins the step-2 listening test | 190 / 210 MB | No | Only 20 MB apart. **Avoid the common INT8 ONNX file.** It also quantizes activations, and was measured adding a steady tinny tone (4.8/9.6 kHz) and occasional garbled sentences, while running *slower* than full precision |
+| **Kokoro** 82M | **Q8_0** GGUF (audio.cpp). BF16 is not needed: measured, no artefact (see below) | 190 / 212 MB | No | Only 22 MB apart. **Avoid the common INT8 ONNX file.** It also quantizes activations, and was measured adding a steady tinny tone (4.8/9.6 kHz) and occasional garbled sentences, while running *slower* than full precision |
 | **Ming-3.0-tts** 0.5B | **Q8_0 GGUF** (audio.cpp, official) | 1.74 GB (BF16: 3.0 GB) | No | In audio.cpp's tests, Q8 runs up to ~1.5× faster with ~37% less graphics memory than 16-bit. Below 8-bit isn't officially possible, because its 896-wide layers don't fit llama.cpp's 4–6-bit formats. A community 6.4-bit file (1.39 GB) exists, but from an uploader we can't vouch for |
 | **Docling Heron** 43M | FP32 (ONNX) | 170 MB | No | Already under a second per page. An INT8 version that quantizes only the image-reading part (a similar detector lost ~0.5 accuracy points that way) gets tested, and is used only if it matches FP32 on our PDFs *and* is actually faster |
 | **PaddleOCR-VL-1.6** | **Q4_K_M** language part + **BF16** vision part | ~0.3 + 0.88 GB | **Yes: Q8_0 (~0.5 GB)** | In one 4-bit test, 2 of 20 pages came out broken (0 of 20 at full precision), while intact pages were within ~1%. So pages are read at Q4, and any broken or garbled page is re-read with the Q8 copy. Both copies are made locally from one official download. The vision part breaks when quantized, so it stays full |
 | **LFM3-1.7B** | **QAD-Q4_0** | 1.05 GB | No (Q8_0, 1.85 GB, only if testing calls for it) | Trained by Liquid to recover 4-bit losses. Its keep/drop job is forgiving, and it can never retype text. We measure its drift from full precision with llama.cpp's KL-divergence tool |
 | MiniCPM5-2B (backup) | Q4_K_M | 1.56 GB | — | Only if LFM3 fails its tests |
+
+#### Kokoro on audio.cpp: what was measured ([#3](https://github.com/Kingskid2026/tomecast/issues/3), 2026-11-05)
+Real runs on the maintainer's machine, with audio.cpp 0.9.4 (CPU build) and the pinned Q8_0 file. The checks below were made from the signal and from eSpeak's phonemes; no one has listened to the files yet, so the by-ear judgment is still to do.
+
+- **Made-up words.** *Galadriel whispered, "Namárië," as the boats drifted toward Lothlórien.* produced a normal 5.03 s file (peak 0.44 of full scale, average level 0.05, about 14 characters per second, ends in the usual short pad of silence, and it passes Tomecast's own `audio_problem` check), so unknown words are not dropped or cut. Kokoro never sees the spelling: eSpeak NG 1.52 turns every word into phonemes first, and for unknown words it uses its English spelling rules. Called directly, the same library gives:
+  - *Galadriel* → `ɡælˈædɹiːəl` ("gal-AD-ree-ul": stress too late, and the first vowel is a short *a* instead of *uh*)
+  - *Namárië* → `nˈæmɚɹˌɪɛ` ("NAM-er-ih-eh": the accents are ignored and the vowels are English ones, not *nah-MAH-ree-eh*)
+  - *whispered* `wˈɪspɚd`, *drifted* `dɹˈɪftᵻd`, *Lothlórien* `ləθlˈɔːɹiən` ("luh-th-LOR-ee-un", close to *loth-LOR-ee-en*)
+
+  So made-up names come out as readable, plausible English guesses, and some need a fix. The server doesn't log the phonemes (its log only has start-up lines), so these come from calling eSpeak's own library with the same data folder. `tomecast names` and the pronunciation lists are the answer for the ones that are off.
+- **Exact phonetic spellings: not possible through audio.cpp 0.9.4's server or command line.**
+  - Kokoro has a `phonemes` request option that skips eSpeak ("Kokoro-vocabulary phonemes to synthesize directly", one list entry per chunk) in the model spec and the source.
+  - But it is a *list* option, and only the C library (`audiocpp_request_set_option_array`) can set a list. The server's `options` object and the command line's `--request-option` only fill string options, so `options.phonemes` is silently ignored. Tested: the audio with and without it is byte for byte identical, for both a valid and a deliberately broken phoneme string.
+  - eSpeak's inline `[[phonemes]]` markup doesn't work either: its phoneme call reads the brackets out as letters ("g, at, el...").
+  - So pronunciation lists use **respellings**, spoken through eSpeak like any other text. Findings that shaped the format: all-caps words are spelled letter by letter (so stress capitals are lowercased automatically), and a hyphen makes each piece its own stressed word (`her-my-oh-nee` → `hɜːmaɪˈoʊnˈiː`), so a respelling should be tried with `tomecast preview`, and `shi-vawn` for *Siobhan* works (`ʃivˈɔːn`). Supporting `/IPA/` later would need a way to pass a list (the C library through a small helper, or a future server version): not worth it yet.
+- **Q8_0 vs BF16.** The BF16 file (212 MB, from the same Hugging Face commit as the pinned Q8_0, SHA-256 `0d2c2afa...`) was downloaded into a scratch folder only, and the same sentences voiced with both (same voice, same seed). For two passages (14 s and 18 s), a numpy spectrum of each (4096-point FFT averaged over the file) showed:
+  - Average level in every band from 0 to 12 kHz within about 0.4 dB of each other.
+  - No narrow tone at 4.8 kHz in either (within about 1.5 dB of the surrounding spectrum), and only a faint, equal bump at 9.6 kHz in both (+4.3 dB for Q8_0 and +5.1 dB for BF16 on the first passage, +2.8 and +2.5 dB on the second), so it belongs to Kokoro's vocoder and not to the quantization. In the quietest 20% of frames (the pauses), Q8_0 showed no tone that BF16 lacked; if anything BF16's pauses had the stronger 9.6 kHz bump on the first passage (+9.2 dB against +1.2 dB, from only 32 frames, so noisy).
+  - The INT8 artefact comes from *activation* quantization in the ONNX file; Q8_0 GGUF quantizes only weights, which is why the rule of thumb at the top of this section holds here.
+
+  **Decision: keep Q8_0.** Switching to BF16 would cost 22 MB for no measured gain. (On this CPU, one run each: Q8_0 2.9× and BF16 3.3× faster than real time, so BF16 is not slower either, but that is a single noisy run and the speed checks are tracked separately.)
 
 Other ways it stays light:
 - **One model in memory at a time.** The AI pass finishes and unloads before the voice starts.
@@ -298,16 +331,16 @@ Rough totals for a **CPU-only machine** (estimates, to be measured in build step
 2. **Check the engines and the newest models on real hardware.**
    - **audio.cpp:**
      - Ming Q8_0 on the RTX PRO 1000 (Vulkan and CUDA builds) and on CPU: measure speed and memory.
-     - Kokoro: how it handles unknown words (the Elvish line), and whether it takes phonetic spellings.
+     - Kokoro: how it handles unknown words (the Elvish line), and whether it takes phonetic spellings. *Done: section 10.*
    - **LFM3-1.7B** on CPU only, with the GPU off and few threads, to stand in for an old laptop. Compare it against MiniCPM5-2B on the same tricky book sections, and measure QAD-Q4_0's drift from BF16 (llama.cpp KL divergence).
    - **Quantized vs full**, to confirm the section 10 picks hold up:
-     - Kokoro Q8_0 vs BF16: by ear, plus a spectrum check for the 4.8/9.6 kHz tone.
+     - Kokoro Q8_0 vs BF16: by ear, plus a spectrum check for the 4.8/9.6 kHz tone. *Spectrum check done: section 10.*
      - Heron: backbone-INT8 vs FP32 on the test PDFs.
      - PaddleOCR-VL: Q4_K_M vs Q8_0, counting broken pages and typos.
 
    *If either struggles on normal hardware, we find out here, before building around it.*
 3. Cleanup rules and the PDF reader. (The DOCX, FB2, TXT and HTML readers are done.)
-4. Text prep: numbers, abbreviations, pronunciation lists, name finder.
+4. Text prep: numbers, abbreviations, pronunciation lists, name finder. *Done for the terminal command; the window's Pronunciation tab is still to do ([#10](https://github.com/Kingskid2026/tomecast/issues/10)).*
 5. Pause & resume and preview.
 6. Hardware scan, the GPU switch, and speed estimates.
 7. The desktop window.

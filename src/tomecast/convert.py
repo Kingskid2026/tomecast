@@ -31,6 +31,7 @@ from tomecast.packaging import (
     write_m4b,
     write_mp3s,
 )
+from tomecast.textprep import TextPrep
 
 # Seconds of silence after each kind of chunk.
 GAP_AFTER = {Boundary.PART: 0.1, Boundary.SENTENCE: 0.3, Boundary.PARAGRAPH: 0.6}
@@ -184,16 +185,24 @@ def select_chapters(book: Book, chapters: Sequence[int] | None) -> list[int]:
 
 
 def plan_chunks(
-    book: Book, max_chars: int, chapters: Sequence[int] | None = None
+    book: Book,
+    max_chars: int,
+    chapters: Sequence[int] | None = None,
+    prep: TextPrep | None = None,
 ) -> list[list[Chunk]]:
     """Chunk the chapters of ``book`` (title first), one list per chapter.
 
     ``chapters`` picks which ones, by index into ``book.chapters`` (``None``: all). Chunk
     IDs always carry the chapter's index in the *whole* book, so the same chapter has the
     same chunk IDs (and so reusable audio) however the others are ticked.
+
+    This is the one place text prep happens: every paragraph goes through ``prep`` (numbers,
+    abbreviations, pronunciation fixes) just before chunking. Without a ``prep``, the book's
+    own language rules are used and no pronunciation lists.
     """
+    prep = prep or TextPrep.for_language(book.language)
     return [
-        chunk_paragraphs(index, book.chapters[index].spoken_paragraphs(), max_chars)
+        chunk_paragraphs(index, prep.chapter(book.chapters[index]), max_chars)
         for index in select_chapters(book, chapters)
     ]
 
@@ -210,6 +219,7 @@ def convert_book(
     chapters: Sequence[int] | None = None,
     overwrite: bool = True,
     format: Literal["m4b", "mp3"] = "m4b",
+    prep: TextPrep | None = None,
 ) -> ConversionResult:
     """Voice ``book`` with ``engine`` and write an M4B audiobook to ``output``.
 
@@ -221,6 +231,9 @@ def convert_book(
     keep each chapter's index in the whole book, so a run with some chapters unticked reuses
     the audio of a run with all of them, and the audiobook holds only the chosen chapters,
     in book order.
+
+    ``prep`` is the text prep (see :func:`plan_chunks`); the default is the book's language
+    rules without pronunciation lists.
 
     ``overwrite=False`` never replaces an existing file: if ``output`` is taken, even by a
     file that appeared while voicing, the book is written to "name (2).m4b" and so on. The
@@ -237,7 +250,7 @@ def convert_book(
 
     voice_speed = getattr(engine, "voice_speed", 1.0)  # test fakes may not have one
     selected = select_chapters(book, chapters)
-    plan = plan_chunks(book, engine.max_chars, selected)
+    plan = plan_chunks(book, engine.max_chars, selected, prep)
     total = sum(len(chunks) for chunks in plan)
     chunk_dir = workdir / "chunks"
     chunk_dir.mkdir(parents=True, exist_ok=True)
