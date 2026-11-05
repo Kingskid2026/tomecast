@@ -1,0 +1,70 @@
+[project]
+name = "tomecast"
+version = "0.0.0"
+description = "Turn ebooks into audiobooks on Linux with local, human-sounding voices."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Ambrose Sigler" }]
+requires-python = ">=3.11"
+keywords = ["audiobook", "text-to-speech", "tts", "epub", "ebook", "linux", "kokoro", "local-ai"]
+classifiers = [
+    "Development Status :: 1 - Planning",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+    "Typing :: Typed",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/Kingskid2026/tomecast"
+Documentation = "https://github.com/Kingskid2026/tomecast/blob/main/docs/architecture.md"
+Issues = "https://github.com/Kingskid2026/tomecast/issues"
+Changelog = "https://github.com/Kingskid2026/tomecast/blob/main/CHANGELOG.md"
+
+[project.scripts]
+tomecast = "tomecast.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.13.7,<0.14"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "mypy>=2.4.1",
+    "pytest>=9.2.0",
+    "ruff>=0.17.3",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # import sorting
+    "B",   # bugbear: likely bugs
+    "UP",  # pyupgrade: modern syntax
+    "SIM", # simplifications
+    "RUF", # ruff-specific checks
+]
+
+[tool.mypy]
+strict = true
+python_version = "3.11"
+files = ["src", "tests"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-ra", "--strict-markers", "--strict-config"]

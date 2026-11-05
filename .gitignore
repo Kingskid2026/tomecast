@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Tooling
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local test books and generated audio: never commit these
+/local/
+/output/
+*.m4b
+
+# Downloaded models and engines (Tomecast keeps them in ~/.local/share/tomecast)
+*.gguf
+*.onnx
+*.safetensors
+
+# Editors and OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+.env

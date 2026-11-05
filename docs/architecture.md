@@ -1,0 +1,299 @@
+# Tomecast architecture
+
+*How Tomecast is designed, and why. Kept up to date as the design changes. Last updated 2026-11-05.*
+
+## Goal
+
+People who read ebooks want to listen to them too, without uploading books to a cloud service or paying a subscription. Tomecast is a simple Linux app that:
+
+- reads the common ebook formats,
+- understands what's actually *book text*, so it reads chapters and not "page 2", headers or footnote numbers,
+- sounds human,
+- runs well on anything from an old laptop to an NVIDIA or AMD gaming PC.
+
+## Key decisions
+
+| # | Topic | Decision |
+|---|---|---|
+| 1 | Interface | Small desktop window **and** a terminal command, both on the same engine |
+| 2 | Hardware | Works on CPU-only, NVIDIA, AMD and older laptops. **First launch scans the hardware and recommends settings.** A "Use graphics card" switch lets the user turn the GPU off, with a note that it's faster on |
+| 3 | Formats | EPUB, TXT, HTML, DOCX, FB2, and normal text PDFs. Scanned PDFs are handled by the **optional AI pass** (PaddleOCR-VL-1.6), which only runs when a PDF has no real text, and asks first |
+| 4 | Output | Just writes files, so people play them in any app. **M4B with chapters by default**, with a switch for one MP3 per chapter |
+| 5 | Skip / clean | Page numbers, headers and footers, copyright page, table of contents, index, footnote markers (footnote text skipped or read at chapter end), links, image captions, tables, and "preview of the next book" excerpts |
+| 6 | Smarts | Rules-based cleanup, plus an **optional local AI pass**: **Docling Heron** reads PDF page layout, **PaddleOCR-VL-1.6** reads scanned pages, and **LFM3-1.7B** makes judgment calls in any format (backup: MiniCPM5-2B) |
+| 7 | Voices | One narrator voice (for now) |
+| 8 | Extras | Pause & resume, preview voice & speed, pronunciation fixes |
+| 9 | Install | One command on any distro (`uv tool install` / `pipx`). **The app sets up llama.cpp, espeak-ng, ffmpeg and the models itself.** Nothing to install by hand |
+| — | Model sizes | **Quantized for speed and low memory** wherever quality holds up, with automatic fallbacks (section 10) |
+| — | Name | **Tomecast** (PyPI `tomecast`) |
+| — | License | **Apache 2.0** (so PDFs use `pypdfium2`, not the AGPL PyMuPDF) |
+| — | Repo | **github.com/Kingskid2026/tomecast**, with high-quality open-source setup and automated releases (section 11) |
+| 10 | Languages | English plus the big ones. Made-up words (Elvish etc.) get a best-guess pronunciation, and the pronunciation list fixes anything off |
+| — | Voice models | **Kokoro** as the default that runs everywhere. **Ming-3.0-tts 0.5B** as the premium voice when a graphics card is available. Both run on **audio.cpp** (C++, no Python) |
+
+## How it fits together
+
+```
+book file
+  → Reader (one per format)          → chapters → paragraphs, with tags (heading, footnote, caption…)
+  → Cleanup (rules, optional AI)      → only the text that should be spoken
+  → Text prep                         → pronunciation list, numbers, abbreviations, sentence chunks
+  → Voice engine (Kokoro or Ming)     → audio per chunk, cached on disk (this is what makes resume work)
+  → Checks                            → every sentence has audio of the right length, or it's regenerated
+  → Packager (ffmpeg)                 → M4B with chapters + cover + title/author, or MP3 per chapter
+```
+
+The app is written in **Python 3.11+**, which has the best ebook and PDF libraries and holds everything together. The heavy model work runs in fast C++ engines (audio.cpp for voices, llama.cpp for the AI add-ons).
+
+## Core guarantee: every sentence gets spoken
+
+**The failure we're designing against:** some audiobook tools send a whole chapter or page to the voice model at once. Voice models silently stop when their input is too long, so the end of a page or chapter just goes missing, with no error. Tomecast never does that:
+
+1. **Small pieces only.** Text goes to the voice in sentence-sized chunks, with a hard size cap for each engine, set well under that model's limit. Long sentences are split at commas or semicolons. A page or chapter is never sent in one call.
+2. **Nothing left behind before the voice.** The splitter always emits the final fragment of a chapter, even without closing punctuation. That's a classic bug: splitters wait for a period that never comes. Readers keep the text after the last page break of a document.
+3. **Every sentence is accounted for.** Each sentence gets an ID that follows it from the reader to the final file. Before packaging, the app checks that every ID has audio. A gap means regenerate, never ship.
+4. **Length check.** Each chunk's audio length is compared with what its text should take to say. Audio that's too short, or silence where words should be, gets regenerated, split smaller on retry.
+5. **Optional listen-back check.** A small speech-recognition model (audio.cpp runs several) transcribes the end of each chunk and compares it to the text. That catches dropped words that timing alone would miss. On by default with a graphics card, optional on CPU.
+6. **Tests that prove it:** fixture documents whose last page ends mid-sentence, a chapter with no final period, and a 2,000-word paragraph. The tests check that every sentence of the cleaned text reached the audio.
+
+## Components
+
+### 1. Readers (one per format)
+- **EPUB:** `ebooklib` + an HTML parser. Follow the book's reading order and use its table of contents for chapter titles. Many EPUBs tag their own parts (`epub:type="footnote"`, `pagebreak`, `copyright-page`, `toc`, `index`), so junk can be skipped exactly instead of guessed. Cover image goes into the M4B.
+- **PDF:** `pypdfium2`, Apache/BSD-licensed, and the same PDF engine Chrome uses. It gives each character with its position (and font size through its low-level API), and we group those into lines. Chapters come from the PDF's bookmarks when present, otherwise from large or bold heading lines. We don't use PyMuPDF because it's AGPL, which doesn't fit an Apache 2.0 app.
+- **DOCX:** `python-docx`, where Heading styles mark chapters. **FB2:** XML sections. **TXT:** chapter-line patterns ("Chapter 12", "CHAPTER TWELVE", "XII"). **HTML:** same path as an EPUB chapter.
+- **Later, if wanted:** Kindle MOBI/AZW3 (DRM-free only) through Calibre's `ebook-convert` when Calibre is installed.
+
+### 2. Cleanup: "read the book, not the page"
+Rules, checked in this order:
+- **Page numbers:** a line near the top or bottom of the page that's just a number, a roman numeral, or "Page 12 of 300".
+- **Headers and footers:** the same or near-same text repeated at the top or bottom of most pages (book title, author, chapter name).
+- **Front and back matter:** copyright, dedication-style blocks, table of contents, index, "Also by", and "Read the first chapter of…" previews. Detected by EPUB tags or by section title. Each one is an on/off switch.
+- **Footnotes:** remove superscript markers. Footnote text is either dropped or collected and read at the end of the chapter (a setting).
+- **Links, captions, tables:** drop URLs and figure captions. A table becomes one short line ("A table appears here.") or is skipped.
+- **PDF layout fixes:** re-join words split by end-of-line hyphens, join lines broken mid-sentence, and handle two-column pages in the right order.
+- **Chapter list with checkboxes:** the window shows what it found, so the user can untick anything the rules got wrong *before* converting.
+
+**Optional AI pass (off by default).** It handles two different jobs with different models. The hardware scan says which parts the machine can handle.
+
+| Job | Model | How it works |
+|---|---|---|
+| **Messy PDF pages** (layout) | **Docling Heron** (IBM, 43M, Apache 2.0) | Looks at each page picture and labels boxes: page-header, page-footer, footnote, caption, table, section-header, document index. The words are taken **from the PDF itself** by box position, so nothing is retyped. Under a second per page on CPU. **Runs on ONNX Runtime** (full FP32, 170 MB), so it needs no PyTorch. Reading order comes from our own layout rules, using Docling's approach as the reference. |
+| **Scanned or badly broken pages** | **PaddleOCR-VL-1.6** (Baidu, ~0.9B, Apache 2.0) | Reads the page picture and retypes it in reading order, with headers and footers marked. Runs through llama.cpp (official GGUF + vision file), so it works on NVIDIA, AMD or CPU. Only used for pages with no real text, or where Heron's result looks wrong. **4-bit by default. If a page comes back with too many words that aren't real words, that page is re-read at 8-bit.** The app shows a time estimate first, because it's slow on CPU. |
+| **Judgment calls, any format** | **LFM3-1.7B** (Liquid AI, ~1 GB at 4-bit) · backup **MiniCPM5-2B** | Finds "About the author", next-book previews, and where chapter 1 really starts in a TXT or untagged EPUB. **It never retypes the book.** It gets numbered lines and answers keep/drop/chapter-start in a fixed JSON format (enforced by llama.cpp), and the app makes the edits, so it can't change the author's words. 256K context means it can see a whole chapter at once. Needs llama.cpp from 2026-10-28 or newer (or ONNX Runtime). License: LFM Open License, free for personal use and companies under $10M revenue. The model is downloaded on first use, so the app itself stays open source. |
+
+Known issue to watch: reading order is the hard part. Even Docling's own reading-order step sometimes moves a list or footnote above a heading ([docling#4433](https://github.com/docling-project/docling/issues/4433)). The chapter-list review screen is the safety net.
+
+### 3. Text prep
+- Split into sentence-sized chunks for the voice model.
+- Expand numbers, years, dates, "Dr.", "St.", roman numerals in headings ("Chapter XIV" → "Chapter fourteen").
+- **Pronunciation fixes:**
+  - A **global list** plus a **per-book list** of *written → say it as* pairs (e.g. Hermione → her-MY-oh-nee). Stored as plain text so it's easy to edit.
+  - **Name finder:** before converting, list words that appear often but aren't in a dictionary (usually names and places) so the user can check them.
+  - **Try it:** type a word, hear it immediately, adjust the spelling.
+  - Advanced: Kokoro also accepts exact phonetic spelling for a word.
+- **Made-up languages:** Kokoro sounds out unknown words with espeak-ng's spelling rules, and Ming guesses from the spelling. Both read *something* reasonable, and the list fixes the rest.
+
+### 4. Voice engines
+Both sit behind one small interface (`voices()`, `languages()`, `synthesize(chunk, voice, speed)`), so more engines can be added later.
+
+**Both voices run on audio.cpp.** It's a C++ engine for voice models (Apache 2.0, v0.9.4, 4,000+ GitHub stars, updated daily) that runs Kokoro and Ming from GGUF files. It has official prebuilt Linux builds: CPU (64 MB) and Vulkan (116 MB).
+- **No Python and no PyTorch.**
+- **Vulkan means NVIDIA *and* AMD graphics cards work the same way.**
+- Risk: it's young (first release June 2026) and run by one company, so we pin a tested version (v0.9.3 or newer, for Ming).
+- Fallback if it breaks: Kokoro through `kokoro-onnx` (FP16-stored weights, never the INT8 file, see section 10), and Ming through its official Python repo in a sandbox.
+
+**Kokoro (default, every machine)**
+- 82M parameters, Apache 2.0, 54 voices. Languages: English (US/UK), Spanish, French, Italian, Portuguese, Hindi, Japanese, Chinese.
+- The English file is ~190 MB. Non-English books use a larger multilingual file (~0.93 GB), downloaded only when one shows up.
+- Runs on CPU, or on any graphics card through Vulkan.
+- To check in step 2: how audio.cpp's Kokoro sounds out unknown words (Elvish names), and whether it accepts exact phonetic spellings for the pronunciation list.
+
+**Ming-3.0-tts 0.5B (premium, graphics card)**
+- MIT license. Built-in voices include **UK_George** (labelled "audiobooks") and **US_Emma** (labelled "narration"). Languages: English, Chinese, German, Spanish, French, Korean, Japanese. Output is 44.1 kHz.
+- Uses the official audio.cpp **Q8_0** file (1.74 GB). Measured on an RTX 5090: about 6× faster than real time, using ~1.9 GB of graphics memory. audio.cpp also reports valid output on CPU and Vulkan.
+- NVIDIA and AMD both run it through Vulkan. On CPU it's offered only if step-2 testing shows a usable speed.
+- Our text-prep step replaces its built-in number/date normalizer.
+- Installed only when the user opts in ("Install premium voice, about 1.9 GB, needs a graphics card").
+
+**Language routing:** if a book's language isn't covered by the chosen engine, the app says so and switches to the one that covers it. Italian, Portuguese and Hindi go to Kokoro. German and Korean go to Ming.
+
+### 5. Hardware scan (first launch, plus a "Rescan" button)
+- Detects the graphics card (NVIDIA, AMD or Intel, plus its memory, and whether Vulkan works), CPU cores, RAM, and whether it's a laptop on battery.
+- Runs a ~10-second test with each available engine, then shows a real estimate: *"This book will take about 2 h 10 min on your graphics card, or 6 h on CPU."*
+- Recommends a setting:
+
+| Machine | Recommended |
+|---|---|
+| NVIDIA or AMD graphics, 4 GB+ | Ming on the graphics card through Vulkan (Kokoro also available) |
+| CPU only, decent RAM | Kokoro |
+| Old or low-RAM laptop | Kokoro, fewer threads |
+
+- The **"Use graphics card"** switch is always visible, with the measured speedup next to it ("about 4× faster on your machine").
+
+### 6. Pause & resume, preview
+- Each book gets a project folder (`~/.local/share/tomecast/projects/<book-id>/`) holding finished audio chunks and a progress file. Closing the app, a crash or a reboot loses at most one sentence. Changing voice or speed starts fresh.
+- **Preview:** play the first paragraph of any chapter, or any typed text, in the chosen voice and speed before converting.
+
+### 7. Packager
+- `ffmpeg` (available on every distro) joins the chunks.
+- **M4B:** AAC, 64 kbps mono (about 30 MB per hour), chapter markers from the book's chapters, plus cover art, title, author and "narrator: <voice>".
+- **MP3 per chapter:** numbered files with tags (album = book, track = chapter) so players keep the order.
+
+### 8. Window and terminal command
+- **Window (PySide6 / Qt):** works on KDE, GNOME and tiling setups.
+  1. Drop a book in.
+  2. Chapter list with checkboxes and the skip switches.
+  3. Voice, speed and Preview.
+  4. Pronunciation tab with the name finder and Try it.
+  5. Convert, with progress, time left, and Pause/Resume.
+  6. "Open output folder".
+- **Terminal:** `tomecast convert book.epub --voice UK_George --format m4b`, plus `tomecast voices`, `tomecast preview "text"`, `tomecast scan`. Easy for a techy user to script over a folder of books.
+
+### 9. Install: the app sets everything up itself
+Users paste **one line** into a terminal: `curl -fsSL kingskid2026.github.io/tomecast/install.sh | sh`.
+- It's a short script, kept in the repo, so a techy user can read it first.
+- It installs **uv** if it's missing, and uv then fetches the right Python and installs the app.
+- If they already have uv, it's just `uv tool install tomecast`.
+- They never install llama.cpp, audio.cpp, CUDA, ROCm, espeak-ng or ffmpeg themselves.
+- **No sudo/admin password:** everything goes in their home folder.
+- Internet is only needed for the first downloads. After that it works offline.
+- Uninstalling is one command, plus deleting `~/.local/share/tomecast`.
+
+On first launch the app runs the hardware scan, lists what it needs to download (with sizes), asks once, and then does the following:
+- **llama.cpp:** downloads the **official prebuilt build** from ggml-org's GitHub releases, pinned to one version we've tested (2026-10-28 or newer, for LFM3) and checked against its published checksum. It's kept in `~/.local/share/tomecast/runtime/`.
+  - **Any graphics card (NVIDIA, AMD, Intel):** the Vulkan build, **35 MB**. It needs only the normal graphics driver.
+  - **No graphics card:** the CPU build, **23 MB**.
+  - The CUDA build (~170 MB + 440 MB runtime) isn't needed for models this small.
+  - The app starts `llama-server` in the background only while it's needed, and stops it afterwards.
+- **audio.cpp** (the voice engine): fetched the same way, from its official GitHub releases. CPU build 64 MB, or Vulkan build 116 MB for any graphics card.
+- **ffmpeg** comes as a Python package (`imageio-ffmpeg`), and so does espeak-ng if Kokoro's unknown-word handling needs it (`espeakng-loader`). So **nothing comes from the distro's package manager**.
+- **No PyTorch anywhere:**
+  - voices run on audio.cpp,
+  - Heron runs on ONNX Runtime (a small Python package),
+  - the text and OCR models run on llama.cpp.
+- **Models** come only from official repos, in the sizes from section 10. Where a smaller file than the official one is needed, the app makes it locally with llama.cpp's own `llama-quantize` (seconds), instead of downloading files from unknown uploaders.
+- **Self-check:** it runs a 2-second test of each piece. If a prebuilt engine won't start (for example on an older distro), it says so and falls back to its CPU build or the Python fallback.
+
+**Where it works: the honest limits.** These were checked against the build setups on 2026-11-05. audio.cpp's Linux downloads are built on Ubuntu 24.04. llama.cpp's main Linux downloads are built on Ubuntu 22.04.
+
+| System | Result |
+|---|---|
+| Ubuntu 24.04+, Fedora 40+, Arch / Manjaro / EndeavourOS / Omarchy, Linux Mint 22+, Debian 13+, openSUSE Tumbleweed, Pop!_OS 24.04+ | **Everything works** |
+| Older releases: Ubuntu 22.04, Debian 12, Mint 21, RHEL/Rocky 9 | audio.cpp's downloads need a newer core system library (glibc 2.39), so the app **falls back to Kokoro through `kokoro-onnx`**, which runs on older systems. The **premium Ming voice isn't available** unless audio.cpp is compiled on the machine (the app can offer this if build tools are installed). The AI add-ons still work |
+| Alpine (musl) or NixOS | The prebuilt engines don't run as-is. Possible with extra setup, but not a first target |
+| ARM Linux (Raspberry Pi, ARM laptops) | audio.cpp has no Linux ARM download, so the Kokoro fallback is used. llama.cpp does have ARM builds |
+| Very old CPUs (no AVX2) | Use audio.cpp's "portable" CPU build, which avoids newer CPU instructions |
+
+**The one thing it can't install: graphics drivers.** Those need admin rights and differ per distro. The app uses whatever driver is already there. If Vulkan isn't working, it runs on the CPU and shows the single package to install for that distro (e.g. `vulkan-icd-loader` on Arch, `libvulkan1` on Ubuntu/Debian, `vulkan-loader` on Fedora).
+
+### 10. Model sizes: quantized where it pays off
+Rules of thumb from the research (2026-11-05):
+- **8-bit is effectively lossless at any size**, as long as only the *weights* are quantized.
+- **4-bit costs small models more than big ones**, because they have less spare capacity per weight. The exception is a model trained for 4-bit, like LFM3's QAD file.
+- **The parts that make the final output are the most fragile:** a voice model's vocoder (the part that turns numbers into sound waves) and an OCR model's vision part. They stay at high precision.
+- **Tiny models gain almost nothing from quantizing.** They aren't limited by memory speed, so they don't get faster, and their files barely shrink.
+- **The app can keep a light and a full copy of a model** and switch between them automatically, using one at a time. That's only worth it where a fallback actually helps (PaddleOCR-VL).
+
+| Model | File used | Size | Second copy? | Why |
+|---|---|---|---|---|
+| **Kokoro** 82M | Q8_0 or BF16 GGUF (audio.cpp): whichever wins the step-2 listening test | 190 / 210 MB | No | Only 20 MB apart. **Avoid the common INT8 ONNX file.** It also quantizes activations, and was measured adding a steady tinny tone (4.8/9.6 kHz) and occasional garbled sentences, while running *slower* than full precision |
+| **Ming-3.0-tts** 0.5B | **Q8_0 GGUF** (audio.cpp, official) | 1.74 GB (BF16: 3.0 GB) | No | In audio.cpp's tests, Q8 runs up to ~1.5× faster with ~37% less graphics memory than 16-bit. Below 8-bit isn't officially possible, because its 896-wide layers don't fit llama.cpp's 4–6-bit formats. A community 6.4-bit file (1.39 GB) exists, but from an uploader we can't vouch for |
+| **Docling Heron** 43M | FP32 (ONNX) | 170 MB | No | Already under a second per page. An INT8 version that quantizes only the image-reading part (a similar detector lost ~0.5 accuracy points that way) gets tested, and is used only if it matches FP32 on our PDFs *and* is actually faster |
+| **PaddleOCR-VL-1.6** | **Q4_K_M** language part + **BF16** vision part | ~0.3 + 0.88 GB | **Yes: Q8_0 (~0.5 GB)** | In one 4-bit test, 2 of 20 pages came out broken (0 of 20 at full precision), while intact pages were within ~1%. So pages are read at Q4, and any broken or garbled page is re-read with the Q8 copy. Both copies are made locally from one official download. The vision part breaks when quantized, so it stays full |
+| **LFM3-1.7B** | **QAD-Q4_0** | 1.05 GB | No (Q8_0, 1.85 GB, only if testing calls for it) | Trained by Liquid to recover 4-bit losses. Its keep/drop job is forgiving, and it can never retype text. We measure its drift from full precision with llama.cpp's KL-divergence tool |
+| MiniCPM5-2B (backup) | Q4_K_M | 1.56 GB | — | Only if LFM3 fails its tests |
+
+Other ways it stays light:
+- **One model in memory at a time.** The AI pass finishes and unloads before the voice starts.
+- **llama.cpp memory:** the AI models' working memory (KV cache) is also 8-bit (`-ctk q8_0 -ctv q8_0`), and the context is capped at what a chapter needs (~16K tokens), not the full 256K.
+- **Threads:** the scan picks the thread count, and uses fewer on a laptop running on battery.
+
+Rough totals for a **CPU-only machine** (estimates, to be measured in build step 2):
+- Voice only, English books: **~0.25 GB** (Kokoro + audio.cpp).
+- Non-English books: the multilingual Kokoro file is ~0.93 GB, downloaded only when needed.
+- With every AI add-on: **~3.2 GB**.
+- The premium voice on a graphics card adds **~1.9 GB** (Ming + the Vulkan build).
+- Peak memory: **~1.5–2 GB**, because only one model is loaded at a time.
+
+### 11. Open source: the repo, quality, and updates
+
+**Where it lives**
+- GitHub: `github.com/Kingskid2026/tomecast` to start. The `tomecast` name on GitHub belongs to an inactive account from 2015. `tomecast-app` is free if we want an organization later, and GitHub redirects old links after a transfer.
+- PyPI: `tomecast`.
+
+**How updates reach people.** There are three kinds of update, all shipped from the repo:
+
+1. **The app itself**
+   - Version numbers follow "semantic versioning": `0.x` while it's young, `1.0.0` once it's stable. A bug fix bumps the last number (0.1.1), a new feature bumps the middle one (0.2.0).
+   - **Every change goes in through a pull request**, and the automatic checks must pass.
+   - **release-please** (a GitHub Action) keeps an always-open "Release 0.2.0" pull request, with the changelog written from the commit messages. **Merging it is the whole release:** it tags the version, builds the package, and publishes to PyPI.
+   - Publishing uses **Trusted Publishing**, so no passwords or tokens are stored anywhere. Each build gets an attestation, a public proof that our CI built it from our code.
+   - **On the user's side:** the app checks PyPI at most once a day. That's one anonymous request with no other tracking, and it can be turned off. When there's a new version it shows *"Tomecast 0.2.0 is available, what's new"*. `tomecast update` (or the button) runs `uv tool upgrade tomecast`. It never updates itself silently.
+2. **Engines and models**
+   - A `manifest.toml` inside the app lists the exact llama.cpp and audio.cpp versions, plus every model file's URL, size and SHA-256 checksum.
+   - To move to a newer engine or model: change the manifest in a pull request, run the tests and the GPU checks on real hardware, then release.
+   - On the user's next launch, the app downloads the new pieces and runs its self-check. It switches over only if the check passes, and **keeps the old version until then**, so it can roll back automatically.
+   - **Never "latest":** a new llama.cpp or audio.cpp could break things, so users only ever get versions we've tested.
+3. **The install script** is served from GitHub Pages in the same repo (`kingskid2026.github.io/tomecast/install.sh`). It changes through pull requests like the code.
+
+**What makes it a high-quality repo**
+
+| Piece | What it is |
+|---|---|
+| **README** | What it does, a short demo GIF and an audio sample, the one-line install, the supported-distros table, quick start, FAQ, credits |
+| **Licenses** | `LICENSE` for our code. `THIRD_PARTY.md` lists every model and engine the app downloads, with its license (Kokoro Apache 2.0, Ming MIT, LFM3 LFM Open License, …) |
+| **Community files** | `CONTRIBUTING.md` (how to set up, test, and send a pull request), `CODE_OF_CONDUCT.md` (Contributor Covenant), `SECURITY.md` plus GitHub's private vulnerability reporting |
+| **Issue templates** | The bug form asks for `tomecast doctor` output (distro, GPU, versions), so reports are useful from the first message |
+| **Automatic checks on every pull request** | `ruff` (style and lint), `pyright` (type checks), `pytest` (readers and cleanup rules on public-domain sample books), a CPU-only end-to-end test (short EPUB → M4B with Kokoro), and **the install script run inside Ubuntu 22.04/24.04, Debian 12/13, Fedora and Arch containers**. That last one proves the "works on any distro" promise on every change |
+| **Protected main branch** | Changes only land through pull requests with passing checks, ours included |
+| **Dependabot** | Opens pull requests when Python packages or GitHub Actions have updates, and the checks show whether anything broke |
+| **Docs** | `CHANGELOG.md` (generated), `docs/architecture.md` (this plan, cleaned up), `docs/models.md` (why each model and quantization), and how to add a new voice engine |
+| **Real-hardware testing** | GitHub's free test machines have no graphics card, so each release has a short checklist: run `tomecast selftest --gpu` on the maintainer's NVIDIA laptop (RTX PRO 1000, 8 GB). Volunteers test AMD and old laptops on preview releases (`0.2.0rc1`) |
+| **House rules** | Never commit copyrighted books (test files come only from Project Gutenberg and Standard Ebooks). Built-in voices only, with no cloning of real people's voices |
+
+## Build order
+
+0. **Set up the repo:** license, README skeleton, community files, the automatic checks, release-please, Trusted Publishing, and branch protection. Everything after this goes in through pull requests.
+1. **Thin slice:** terminal command, EPUB in, Kokoro, M4B out with chapters. Proves the whole pipeline end to end.
+2. **Check the engines and the newest models on real hardware.**
+   - **audio.cpp:**
+     - Ming Q8_0 on the RTX PRO 1000 (Vulkan and CUDA builds) and on CPU: measure speed and memory.
+     - Kokoro: how it handles unknown words (the Elvish line), and whether it takes phonetic spellings.
+   - **LFM3-1.7B** on CPU only, with the GPU off and few threads, to stand in for an old laptop. Compare it against MiniCPM5-2B on the same tricky book sections, and measure QAD-Q4_0's drift from BF16 (llama.cpp KL divergence).
+   - **Quantized vs full**, to confirm the section 10 picks hold up:
+     - Kokoro Q8_0 vs BF16: by ear, plus a spectrum check for the 4.8/9.6 kHz tone.
+     - Heron: backbone-INT8 vs FP32 on the test PDFs.
+     - PaddleOCR-VL: Q4_K_M vs Q8_0, counting broken pages and typos.
+
+   *If either struggles on normal hardware, we find out here, before building around it.*
+3. Cleanup rules and the PDF reader, then DOCX, FB2, TXT and HTML.
+4. Text prep: numbers, abbreviations, pronunciation lists, name finder.
+5. Pause & resume and preview.
+6. Hardware scan, the GPU switch, and speed estimates.
+7. The desktop window.
+8. The optional AI pass: Docling Heron for PDF layout, then LFM3-1.7B for judgment calls, then PaddleOCR-VL-1.6 for scanned pages.
+9. **First public release (v0.1.0):** finished README, the install script on GitHub Pages, and a preview release for early testers first.
+
+## Open questions
+
+- Kindle MOBI/AZW3 support (DRM-free only) through Calibre's `ebook-convert`: later, or never.
+
+## How we'll test it
+
+- **Test books:**
+  - a Project Gutenberg EPUB (plain markup)
+  - a Standard Ebooks EPUB (rich tags, footnotes)
+  - a text PDF with running headers, page numbers and footnotes
+  - a scanned PDF from the Internet Archive
+  - one each of DOCX, FB2 and TXT
+  - a passage full of Tolkien-style names
+- **Cleanup tests:** sample pages with known headers, page numbers and footnotes, checked against the exact expected spoken text.
+- **AI pass:**
+  - Run the same messy PDF with rules only and with Heron, and compare what's left.
+  - Confirm LFM3's keep/drop answers never change a single word of the kept text (a diff check).
+  - Time PaddleOCR-VL on a scanned chapter, on GPU and on CPU.
+- **End to end:** convert a short book with each engine. Check chapters with `ffprobe` and play in VLC/mpv. Check MP3 tags and order.
+- **Hardware:** on the maintainer's laptop, test the NVIDIA path and CPU-only (GPU switched off), and record speed and peak memory per engine. AMD and old-laptop paths need real machines from volunteer testers.
+- **Resume:** kill the app mid-chapter, restart, and confirm no gaps or repeated sentences.
+- **Listen check:** chapter starts, a footnote-heavy page, and the Elvish line: *Galadriel whispered, "Namárië," as the boats drifted toward Lothlórien.*
