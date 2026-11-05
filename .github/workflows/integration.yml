@@ -1,0 +1,117 @@
+name: Integration
+
+# Real conversions on clean copies of the distros people use. Each job installs Tomecast from
+# this checkout with install.sh, turns a tiny public-domain EPUB into an M4B with the real
+# voice engine and Kokoro model, and checks the audiobook: it plays, and has one spoken
+# chapter per section. The engine and model are downloaded once per change of their pinned
+# SHA-256s and cached, so the distro jobs don't each fetch about 230 MB. It also runs every
+# week, because fedora and archlinux images move on without a change here.
+
+on:
+  pull_request:
+    paths: &paths
+      - src/tomecast/engines/**
+      - src/tomecast/downloads.py
+      - src/tomecast/convert.py
+      - src/tomecast/audio.py
+      - src/tomecast/packaging.py
+      - install.sh
+      - .github/workflows/integration.yml
+      - .github/scripts/make_test_book.py
+      - .github/scripts/check_audiobook.py
+  push:
+    branches: [main]
+    paths: *paths
+  schedule:
+    - cron: "17 6 * * 1" # Mondays, 06:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: integration-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  download:
+    name: Download the engine and model
+    runs-on: ubuntu-24.04
+    outputs:
+      key: ${{ steps.key.outputs.key }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - run: uv sync --locked
+      - name: Name the cache after the pinned files
+        id: key
+        run: |
+          key=$(uv run python -c 'from tomecast.engines.audiocpp import required_assets as r; print("-".join(a.sha256[:12] for a in r(use_gpu=False)))')
+          echo "key=tomecast-engine-$key" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: cache
+        with:
+          path: ${{ runner.temp }}/data
+          key: ${{ steps.key.outputs.key }}
+      - name: Download
+        if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          XDG_DATA_HOME: ${{ runner.temp }}/data
+        run: |
+          uv run python -c '
+          from tomecast.downloads import data_dir, ensure
+          from tomecast.engines.audiocpp import required_assets
+          for asset in required_assets(use_gpu=False):
+              print(asset.name, "->", ensure(asset, data_dir()))
+          '
+
+  convert:
+    name: Convert on ${{ matrix.image }}
+    needs: download
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: ubuntu:22.04
+            prep: apt-get update -qq && apt-get install -y -qq curl ca-certificates >/dev/null
+          - image: ubuntu:24.04
+            prep: apt-get update -qq && apt-get install -y -qq curl ca-certificates >/dev/null
+          - image: debian:12
+            prep: apt-get update -qq && apt-get install -y -qq curl ca-certificates >/dev/null
+          - image: debian:13
+            prep: apt-get update -qq && apt-get install -y -qq curl ca-certificates >/dev/null
+          - image: fedora:44 # the base of Bazzite
+            prep: "true"
+          - image: archlinux:latest
+            prep: "true"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/data
+          key: ${{ needs.download.outputs.key }}
+          fail-on-cache-miss: true
+      - name: Install, convert and check in a clean ${{ matrix.image }}
+        env:
+          IMAGE: ${{ matrix.image }}
+          PREP: ${{ matrix.prep }}
+        run: |
+          # Tomecast's data folder (engine, model, work files) is the restored cache.
+          docker run --rm -e PREP -v "$PWD:/src:ro" -v "$RUNNER_TEMP/data:/data" "$IMAGE" sh -euc '
+            eval "$PREP"
+            ldd --version | head -n1
+            cp -r /src /tmp/tomecast
+            TOMECAST_PACKAGE=/tmp/tomecast sh /tmp/tomecast/install.sh
+            python="$("$HOME/.local/bin/uv" tool dir)/tomecast/bin/python"
+            mkdir /tmp/book
+            "$python" /tmp/tomecast/.github/scripts/make_test_book.py /tmp/book/alice.epub
+            XDG_DATA_HOME=/data "$HOME/.local/bin/tomecast" convert /tmp/book/alice.epub --yes
+            "$python" /tmp/tomecast/.github/scripts/check_audiobook.py \
+              /tmp/book/alice.m4b /tmp/book/alice.expected.json
+          '

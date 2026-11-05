@@ -75,7 +75,7 @@ New Zealand → noo zee-lund  # several words are fine
 
 **Where things stand:** Tomecast is a preview, and active development is paused after 0.1.2. The plan to get it fully shipped, in order:
 
-1. **0.2.0, the polish release.** The premium Ming voice for computers with a graphics card, a pronunciation editor in the window, the voice engine on older distros such as Ubuntu and Debian (already part-built in [#27](https://github.com/Kingskid2026/tomecast/pull/27)), the final app icon, and safer engine updates that check a new engine before switching to it.
+1. **0.2.0, the polish release.** The premium Ming voice for computers with a graphics card, a pronunciation editor in the window, the voice engine on older distros such as Ubuntu and Debian (built in [#27](https://github.com/Kingskid2026/tomecast/pull/27)), the final app icon, and safer engine updates that check a new engine before switching to it.
 2. **0.3.0, the AI add-ons.** Optional downloads for messy books: understanding complex PDF page layouts, reading scanned PDFs, and a small local model for tricky cleanup decisions. This is the largest piece of work, since each add-on brings its own model.
 3. **1.0.0, the full release.** A Windows version, a demo, the docs, and an install page.
 
@@ -105,8 +105,9 @@ Then open **Tomecast** from your app launcher. Run the same line again any time 
 
 | Your system | Support |
 |---|---|
-| Distros with glibc 2.43 or newer: Fedora 44+, Bazzite, Arch-based ones, openSUSE Tumbleweed (check with `ldd --version`) | Everything |
-| Ubuntu 22.04 and 24.04, Debian 12 and 13, Fedora 43 and older | Installs, but the voice engine needs a newer system. Planned for 0.2.0 ([#18](https://github.com/Kingskid2026/tomecast/issues/18)) |
+| Distros from 2019 on (glibc 2.29 or newer, check with `ldd --version`): Ubuntu 20.04+, Debian 11+, Fedora and Bazzite, RHEL/Alma/Rocky 9+, Arch-based ones, openSUSE Tumbleweed | Everything. Tested on every engine change with real conversions on Ubuntu 22.04/24.04, Debian 12/13, Fedora 44 and Arch |
+| Older distros (Ubuntu 18.04, Debian 10, RHEL 8) | Not supported |
+| Processors without AVX2 (Intel before 2013, AMD before 2015, many Pentium and Celeron chips) | Not supported yet |
 | Alpine, NixOS, ARM computers | Not supported yet |
 
 ## Privacy
