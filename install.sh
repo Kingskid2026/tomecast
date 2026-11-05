@@ -1,7 +1,7 @@
 #!/bin/sh
 # Tomecast installer: https://github.com/Kingskid2026/tomecast
 #
-#   curl -fsSL https://kingskid2026.github.io/tomecast/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/Kingskid2026/tomecast/main/install.sh | sh
 #
 # What this does (no sudo, everything stays in your home folder):
 #   1. Installs uv, the Python tool manager, into ~/.local/bin if you don't have it.
