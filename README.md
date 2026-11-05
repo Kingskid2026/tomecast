@@ -6,16 +6,16 @@
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
 > [!NOTE]
-> **Early development.** Tomecast can already turn **EPUB, DOCX, FB2, HTML and TXT** books into **M4B** audiobooks with chapters, using the Kokoro voice, from the command line. PDFs, smarter cleanup, the desktop window and the premium voice are on the [roadmap](https://github.com/Kingskid2026/tomecast/milestones). The voice engine currently needs a recent Linux (glibc 2.43+, see below).
+> **Tomecast 0.1** has a desktop window and a terminal command. It turns **EPUB, DOCX, FB2, HTML and TXT** books into **M4B** audiobooks with chapters, using the Kokoro voice, on the CPU or the graphics card you already have. MP3 output, PDFs and smarter pronunciation are coming in 0.1.2. See the [roadmap](#roadmap) for what's next.
 
 ## Try it
 
 ```sh
-uv tool install tomecast                      # or: pipx install tomecast
+tomecast gui                                  # the desktop window (also in your app launcher)
 tomecast convert book.epub                    # writes book.m4b next to the book
-tomecast convert book.docx                    # EPUB, DOCX, FB2, HTML and TXT work today (PDF is coming)
+tomecast convert book.docx                    # EPUB, DOCX, FB2, HTML and TXT work today (PDF in 0.1.2)
 tomecast convert book.epub --voice bm_george --speed 1.1   # speed: 0.5 to 3.0 (default 1.0)
-tomecast convert book.epub --format mp3       # a folder "book/" with one MP3 per chapter
+tomecast convert book.epub --format mp3       # 0.1.2: a folder "book/" with one MP3 per chapter
 tomecast voices                               # list the 54 built-in voices
 ```
 
@@ -37,6 +37,19 @@ If your computer has a graphics card with a working Vulkan driver (NVIDIA, AMD o
 - **Pronunciation fixes.** A word list for names the voice gets wrong, a finder for unusual names before you convert, and a button to hear any word right away.
 - **One-line install.** It sets up its own engines and models, with no `sudo`.
 
+## Roadmap
+
+| Version | What's in it | Status |
+|---|---|---|
+| **0.1.0** | Desktop window, EPUB to M4B with chapters, the graphics card through the installed driver, speeds 0.5× to 3×, one-line install | Released |
+| **0.1.1** | DOCX, FB2, TXT and HTML books, plus installer and reliability fixes | Released |
+| **0.1.2** | MP3 output (one file per chapter); numbers, dates and abbreviations read properly; your own pronunciation lists, `tomecast names` and `tomecast preview`; PDF books with page numbers, headers and footnotes cleaned up | Shipping soon |
+| **0.2.0** | The premium Ming voice (graphics card), a pronunciation editor in the window, the voice engine on older distros (Ubuntu, Debian), the final app icon, safer engine updates | Planned |
+| **0.3.0** | Optional AI add-ons for messy books: PDF page layout, scanned PDFs (OCR), tricky cleanup calls | Planned |
+| **1.0.0** | Public launch (demo, docs, install page) and a Windows version | Planned |
+
+A Mac version isn't planned yet. Progress is tracked on the [milestones page](https://github.com/Kingskid2026/tomecast/milestones).
+
 ## How it works
 
 ```mermaid
@@ -51,18 +64,18 @@ flowchart LR
 
 The full design, including why each model and quantization was chosen, is in [docs/architecture.md](docs/architecture.md).
 
-## Install (planned for v0.1.0)
+## Install
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Kingskid2026/tomecast/main/install.sh | sh
 ```
 
-The script is [short and readable](install.sh). It installs [uv](https://docs.astral.sh/uv/) if it's missing, then installs Tomecast from [PyPI](https://pypi.org/project/tomecast/) into your home folder. On first launch, Tomecast downloads only the engines and models your machine needs, and asks before downloading.
+Then open **Tomecast** from your app launcher. Run the same line again any time to update. No `sudo`: the script is [short and readable](install.sh). It installs [uv](https://docs.astral.sh/uv/) if it's missing, then installs Tomecast from [PyPI](https://pypi.org/project/tomecast/) into your home folder. On first launch, Tomecast downloads only the engines and models your machine needs, and asks before downloading.
 
 | Your system | Support |
 |---|---|
-| Distros with glibc 2.43 or newer, like Arch-based ones and openSUSE Tumbleweed (check with `ldd --version`) | Everything |
-| Ubuntu 22.04 and 24.04, Debian 12 and 13, current Fedora | Installs, but the voice engine needs a newer system. Planned in [#18](https://github.com/Kingskid2026/tomecast/issues/18) |
+| Distros with glibc 2.43 or newer: Fedora 44+, Bazzite, Arch-based ones, openSUSE Tumbleweed (check with `ldd --version`) | Everything |
+| Ubuntu 22.04 and 24.04, Debian 12 and 13, Fedora 43 and older | Installs, but the voice engine needs a newer system. Planned for 0.2.0 ([#18](https://github.com/Kingskid2026/tomecast/issues/18)) |
 | Alpine, NixOS, ARM computers | Not supported yet |
 
 ## Privacy
