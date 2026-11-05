@@ -36,7 +36,7 @@ All three are open-licensed (SIL OFL) and get bundled with the app.
 
 | Use | Family | Rule |
 |---|---|---|
-| Big numerals and timers (`02:10:34`, `41%`) | **Doto** (dot-matrix) | Display sizes only, 24 px and up; unreadable smaller |
+| Big numerals and timers (`02:10:34`, `41%`) | **Doto** (dot-matrix), with **round dots** (its `ROND` axis at 100) | Display sizes only, 24 px and up; unreadable smaller |
 | Interface text | **IBM Plex Sans** | |
 | Labels, data, file names, the live caption | **IBM Plex Mono** | Labels in caps with slight letter spacing |
 
@@ -44,6 +44,7 @@ All three are open-licensed (SIL OFL) and get bundled with the app.
 
 - **The sentence grid** (the living element): one dot per chunk of text. Dim means waiting, text colour means voiced, accent means being spoken now. A chunk that fails its audio check blinks once while it's redone. Drawn as one custom item, so thousands of dots stay cheap.
 - **A live caption** of the sentence being voiced, in Plex Mono.
+- **Every dot is round:** the numerals, the art and covers, the sentence grid, the meters and the waveform all use circles, so they read as one family.
 - **No index tags:** no bracketed numbers like `[ 03 ]` on screens, rows or headers. Chapters are listed by title.
 - **Dot meters** for amounts, like speed as an 11-dot meter.
 - **A round play/pause** for the voice preview, with a row of dots as its waveform.
