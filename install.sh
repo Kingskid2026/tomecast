@@ -47,12 +47,14 @@ else
     [ -x "$UV" ] || fail "uv did not install correctly. See https://docs.astral.sh/uv/ for help."
 fi
 
+# uv remembers PyPI's package list for a few minutes; these flags ask again for Tomecast only,
+# so a release published moments ago is picked up. Older uv versions get the plain command.
 if "$UV" tool list 2>/dev/null | grep -q '^tomecast '; then
     say "Tomecast is already installed; upgrading it"
-    "$UV" tool upgrade tomecast
+    "$UV" tool upgrade --reinstall-package tomecast tomecast 2>/dev/null || "$UV" tool upgrade tomecast
 else
     say "installing Tomecast"
-    "$UV" tool install "$PACKAGE"
+    "$UV" tool install --refresh-package tomecast "$PACKAGE" 2>/dev/null || "$UV" tool install "$PACKAGE"
 fi
 
 BIN_DIR="$("$UV" tool dir --bin)"
