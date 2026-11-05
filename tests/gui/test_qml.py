@@ -250,7 +250,7 @@ def test_theme_switches_the_palette(app_window: Window, messages: Messages) -> N
 def test_drop_screen_texts(app_window: Window, messages: Messages) -> None:
     app_window.show("drop")
     assert app_window.text("dropTitle") == "DROP A BOOK HERE"
-    assert app_window.text("formatsLabel") == "EPUB · DOCX · FB2 · HTML · TXT"
+    assert app_window.text("formatsLabel") == "EPUB · PDF · DOCX · FB2 · HTML · TXT"
     assert app_window.text("hardwareLabel") == "CPU · ABOUT 4.7× REAL TIME"
     assert app_window.find("artCredit") is None  # no art credit under the Cantoria
     assert app_window.text("chooseBookButton") == "Choose a book"
@@ -637,7 +637,10 @@ def test_backend_property_list_matches_the_contract(backend: DemoBackend) -> Non
         "formatsLabel", "chapters", "skipFrontMatter", "selectionSummary",
         "voiceGroups", "voice", "voiceLabel", "speed", "outputFormat", "previewText",
         "previewPlaying",
-        "previewAvailable", "downloadNote", "stage", "downloadLabel", "chunksDone", "chunksTotal",
+
+
+        "bookHasPages", "skipPageNumbers",
+        "footnotesAtEnd", "previewAvailable", "downloadNote", "stage", "downloadLabel", "chunksDone", "chunksTotal",
         "chapterLabel", "timeLeft", "progressLabel", "speedLabel", "nowSpeaking", "paused",
         "outputPath", "audioLength", "doneSummary", "warnings",
     }  # fmt: skip
@@ -651,6 +654,9 @@ def test_backend_property_list_matches_the_contract(backend: DemoBackend) -> Non
         "setThemeSetting", "goTo", "chooseBookFolder", "dismissError", "openBook",
         "setChapterSelected", "setSkipFrontMatter", "setVoice", "setSpeed", "setOutputFormat",
         "setUseGpu",
+
+
+        "setSkipPageNumbers", "setFootnotesAtEnd",
         "togglePreview",
         "startConversion", "pauseConversion", "resumeConversion", "cancelConversion",
         "openOutputFolder", "convertAnother",
@@ -661,6 +667,7 @@ def test_backend_property_list_matches_the_contract(backend: DemoBackend) -> Non
     roles = {bytes(name.data()).decode() for name in model.roleNames().values()}
     assert roles == {
         "title", "wordsLabel", "minutesLabel", "meterLit", "frontMatter", "selected",
+        "matterLabel",
     }  # fmt: skip
 
 
@@ -939,4 +946,74 @@ def test_the_graphics_card_row_fits_at_every_width(
     assert sticks_out(page, width) == []
     note = app_window.get("gpuNote")
     assert note.width() <= app_window.get("gpuChoice").width() + 1
+    assert_clean(messages)
+
+
+# -- the skip switches ----------------------------------------------------------------------------
+
+SWITCHES = ("skipPageNumbersSwitch", "skipFrontMatterSwitch", "footnotesAtEndSwitch")
+
+
+def _box(window: Window, name: str) -> tuple[float, float, float, float]:
+    item = window.get(name)
+    corner = item.mapToScene(QPointF(0, 0))
+    return corner.x(), corner.y(), item.width(), item.height()
+
+
+def test_skip_switches_say_what_they_do(app_window: Window, messages: Messages) -> None:
+    app_window.show("chapters")
+    assert [app_window.text(name) for name in SWITCHES] == [
+        "Skip page numbers", "Skip front matter", "Read footnotes at chapter end",
+    ]  # fmt: skip
+    assert [app_window.get(name).property("checked") for name in SWITCHES] == [True, True, False]
+    assert all(app_window.get(name).isVisible() for name in SWITCHES)
+    assert_clean(messages)
+
+
+def test_skip_page_numbers_is_only_for_books_with_pages(
+    app_window: Window, messages: Messages
+) -> None:
+    app_window.show("chapters")
+    app_window.backend.set_book_has_pages(False)
+    app_window.settle()
+
+    assert not app_window.get("skipPageNumbersSwitch").isVisible()
+    assert app_window.get("skipFrontMatterSwitch").isVisible()
+    assert app_window.get("footnotesAtEndSwitch").isVisible()
+    # The switches that are left start where the first one did.
+    assert _box(app_window, "skipFrontMatterSwitch")[0] == _box(app_window, "chapterList")[0]
+    assert_clean(messages)
+
+
+def test_skip_switches_call_the_backend(app_window: Window, messages: Messages) -> None:
+    app_window.show("chapters")
+
+    app_window.click("skipPageNumbersSwitch")
+    app_window.click("footnotesAtEndSwitch")
+
+    assert ("setSkipPageNumbers", (False,)) in app_window.backend.calls
+    assert ("setFootnotesAtEnd", (True,)) in app_window.backend.calls
+    assert app_window.get("skipPageNumbersSwitch").property("checked") is False
+    assert app_window.get("footnotesAtEndSwitch").property("checked") is True
+    assert_clean(messages)
+
+
+@pytest.mark.parametrize("width", [1200, 520])
+def test_skip_switches_wrap_as_in_the_mockup(
+    app_window: Window, messages: Messages, width: int
+) -> None:
+    app_window.window.resize(width, 780)
+    page = app_window.show("chapters")
+    pages, front, notes = (_box(app_window, name) for name in SWITCHES)
+
+    assert pages[1] == front[1]  # side by side, 24 px apart (gap: 10px 24px)
+    assert front[0] - (pages[0] + pages[2]) == 24
+    if width == 1200:
+        assert notes[1] == front[1]
+        assert notes[0] - (front[0] + front[2]) == 24
+    else:
+        assert notes[0] == pages[0]  # wrapped to a second row, 10 px down
+        assert notes[1] - (pages[1] + pages[3]) == 10
+    assert all(box[3] == 44 for box in (pages, front, notes))
+    assert sticks_out(page, width) == []
     assert_clean(messages)

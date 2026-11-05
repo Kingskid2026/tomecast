@@ -18,6 +18,7 @@ from tomecast.readers.epub import read_epub
 from tomecast.readers.errors import InvalidEbookError
 from tomecast.readers.fb2 import read_fb2
 from tomecast.readers.html import read_html
+from tomecast.readers.pdf import read_pdf
 from tomecast.readers.txt import read_txt
 
 
@@ -33,6 +34,7 @@ class Format:
 # Every supported format, in the order people see them. The window lists exactly these.
 _TABLE: tuple[Format, ...] = (
     Format("EPUB", (".epub",), read_epub),
+    Format("PDF", (".pdf",), read_pdf),
     Format("DOCX", (".docx",), read_docx),
     Format("FB2", (".fb2",), read_fb2),
     Format("HTML", (".html", ".htm", ".xhtml"), read_html),
@@ -82,6 +84,8 @@ def _sniff(path: Path, head: bytes) -> Format | None:
         return None
     if b"<FictionBook" in head:
         return _BY_NAME["FB2"]
+    if head.startswith(b"%PDF-"):
+        return _BY_NAME["PDF"]
     return None
 
 
@@ -106,5 +110,6 @@ __all__ = [
     "read_epub",
     "read_fb2",
     "read_html",
+    "read_pdf",
     "read_txt",
 ]

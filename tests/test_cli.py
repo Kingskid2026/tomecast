@@ -10,6 +10,7 @@ from typing import ClassVar
 import pytest
 from epub_factory import NavPoint, Page, build_epub
 from format_factory import book_in_format
+from pdf_factory import PageBuilder, build_pdf
 
 from tomecast import __version__, cli
 from tomecast.downloads import Asset
@@ -28,6 +29,8 @@ class FakeKokoro:
     gpu_description = "NVIDIA RTX PRO 1000 Blackwell Generation Laptop GPU"
     gpu_warning: str | None = None  # set: a use_gpu run falls back to the CPU
     texts: ClassVar[list[str]] = []  # everything the voice was asked to say, across all instances
+
+    texts: ClassVar[list[str]] = []  # everything voiced, in order
 
     def __init__(self, root: Path, *, voice: str, speed: float, use_gpu: bool = False) -> None:
         self.label = f"Fake ({voice})"
@@ -182,8 +185,8 @@ def test_convert_refuses_to_overwrite_without_force(
     ("name", "content", "message"),
     [
         ("missing.epub", None, "doesn't exist"),
-        ("book.pdf", b"%PDF-1.7", "can't read .pdf files"),
-        ("notes.xyz", b"hello", "reads EPUB, DOCX, FB2, HTML and TXT books"),
+        ("book.pdf", b"%PDF-1.7", "book.pdf isn't a PDF, or it's damaged"),
+        ("notes.xyz", b"hello", "reads EPUB, PDF, DOCX, FB2, HTML and TXT books"),
         ("picture.txt", bytes(range(256)) * 20, "isn't a text file"),
         ("broken.epub", b"not a zip", "not"),
     ],
@@ -689,3 +692,71 @@ def test_preview_and_names_are_listed_in_the_help(capsys: pytest.CaptureFixture[
     out = capsys.readouterr().out
     assert "preview" in out
     assert "names" in out
+
+
+# --- PDF books and cleanup ---------------------------------------------------------------------
+
+
+def _pdf(tmp_path: Path) -> Path:
+    """Contents, then two short chapters over three pages with a running header, page
+    numbers and a footnote."""
+    contents = PageBuilder()
+    contents.heading("Contents", size=16)
+    contents.line("Chapter One ........ 1")
+    contents.line("Chapter Two ........ 2")
+    contents.line("Afterword ........ 3")
+    one = PageBuilder().header("A STORY").footer("1")
+    one.heading("Chapter One", size=16)
+    one.paragraph(["It began.^1^ It went on."])
+    one.footnotes(["^1^ As stories do."])
+    two = PageBuilder().header("A STORY").footer("2")
+    two.heading("Chapter Two", size=16)
+    two.paragraph(["It ended without a"])
+    three = PageBuilder().header("A STORY").footer("3")
+    three.paragraph(["period"], indent=0)
+    return build_pdf(
+        tmp_path / "story.pdf", [contents.page, one.page, two.page, three.page], title="A Story"
+    )
+
+
+def test_convert_reads_a_pdf_and_leaves_out_the_page_furniture(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert cli.main(["convert", str(_pdf(tmp_path))]) == 0
+
+    assert (tmp_path / "story.m4b").is_file()
+    out = capsys.readouterr().out
+    assert "Skipping 1 section: “Contents”." in out
+    assert (
+        "Left out: page numbers and running headers and footers (6), footnote markers (1), "
+        "footnote text (1)."
+    ) in out
+    assert "Converting “A Story”: 2 chapters" in out
+    assert " ".join(FakeKokoro.texts) == (
+        "Chapter One It began. It went on. Chapter Two It ended without a period"
+    )
+
+
+def test_convert_cleanup_options(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    book = _pdf(tmp_path)
+    arguments = ["convert", str(book), "--force", "--keep-front-matter", "--keep-page-numbers"]
+
+    assert cli.main([*arguments, "--footnotes", "end"]) == 0
+
+    out = capsys.readouterr().out
+    assert "Skipping" not in out
+    assert "Left out: footnote markers (1)." in out
+    assert "Converting “A Story”: 3 chapters" in out
+    assert " ".join(FakeKokoro.texts) == (
+        "Contents Chapter One ........ 1 Chapter Two ........ 2 Afterword ........ 3 A STORY "
+        "Chapter One It began. It went on. 1 A STORY As stories do. Chapter Two It ended "
+        "without a 2 A STORY period 3"
+    )
+
+
+def test_convert_rejects_an_unknown_footnote_choice(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit):
+        cli.main(["convert", str(_pdf(tmp_path)), "--footnotes", "inline"])
+    assert "invalid choice: 'inline'" in capsys.readouterr().err

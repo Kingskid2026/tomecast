@@ -1,8 +1,6 @@
 """The chapter list (``ChapterModel``) and the estimates shown under it.
 
-Front matter is guessed here until the real cleanup lands (issue #4): sections before the
-first numbered chapter whose title looks like a title page, contents, copyright, dedication or
-edition note, or which have under 100 words.
+Which sections are front or back matter comes from :mod:`tomecast.cleanup`.
 """
 
 from __future__ import annotations
@@ -24,6 +22,7 @@ from PySide6.QtCore import (
 )
 
 from tomecast.book import Book, Chapter
+from tomecast.cleanup import NUMBER_PATTERN, Matter, find_matter
 from tomecast.engines.audiocpp import split_speed
 
 # Narration speed used for estimates (Kokoro at speed 1.0 reads about this fast).
@@ -32,39 +31,18 @@ WORDS_PER_MINUTE = 158
 DEFAULT_SPEEDUP = 4.7
 # Dots in each row's length meter.
 METER_DOTS = 17
-# Sections shorter than this, before the first numbered chapter, count as front matter.
-FRONT_MATTER_WORDS = 100
 
-_NUMBER_WORD = (
-    "one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|"
-    "fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|"
-    "eighty|ninety|hundred"
-)
-_ROMAN = r"(?=[ivxlcdm])m{0,4}(?:cm|cd|d?c{0,3})(?:xc|xl|l?x{0,3})(?:ix|iv|v?i{0,3})"
-_NUMBER = rf"(?:\d+|{_ROMAN}|(?:{_NUMBER_WORD})(?:[- ](?:{_NUMBER_WORD}))?)"
-# "Chapter 3", "PART IV", "Book Two", "Stave I"…
-_NUMBERED_HEADING = re.compile(
-    rf"^\s*(?:chapter|chap\.|part|book|stave|letter)\s+{_NUMBER}\b", re.IGNORECASE
-)
-# A title that is only a number, or starts with one followed by punctuation: "3", "IV. Pig".
-_BARE_NUMBER = re.compile(r"^\s*(?:\d+|[IVXLCDM]+)(?:[.:)]|\s*$)")
 # The "CHAPTER I. " in "CHAPTER I. Down the Rabbit-Hole": rows show titles only (see the mockups).
 _CHAPTER_PREFIX = re.compile(
-    rf"^\s*(?:chapter|chap\.)\s+{_NUMBER}"
-    # then ". ", ": ", " - ", "—" or a space (a bare hyphen belongs to "Twenty-One")
+    rf"^\s*(?:chapter|chap\.)\s+{NUMBER_PATTERN}"
+    # then ". ", ": ", " - ", "\u2014" or a space (a bare hyphen belongs to "Twenty-One")
     r"(?:\s*[.:]\s*|\s*[\u2014\u2013]\s*|\s+-\s+|\s+)(?=\S)",
     re.IGNORECASE,
 )
 _BARE_PREFIX = re.compile(r"^\s*(?:\d+|[IVXLCDM]+)[.:)]\s+(?=\S)")
-_FRONT_MATTER_TITLE = re.compile(
-    r"\b(?:title\s*page|half[\s-]*title|contents|copyright|dedication|edition|imprint)\b",
-    re.IGNORECASE,
-)
 
-
-def is_numbered_chapter(title: str) -> bool:
-    """True for titles like "Chapter 3", "CHAPTER III. Pig and Pepper" or "IV."."""
-    return bool(_NUMBERED_HEADING.match(title) or _BARE_NUMBER.match(title))
+FRONT_MATTER_LABEL = "FRONT MATTER"
+BACK_MATTER_LABEL = "BACK MATTER"
 
 
 UNTITLED = "Untitled section"
@@ -86,35 +64,15 @@ def word_count(chapter: Chapter) -> int:
     return sum(len(paragraph.split()) for paragraph in chapter.paragraphs)
 
 
-def guess_front_matter(book: Book) -> list[bool]:
-    """Guess which sections are front matter (see the module docstring)."""
-    chapters = book.chapters
-    first_numbered = next(
-        (i for i, chapter in enumerate(chapters) if is_numbered_chapter(chapter.title)), None
-    )
-    flags = [False] * len(chapters)
-    for index, chapter in enumerate(chapters):
-        if first_numbered is not None and index >= first_numbered:
-            break
-        looks_like_it = _looks_like_front_matter(chapter, book.title)
-        if first_numbered is None and not looks_like_it:
-            break  # without numbered chapters, only the opening run can be front matter
-        flags[index] = looks_like_it
-    if all(flags):
-        return [False] * len(chapters)  # a book that's all "front matter" has none
-    return flags
-
-
-def _looks_like_front_matter(chapter: Chapter, book_title: str) -> bool:
-    if word_count(chapter) < FRONT_MATTER_WORDS:
-        return True
-    if _FRONT_MATTER_TITLE.search(chapter.title):
-        return True
-    return bool(chapter.title) and _comparable(chapter.title) == _comparable(book_title)
-
-
-def _comparable(text: str) -> str:
-    return "".join(character for character in text.casefold() if character.isalnum())
+def matter_labels(matter: Sequence[Matter | None]) -> list[str]:
+    """``"FRONT MATTER"`` for flagged sections before the story, ``"BACK MATTER"`` after it,
+    ``""`` for the rest."""
+    story = [i for i, kind in enumerate(matter) if kind is None]
+    first = story[0] if story else len(matter)
+    return [
+        "" if kind is None else (FRONT_MATTER_LABEL if i < first else BACK_MATTER_LABEL)
+        for i, kind in enumerate(matter)
+    ]
 
 
 def _round(value: float) -> int:
@@ -173,8 +131,9 @@ class Section:
     chapter: Chapter
     title: str  # as shown, without a "Chapter N." prefix
     words: int
-    front_matter: bool
+    front_matter: bool  # front or back matter: "Skip front matter" unticks it
     selected: bool
+    matter_label: str = ""  # "FRONT MATTER", "BACK MATTER" or ""
 
     @property
     def minutes(self) -> float:
@@ -199,6 +158,7 @@ class ChapterModel(QAbstractListModel):
     MeterLitRole = Qt.ItemDataRole.UserRole + 5
     FrontMatterRole = Qt.ItemDataRole.UserRole + 6
     SelectedRole = Qt.ItemDataRole.UserRole + 7
+    MatterLabelRole = Qt.ItemDataRole.UserRole + 8
 
     _ROLE_NAMES: ClassVar[dict[int, bytes]] = {
         TitleRole: b"title",
@@ -207,6 +167,7 @@ class ChapterModel(QAbstractListModel):
         MeterLitRole: b"meterLit",
         FrontMatterRole: b"frontMatter",
         SelectedRole: b"selected",
+        MatterLabelRole: b"matterLabel",
     }
 
     selectionChanged = Signal()  # any row's ``selected`` changed, or the rows were replaced
@@ -218,18 +179,43 @@ class ChapterModel(QAbstractListModel):
 
     # --- Filling ------------------------------------------------------------------------
 
-    def set_book(self, book: Book, *, skip_front_matter: bool) -> None:
-        """Replace the rows with ``book``'s chapters."""
-        front = guess_front_matter(book)
+    def set_book(
+        self,
+        book: Book,
+        *,
+        skip_front_matter: bool,
+        matter: Sequence[Matter | None] | None = None,
+        keep_selection: bool = False,
+    ) -> None:
+        """Replace the rows with ``book``'s chapters.
+
+        ``matter`` says which chapters are front or back matter (as found by
+        :func:`tomecast.cleanup.clean`); without it, :func:`tomecast.cleanup.find_matter`
+        decides. With ``keep_selection`` (the same book, cleaned again), rows keep their
+        ticks if they're still the same section.
+        """
+        kinds = tuple(matter) if matter is not None else find_matter(book)
+        previous = {
+            (row, section.title, section.front_matter): section.selected
+            for row, section in enumerate(self._sections)
+        }
         sections: list[Section] = []
-        for chapter, is_front in zip(book.chapters, front, strict=True):
+        for row, (chapter, kind, label) in enumerate(
+            zip(book.chapters, kinds, matter_labels(kinds), strict=True)
+        ):
+            title = display_title(chapter.title)
+            is_matter = kind is not None
+            selected = not (is_matter and skip_front_matter)
+            if keep_selection:
+                selected = previous.get((row, title, is_matter), selected)
             sections.append(
                 Section(
                     chapter=chapter,
-                    title=display_title(chapter.title),
+                    title=title,
                     words=word_count(chapter),
-                    front_matter=is_front,
-                    selected=not (is_front and skip_front_matter),
+                    front_matter=is_matter,
+                    selected=selected,
+                    matter_label=label,
                 )
             )
         longest = max((section.minutes for section in sections), default=0.0)
@@ -325,6 +311,8 @@ class ChapterModel(QAbstractListModel):
             return section.front_matter
         if role == self.SelectedRole:
             return section.selected
+        if role == self.MatterLabelRole:
+            return section.matter_label
         return None
 
     def setData(
