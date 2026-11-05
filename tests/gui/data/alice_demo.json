@@ -1,0 +1,107 @@
+{
+ "title": "Alice's Adventures in Wonderland",
+ "authors": [
+  "Lewis Carroll"
+ ],
+ "sections": [
+  {
+   "title": "Alice’s Adventures in Wonderland",
+   "words": 3,
+   "minutes": 0.0,
+   "chunks": 2
+  },
+  {
+   "title": "THE MILLENNIUM FULCRUM EDITION 3.0",
+   "words": 0,
+   "minutes": 0.0,
+   "chunks": 1
+  },
+  {
+   "title": "Contents",
+   "words": 70,
+   "minutes": 0.4,
+   "chunks": 25
+  },
+  {
+   "title": "CHAPTER I. Down the Rabbit-Hole",
+   "words": 2181,
+   "minutes": 13.8,
+   "chunks": 107
+  },
+  {
+   "title": "CHAPTER II. The Pool of Tears",
+   "words": 2093,
+   "minutes": 13.2,
+   "chunks": 118
+  },
+  {
+   "title": "CHAPTER III. A Caucus-Race and a Long Tale",
+   "words": 1694,
+   "minutes": 10.7,
+   "chunks": 104
+  },
+  {
+   "title": "CHAPTER IV. The Rabbit Sends in a Little Bill",
+   "words": 2607,
+   "minutes": 16.5,
+   "chunks": 147
+  },
+  {
+   "title": "CHAPTER V. Advice from a Caterpillar",
+   "words": 2180,
+   "minutes": 13.8,
+   "chunks": 123
+  },
+  {
+   "title": "CHAPTER VI. Pig and Pepper",
+   "words": 2588,
+   "minutes": 16.4,
+   "chunks": 155
+  },
+  {
+   "title": "CHAPTER VII. A Mad Tea-Party",
+   "words": 2282,
+   "minutes": 14.4,
+   "chunks": 163
+  },
+  {
+   "title": "CHAPTER VIII. The Queen’s Croquet-Ground",
+   "words": 2482,
+   "minutes": 15.7,
+   "chunks": 143
+  },
+  {
+   "title": "CHAPTER IX. The Mock Turtle’s Story",
+   "words": 2266,
+   "minutes": 14.3,
+   "chunks": 151
+  },
+  {
+   "title": "CHAPTER X. The Lobster Quadrille",
+   "words": 2025,
+   "minutes": 12.8,
+   "chunks": 151
+  },
+  {
+   "title": "CHAPTER XI. Who Stole the Tarts?",
+   "words": 1872,
+   "minutes": 11.8,
+   "chunks": 126
+  },
+  {
+   "title": "CHAPTER XII. Alice’s Evidence",
+   "words": 2101,
+   "minutes": 13.3,
+   "chunks": 122
+  }
+ ],
+ "story_words": 26371,
+ "story_minutes": 167,
+ "story_chunks": 1610,
+ "ch1_first_sentences": [
+  "Alice was beginning to get very tired of sitting by her sister on the bank, and of having nothing to do: once or twice she had peeped into the book her sister was reading, but it had no pictures or conversations in it, “and what is the use of a book,” thought Alice “without pictures or conversations?”"
+ ],
+ "ch3_sentence": "They were indeed a queer-looking party that assembled on the bank—the birds with draggled feathers, the animals with their fur clinging close to them, and all dripping wet, cross, and uncomfortable.",
+ "wpm": 158,
+ "speedup": 4.7
+}
