@@ -60,3 +60,27 @@ def write_silence(path: Path, seconds: float, sample_rate: int) -> None:
         wav.setsampwidth(2)
         wav.setframerate(sample_rate)
         wav.writeframes(b"\x00\x00" * round(seconds * sample_rate))
+
+
+def concatenate_wavs(parts: list[Path], output: Path, gap_seconds: float = 0.0) -> None:
+    """Join mono 16-bit WAVs with the same sample rate into one file, streaming."""
+    if not parts:
+        raise ValueError("nothing to concatenate")
+    first = wav_info(parts[0])
+    with wave.open(str(output), "wb") as out:
+        out.setnchannels(1)
+        out.setsampwidth(2)
+        out.setframerate(first.sample_rate)
+        silence = b"\x00\x00" * round(gap_seconds * first.sample_rate)
+        for index, part in enumerate(parts):
+            with wave.open(str(part), "rb") as wav:
+                if (wav.getnchannels(), wav.getsampwidth(), wav.getframerate()) != (
+                    1,
+                    2,
+                    first.sample_rate,
+                ):
+                    raise ValueError(f"{part.name}: format differs from {parts[0].name}")
+                while frames := wav.readframes(_FRAMES_PER_READ):
+                    out.writeframes(frames)
+            if index < len(parts) - 1:
+                out.writeframes(silence)

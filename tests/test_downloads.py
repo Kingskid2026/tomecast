@@ -1,14 +1,18 @@
 import hashlib
 import io
 import tarfile
+import zipfile
 from pathlib import Path
+from typing import Literal
 
 import pytest
 
 from tomecast.downloads import Asset, DownloadError, data_dir, ensure, is_installed
 
 
-def _file_asset(source: Path, *, path: str = "models/thing.bin", archive: bool = False) -> Asset:
+def _file_asset(
+    source: Path, *, path: str = "models/thing.bin", archive: Literal["tar.gz", "zip"] | None = None
+) -> Asset:
     data = source.read_bytes()
     return Asset(
         name="test asset",
@@ -76,7 +80,7 @@ def test_installed_files_are_not_downloaded_again(tmp_path: Path) -> None:
 def test_archives_are_extracted_into_their_folder(tmp_path: Path) -> None:
     archive = tmp_path / "engine.tar.gz"
     _make_tar(archive, {"engine/bin/tts": b"binary", "engine/README": b"hi"})
-    asset = _file_asset(archive, path="engines/audiocpp", archive=True)
+    asset = _file_asset(archive, path="engines/audiocpp", archive="tar.gz")
     root = tmp_path / "data"
 
     folder = ensure(asset, root)
@@ -88,7 +92,7 @@ def test_archives_are_extracted_into_their_folder(tmp_path: Path) -> None:
 def test_archives_that_escape_their_folder_are_refused(tmp_path: Path) -> None:
     archive = tmp_path / "evil.tar.gz"
     _make_tar(archive, {"../../escaped": b"gotcha"})
-    asset = _file_asset(archive, path="engines/evil", archive=True)
+    asset = _file_asset(archive, path="engines/evil", archive="tar.gz")
     root = tmp_path / "data"
 
     with pytest.raises(DownloadError, match="extract"):
@@ -103,3 +107,27 @@ def test_data_dir_follows_xdg(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -
     assert data_dir() == tmp_path / "tomecast"
     monkeypatch.delenv("XDG_DATA_HOME")
     assert data_dir() == Path.home() / ".local" / "share" / "tomecast"
+
+
+def test_zip_archives_like_wheels_are_extracted(tmp_path: Path) -> None:
+    archive = tmp_path / "lib.whl"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("espeakng_loader/libespeak-ng.so.1", b"library")
+        zf.writestr("espeakng_loader/espeak-ng-data/phontab", b"data")
+    asset = _file_asset(archive, path="engines/espeak", archive="zip")
+
+    folder = ensure(asset, tmp_path / "data")
+
+    assert (folder / "espeakng_loader" / "libespeak-ng.so.1").read_bytes() == b"library"
+    assert (folder / "espeakng_loader" / "espeak-ng-data" / "phontab").is_file()
+
+
+def test_zip_archives_that_escape_their_folder_are_refused(tmp_path: Path) -> None:
+    archive = tmp_path / "evil.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("../escaped", b"gotcha")
+    asset = _file_asset(archive, path="engines/evil", archive="zip")
+
+    with pytest.raises(DownloadError, match="unsafe path"):
+        ensure(asset, tmp_path / "data")
+    assert not (tmp_path / "escaped").exists()

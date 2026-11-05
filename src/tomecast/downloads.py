@@ -13,9 +13,11 @@ import shutil
 import tarfile
 import tempfile
 import urllib.request
+import zipfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from tomecast import __version__
 
@@ -38,7 +40,7 @@ class Asset:
     sha256: str
     size: int  # bytes, for the "this will download N MB" prompt
     path: str  # relative to the data folder; for archives, the folder to extract into
-    archive: bool = False  # a .tar.gz to extract into ``path``
+    archive: Literal["tar.gz", "zip"] | None = None  # extract into ``path`` if set
 
 
 def data_dir() -> Path:
@@ -72,7 +74,10 @@ def ensure(asset: Asset, root: Path, progress: ProgressCallback | None = None) -
         _download(asset, downloaded, progress)
         if asset.archive:
             extracted = Path(tmp) / "extracted"
-            _safe_extract(downloaded, extracted)
+            if asset.archive == "zip":
+                _safe_extract_zip(downloaded, extracted)
+            else:
+                _safe_extract_tar(downloaded, extracted)
             (extracted / _MARKER).write_text(asset.sha256 + "\n")
             if target.exists():
                 shutil.rmtree(target)
@@ -105,7 +110,7 @@ def _download(asset: Asset, destination: Path, progress: ProgressCallback | None
         )
 
 
-def _safe_extract(archive: Path, destination: Path) -> None:
+def _safe_extract_tar(archive: Path, destination: Path) -> None:
     """Extract a .tar.gz, refusing any member that would land outside ``destination``."""
     if not hasattr(tarfile, "data_filter"):  # added in Python 3.11.4
         raise DownloadError("extracting downloads safely needs Python 3.11.4 or newer")
@@ -116,6 +121,20 @@ def _safe_extract(archive: Path, destination: Path) -> None:
             # and device files.
             tar.extractall(destination, filter="data")
     except (tarfile.TarError, OSError) as error:
+        raise DownloadError(f"couldn't extract {archive.name}: {error}") from error
+
+
+def _safe_extract_zip(archive: Path, destination: Path) -> None:
+    """Extract a .zip (or wheel), refusing any member that would land outside ``destination``."""
+    destination.mkdir()
+    root = destination.resolve()
+    try:
+        with zipfile.ZipFile(archive) as zf:
+            for name in zf.namelist():
+                if not (destination / name).resolve().is_relative_to(root):
+                    raise DownloadError(f"couldn't extract {archive.name}: unsafe path {name!r}")
+            zf.extractall(destination)
+    except (zipfile.BadZipFile, OSError) as error:
         raise DownloadError(f"couldn't extract {archive.name}: {error}") from error
 
 

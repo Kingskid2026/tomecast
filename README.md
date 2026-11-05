@@ -5,10 +5,21 @@
 [![CI](https://github.com/Kingskid2026/tomecast/actions/workflows/ci.yml/badge.svg)](https://github.com/Kingskid2026/tomecast/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
-> [!WARNING]
-> **Tomecast is in early development and can't convert books yet.** The design is done (see [docs/architecture.md](docs/architecture.md)), and the first usable release is tracked in the [v0.1.0 milestone](https://github.com/Kingskid2026/tomecast/milestone/1).
+> [!NOTE]
+> **Early development.** Tomecast can already turn **EPUB** books into **M4B** audiobooks with chapters, using the Kokoro voice, from the command line. PDFs and other formats, smarter cleanup, the desktop window and the premium voice are on the [roadmap](https://github.com/Kingskid2026/tomecast/milestones). The voice engine currently needs a recent Linux (glibc 2.43+, see below).
 
-## What it will do
+## Try it
+
+```sh
+uv tool install tomecast                      # or: pipx install tomecast
+tomecast convert book.epub                    # writes book.m4b next to the book
+tomecast convert book.epub --voice bm_george --speed 1.1
+tomecast voices                               # list the 54 built-in voices
+```
+
+The first conversion downloads the voice engine, eSpeak NG and the Kokoro model (about 264 MB, after asking). On an 8-core laptop CPU, a 13-minute story took about 3 minutes to make.
+
+## What it does (and will do)
 
 - **Reads the book, not the page.** Chapters come out as chapters. Page numbers, running headers and footers, footnote markers, copyright pages, indexes and "read the next book" previews are skipped.
 - **Every sentence gets spoken.** Text is voiced in small, checked pieces, so the end of a page or chapter is never silently dropped.
@@ -44,8 +55,8 @@ The script is [short and readable](install.sh). It installs [uv](https://docs.as
 
 | Your system | Support |
 |---|---|
-| Ubuntu 24.04+, Fedora 40+, Arch-based, Linux Mint 22+, Debian 13+, openSUSE Tumbleweed | Everything |
-| Ubuntu 22.04, Debian 12, Mint 21 | Kokoro voice and the AI add-ons. The premium Ming voice needs a newer system |
+| Distros with glibc 2.43 or newer, like Arch-based ones and openSUSE Tumbleweed (check with `ldd --version`) | Everything |
+| Ubuntu 22.04 and 24.04, Debian 12 and 13, current Fedora | Installs, but the voice engine needs a newer system. Planned in [#18](https://github.com/Kingskid2026/tomecast/issues/18) |
 | Alpine, NixOS, ARM computers | Not supported yet |
 
 ## Privacy
