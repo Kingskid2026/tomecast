@@ -36,10 +36,10 @@ from tomecast.chunking import split_sentences
 from tomecast.downloads import Asset, data_dir, is_installed
 from tomecast.engines.audiocpp import (
     DEFAULT_VOICE,
-    REQUIRED_ASSETS,
     VOICES,
     check_system,
     default_threads,
+    required_assets,
 )
 from tomecast.gui.models import DEFAULT_SPEEDUP, ChapterModel
 from tomecast.gui.worker import (
@@ -47,14 +47,18 @@ from tomecast.gui.worker import (
     ConvertJob,
     ConvertResult,
     ConvertUpdate,
+    DeviceScanner,
     EngineFactory,
     PreviewJob,
     ReadJob,
+    ScanJob,
     TimedControl,
     kokoro_engine,
     megabytes,
     preview_file,
+    scan_gpu,
 )
+from tomecast.hardware import short_name, vulkan_possible
 from tomecast.readers import FORMATS
 
 SCREENS = ("drop", "chapters", "voice", "converting", "done")
@@ -109,6 +113,14 @@ def voice_groups() -> list[dict[str, Any]]:
         voices = [{"id": voice, "name": voice.split("_", 1)[1].capitalize()} for voice in ids]
         groups.append({"label": label, "voices": voices})
     return groups
+
+
+def _as_bool(value: object, *, default: bool) -> bool:
+    """A saved setting as a bool (an INI file stores it as the text "true" or "false")."""
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    return True if text == "true" else False if text == "false" else default
 
 
 def voice_label(voice: str) -> str:
@@ -205,6 +217,9 @@ class Backend(QObject):
     themeChanged = Signal()
     reduceMotionChanged = Signal()
     hardwareLabelChanged = Signal()
+    gpuAvailableChanged = Signal()
+    useGpuChanged = Signal()
+    gpuNameChanged = Signal()
     errorMessageChanged = Signal()
 
     bookLoadedChanged = Signal()
@@ -252,12 +267,14 @@ class Backend(QObject):
         parent: QObject | None = None,
         *,
         engine_factory: EngineFactory = kokoro_engine,
-        assets: Sequence[Asset] = REQUIRED_ASSETS,
+        assets: Sequence[Asset] | None = None,
         data_root: Path | None = None,
         player: str | Literal["auto"] | None = "auto",
         settings: QSettings | None = None,
         system_check: Callable[[], None] = check_system,
         cover_sink: Callable[[bytes | None], None] | None = None,
+        gpu_check: Callable[[], bool] = vulkan_possible,
+        device_scanner: DeviceScanner = scan_gpu,
     ) -> None:
         super().__init__(parent)
         self._settings = settings if settings is not None else QSettings()
@@ -279,7 +296,11 @@ class Backend(QObject):
         self._playback: QProcess | None = None
         self._preview_cache: Path | None = None
         self._shut_down = False
-        self._assets = tuple(assets)
+        fixed_assets = None if assets is None else tuple(assets)
+        # The files a run needs depend on whether it uses the graphics card.
+        self._assets_for: Callable[[bool], Sequence[Asset]] = (
+            required_assets if fixed_assets is None else (lambda use_gpu: fixed_assets)
+        )
         self._verified: dict[Path, tuple[int, int]] = {}  # file -> (size, mtime_ns) once hashed
 
         # App
@@ -289,7 +310,12 @@ class Backend(QObject):
         self._theme = self._effective_theme()
         self._reduceMotion = system_reduce_motion()
         threads = default_threads()
-        self._hardwareLabel = f"CPU · {threads} THREAD{'' if threads == 1 else 'S'}"
+        self._cpuLabel = f"CPU · {threads} THREAD{'' if threads == 1 else 'S'}"
+        self._hardwareLabel = self._cpuLabel
+        self._gpuAvailable = gpu_check()
+        self._useGpu = _as_bool(self._settings.value("useGpu", True), default=True)
+        self._gpuName = ""
+        self._speedup_for = ""  # the hardware label the measured speed belongs to
         self._errorMessage = ""
         # Book
         self._bookLoaded = False
@@ -332,9 +358,10 @@ class Backend(QObject):
         self._thread.setObjectName("tomecast-worker")
         self._worker = ConversionWorker(
             engine_factory=engine_factory,
-            assets=assets,
+            assets=self._assets_for,
             data_root=self._data_root,
             system_check=system_check,
+            device_scanner=device_scanner,
         )
         self._worker.moveToThread(self._thread)
         self._jobRequested.connect(self._worker.run)
@@ -346,7 +373,10 @@ class Backend(QObject):
         self._worker.progressed.connect(self._on_progress)
         self._worker.converted.connect(self._on_converted)
         self._worker.failed.connect(self._on_failed)
+        self._worker.deviceChosen.connect(self._on_device)
         self._thread.start()
+        if self._gpuAvailable:
+            self._jobRequested.emit(ScanJob(next(self._jobs)))  # learn the card's name
 
     # --- Properties: app -------------------------------------------------------------------
 
@@ -355,6 +385,9 @@ class Backend(QObject):
     theme: str = _field(str, "theme", themeChanged)
     reduceMotion: bool = _field(bool, "reduceMotion", reduceMotionChanged)
     hardwareLabel: str = _field(str, "hardwareLabel", hardwareLabelChanged)
+    gpuAvailable: bool = _field(bool, "gpuAvailable", gpuAvailableChanged)
+    useGpu: bool = _field(bool, "useGpu", useGpuChanged)
+    gpuName: str = _field(str, "gpuName", gpuNameChanged)
     errorMessage: str = _field(str, "errorMessage", errorMessageChanged)
 
     # --- Properties: book ------------------------------------------------------------------
@@ -445,6 +478,20 @@ class Backend(QObject):
         self._settings.setValue("themeSetting", name)
         self._settings.sync()
         self._update_theme()
+
+    @Slot(bool)
+    def setUseGpu(self, on: bool) -> None:
+        """Use the graphics card (through the driver already installed) or the CPU. Saved."""
+        if on == self._useGpu:
+            return
+        self._stop_preview()  # a preview made on the other hardware shouldn't keep playing
+        self._update("useGpu", on)
+        self._settings.setValue("useGpu", on)
+        self._settings.sync()
+        self._speedup = None  # the measured speed belonged to the other hardware
+        self.selectionSummaryChanged.emit()
+        self._refresh_hardware_label()
+        self._refresh_download_note()
 
     @Slot(str)
     def goTo(self, screen: str) -> None:
@@ -555,7 +602,9 @@ class Backend(QObject):
             self._play(wav)
             return
         self._preview_job = next(self._jobs)
-        job = PreviewJob(self._preview_job, self._previewText, self._voice, self._speed, wav)
+        job = PreviewJob(
+            self._preview_job, self._previewText, self._voice, self._speed, wav, self._using_gpu
+        )
         self._jobRequested.emit(job)
 
     @Slot()
@@ -596,7 +645,7 @@ class Backend(QObject):
         self._jobRequested.emit(
             ConvertJob(
                 self._convert_job, book, tuple(rows), self._book_path, output, self._voice,
-                self._speed, self._control,
+                self._speed, self._control, self._using_gpu,
             )
         )  # fmt: skip
 
@@ -699,6 +748,12 @@ class Backend(QObject):
         self._update("loading", False)
         self._show("chapters")
 
+    @Slot(str)
+    def _on_device(self, description: str) -> None:
+        """The worker found out (or started the engine on) which graphics card is in use."""
+        self._update("gpuName", description)
+        self._refresh_hardware_label()
+
     @Slot(int, str)
     def _on_preview_ready(self, job: int, path: str) -> None:
         if job != self._preview_job:
@@ -788,7 +843,7 @@ class Backend(QObject):
 
     def _refresh_download_note(self) -> None:
         """Say what Start will download: nothing when every required file is installed."""
-        missing = [a for a in self._assets if not self._installed(a)]
+        missing = [a for a in self._assets_for(self._using_gpu) if not self._installed(a)]
         if not missing:
             self._update("downloadNote", "")
             return
@@ -884,9 +939,32 @@ class Backend(QObject):
         self._control = None
         self._update("paused", False)
 
+    @property
+    def _using_gpu(self) -> bool:
+        """True when the graphics card is both there and switched on."""
+        return self._gpuAvailable and self._useGpu
+
+    def _device_label(self) -> str:
+        """What is voicing, short: ``"NVIDIA RTX PRO 1000"`` or ``"CPU"``."""
+        if self._using_gpu and self._gpuName:
+            return short_name(self._gpuName)
+        return "CPU"
+
+    def _refresh_hardware_label(self) -> None:
+        device = self._device_label()
+        if self._speedup is not None and self._speedup_for == device:
+            self._update(
+                "hardwareLabel", f"{device} \u00b7 ABOUT {self._speedup:.1f}\u00d7 REAL TIME"
+            )
+        elif device == "CPU":
+            self._update("hardwareLabel", self._cpuLabel)
+        else:
+            self._update("hardwareLabel", device)
+
     def _measured(self, speedup: float) -> None:
         self._speedup = speedup
-        self._update("hardwareLabel", f"CPU · ABOUT {speedup:.1f}\u00d7 REAL TIME")
+        self._speedup_for = self._device_label()
+        self._refresh_hardware_label()
         self.selectionSummaryChanged.emit()
 
     # --- Preview playback ------------------------------------------------------------------

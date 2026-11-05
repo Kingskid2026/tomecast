@@ -618,6 +618,7 @@ def test_register_again_returns_the_same_backend(backend: DemoBackend) -> None:
 def test_backend_property_list_matches_the_contract(backend: DemoBackend) -> None:
     contract = {
         "screen", "themeSetting", "theme", "reduceMotion", "hardwareLabel", "errorMessage",
+        "gpuAvailable", "useGpu", "gpuName",
         "bookLoaded", "loading", "bookTitle", "bookAuthors", "coverSource", "artSource",
         "formatsLabel", "chapters", "skipFrontMatter", "selectionSummary",
         "voiceGroups", "voice", "voiceLabel", "speed", "previewText", "previewPlaying",
@@ -633,7 +634,8 @@ def test_backend_property_list_matches_the_contract(backend: DemoBackend) -> Non
         assert meta.property(meta.indexOfProperty(name)).hasNotifySignal(), name
     slots = {
         "setThemeSetting", "goTo", "chooseBookFolder", "dismissError", "openBook",
-        "setChapterSelected", "setSkipFrontMatter", "setVoice", "setSpeed", "togglePreview",
+        "setChapterSelected", "setSkipFrontMatter", "setVoice", "setSpeed", "setUseGpu",
+        "togglePreview",
         "startConversion", "pauseConversion", "resumeConversion", "cancelConversion",
         "openOutputFolder", "convertAnother",
     }  # fmt: skip
@@ -806,4 +808,91 @@ def test_an_untitled_section_has_a_readable_name(app_window: Window, messages: M
     interface = QAccessible.queryAccessibleInterface(row)
     assert interface is not None
     assert interface.text(QAccessible.Text.Name) == "Include untitled section"
+    assert_clean(messages)
+
+
+def test_the_graphics_card_row_is_only_there_when_a_driver_is(
+    app_window: Window, messages: Messages
+) -> None:
+    app_window.show("voice")
+    assert not app_window.get("gpuChoice").isVisible()
+    assert not app_window.get("useGpuSwitch").isVisible()
+
+    app_window.backend.set_gpu(True, "NVIDIA RTX PRO 1000 Blackwell Generation Laptop GPU")
+    app_window.settle()
+    assert app_window.get("gpuChoice").isVisible()
+    assert app_window.text("useGpuSwitch") == "Use graphics card"
+    assert app_window.get("useGpuSwitch").property("checked") is True
+    assert app_window.text("gpuNote") == "FASTER · USES THE DRIVER ALREADY INSTALLED"
+    assert_clean(messages)
+
+
+def _qml_type(item: QQuickItem) -> str:
+    """The QML component an item was made from, e.g. ``CheckRow_QMLTYPE_12``."""
+    return str(item.metaObject().className())
+
+
+def test_the_graphics_card_row_is_the_same_check_row_as_skip_front_matter(
+    app_window: Window, messages: Messages
+) -> None:
+    app_window.show("chapters")
+    skip = app_window.get("skipFrontMatterSwitch")
+    skip_type, skip_height = _qml_type(skip), skip.property("height")
+    app_window.backend.set_gpu(True)
+    app_window.show("voice")
+    gpu = app_window.get("useGpuSwitch")
+    assert skip_type.startswith("CheckRow_QMLTYPE")
+    assert _qml_type(gpu) == skip_type  # the same QML component
+    assert gpu.property("height") == skip_height  # a 44 px tick row
+    assert_clean(messages)
+
+
+def test_clicking_the_graphics_card_row_switches_it_and_the_note(
+    app_window: Window, messages: Messages
+) -> None:
+    app_window.backend.set_gpu(True)
+    app_window.show("voice")
+
+    app_window.click("useGpuSwitch")
+    assert ("setUseGpu", (False,)) in app_window.backend.calls
+    assert app_window.get("useGpuSwitch").property("checked") is False
+    assert (
+        app_window.text("gpuNote")
+        == "USING THE CPU · THE GRAPHICS CARD IS USUALLY SEVERAL TIMES FASTER"
+    )
+
+    app_window.click("useGpuSwitch")
+    assert ("setUseGpu", (True,)) in app_window.backend.calls
+    assert app_window.text("gpuNote") == "FASTER · USES THE DRIVER ALREADY INSTALLED"
+    assert_clean(messages)
+
+
+def test_the_graphics_card_row_is_keyboard_reachable_and_named(
+    app_window: Window, messages: Messages
+) -> None:
+    app_window.backend.set_gpu(True)
+    app_window.show("voice")
+    row = app_window.get("useGpuSwitch")
+    assert row.property("focusPolicy") == Qt.FocusPolicy.StrongFocus
+    QAccessible.setActive(True)
+    interface = QAccessible.queryAccessibleInterface(row)
+    assert interface is not None
+    assert interface.text(QAccessible.Text.Name) == "Use graphics card"
+    assert_clean(messages)
+
+
+@pytest.mark.parametrize("width", [1200, 680, 560, 400])
+@pytest.mark.parametrize("use_gpu", [True, False])
+def test_the_graphics_card_row_fits_at_every_width(
+    app_window: Window, messages: Messages, width: int, use_gpu: bool
+) -> None:
+    app_window.window.resize(width, 700)
+    app_window.backend.set_gpu(True)
+    app_window.backend.setUseGpu(use_gpu)
+    page = app_window.show("voice")
+    app_window.settle()
+    assert page.property("contentWidth") == width  # nothing scrolls sideways
+    assert sticks_out(page, width) == []
+    note = app_window.get("gpuNote")
+    assert note.width() <= app_window.get("gpuChoice").width() + 1
     assert_clean(messages)

@@ -5,6 +5,7 @@ import wave
 from collections.abc import Sequence
 from pathlib import Path
 from types import TracebackType
+from typing import ClassVar
 
 import pytest
 from epub_factory import NavPoint, Page, build_epub
@@ -12,6 +13,7 @@ from epub_factory import NavPoint, Page, build_epub
 from tomecast import __version__, cli
 from tomecast.downloads import Asset
 from tomecast.engines.audiocpp import EngineError
+from tomecast.hardware import GpuDevice
 from tomecast.workdirs import work_folder
 
 
@@ -21,13 +23,24 @@ class FakeKokoro:
     fail_with: str | None = None
     fail_after: int | None = None  # chunks to voice before failing, like an interrupted run
     voiced = 0
+    made: ClassVar[list["FakeKokoro"]] = []
+    gpu_description = "NVIDIA RTX PRO 1000 Blackwell Generation Laptop GPU"
+    gpu_warning: str | None = None  # set: a use_gpu run falls back to the CPU
 
-    def __init__(self, root: Path, *, voice: str, speed: float) -> None:
+    def __init__(self, root: Path, *, voice: str, speed: float, use_gpu: bool = False) -> None:
         self.label = f"Fake ({voice})"
         self.max_chars = 200
         self.sample_rate = 24000
+        self.use_gpu = use_gpu
+        self.warning: str | None = None
+        self.gpu_description = ""
+        FakeKokoro.made.append(self)
 
     def __enter__(self) -> "FakeKokoro":
+        if self.use_gpu and FakeKokoro.gpu_warning:
+            self.warning = FakeKokoro.gpu_warning
+        elif self.use_gpu:
+            self.gpu_description = FakeKokoro.gpu_description
         return self
 
     def __exit__(
@@ -55,13 +68,16 @@ class FakeKokoro:
 
 @pytest.fixture(autouse=True)
 def no_real_engine(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.setattr(cli, "KokoroServer", FakeKokoro)
+    monkeypatch.setattr(cli, "AutoKokoro", FakeKokoro)
     monkeypatch.setattr(cli, "check_system", lambda: None)
-    monkeypatch.setattr(cli, "REQUIRED_ASSETS", ())
+    monkeypatch.setattr(cli, "required_assets", lambda use_gpu: ())
+    monkeypatch.setattr(cli, "vulkan_possible", lambda: False)
     monkeypatch.setattr(cli, "data_dir", lambda: tmp_path / "data")
     FakeKokoro.fail_with = None
     FakeKokoro.fail_after = None
     FakeKokoro.voiced = 0
+    FakeKokoro.made = []
+    FakeKokoro.gpu_warning = None
 
 
 def _epub(tmp_path: Path) -> Path:
@@ -143,7 +159,7 @@ def test_downloads_need_permission_when_not_interactive(
     asset = Asset(
         "Kokoro voice model", "https://example.invalid/m.gguf", "0" * 64, 190_000_000, "m"
     )
-    monkeypatch.setattr(cli, "REQUIRED_ASSETS", (asset,))
+    monkeypatch.setattr(cli, "required_assets", lambda use_gpu: (asset,))
     monkeypatch.setattr("sys.stdin.isatty", lambda: False)
 
     assert cli.main(["convert", str(_epub(tmp_path))]) == 1
@@ -254,3 +270,107 @@ def test_desktop_entry_install_and_uninstall(
 def test_desktop_entry_needs_an_action() -> None:
     with pytest.raises(SystemExit):
         cli.main(["desktop-entry"])
+
+
+def test_the_cpu_is_used_when_there_is_no_vulkan(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert cli.main(["convert", str(_epub(tmp_path))]) == 0
+
+    assert [engine.use_gpu for engine in FakeKokoro.made] == [False]
+    assert "Using the CPU (no graphics card found)." in capsys.readouterr().out
+
+
+def test_the_graphics_card_is_the_default_when_vulkan_is_possible(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(cli, "vulkan_possible", lambda: True)
+
+    assert cli.main(["convert", str(_epub(tmp_path))]) == 0
+
+    assert [engine.use_gpu for engine in FakeKokoro.made] == [True]
+    out = capsys.readouterr().out
+    assert "Using the graphics card: NVIDIA RTX PRO 1000 Blackwell Generation Laptop GPU." in out
+
+
+def test_no_gpu_turns_the_graphics_card_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(cli, "vulkan_possible", lambda: True)
+
+    assert cli.main(["convert", str(_epub(tmp_path)), "--no-gpu"]) == 0
+
+    assert [engine.use_gpu for engine in FakeKokoro.made] == [False]
+    assert "Using the CPU (turned off with --no-gpu)." in capsys.readouterr().out
+
+
+def test_gpu_without_a_vulkan_driver_says_so_and_uses_the_cpu(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert cli.main(["convert", str(_epub(tmp_path)), "--gpu"]) == 0
+
+    assert [engine.use_gpu for engine in FakeKokoro.made] == [False]
+    out = capsys.readouterr().out
+    assert "No usable Vulkan graphics driver was found" in out
+    assert "vulkan-icd-loader" in out
+
+
+def test_a_card_that_didnt_work_is_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(cli, "vulkan_possible", lambda: True)
+    FakeKokoro.gpu_warning = "The graphics card didn't work, so Tomecast used the CPU."
+
+    assert cli.main(["convert", str(_epub(tmp_path))]) == 0
+
+    out = capsys.readouterr().out
+    assert "Using the CPU." in out
+    assert "Note: The graphics card didn't work, so Tomecast used the CPU." in out
+
+
+def test_the_work_folder_depends_on_the_engine_build(tmp_path: Path) -> None:
+    book = _epub(tmp_path)
+    root = tmp_path / "data"
+    assert work_folder(root, book, "af_heart", 1.0, use_gpu=True) != work_folder(
+        root, book, "af_heart", 1.0, use_gpu=False
+    )
+
+
+def test_doctor_prints_what_a_bug_report_needs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(cli, "vulkan_possible", lambda: True)
+
+    assert cli.main(["doctor"]) == 0
+
+    out = capsys.readouterr().out
+    for expected in (
+        f"Tomecast {__version__}",
+        "Distro: ",
+        "glibc: ",
+        "CPU threads: ",
+        "Vulkan possible: yes",
+        "Vulkan devices: not checked (the graphics-card engine isn't installed yet)",
+        "audio.cpp 0.9.4 voice engine (CPU): no",
+        "Kokoro voice model (82M, 8-bit): no",
+    ):
+        assert expected in out
+
+
+def test_doctor_lists_devices_when_the_vulkan_engine_is_installed(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(cli, "is_installed", lambda asset, root: "graphics" in asset.name)
+    monkeypatch.setattr(
+        cli,
+        "list_devices",
+        lambda executable: [
+            GpuDevice(0, "Vulkan0", "NVIDIA RTX PRO 1000", "gpu", 7 * 2**30, 8 * 2**30)
+        ],
+    )
+
+    assert cli.main(["doctor"]) == 0
+
+    out = capsys.readouterr().out
+    assert "0: NVIDIA RTX PRO 1000 (gpu, 7.0 of 8.0 GiB free)" in out
+    assert "(graphics card): yes" in out

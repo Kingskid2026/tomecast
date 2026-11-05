@@ -8,20 +8,35 @@ import pytest
 
 from tomecast.audio import wav_info
 from tomecast.engines import audiocpp
-from tomecast.engines.audiocpp import EngineError, KokoroServer, check_system
+from tomecast.engines.audiocpp import (
+    AUDIOCPP_CPU,
+    AUDIOCPP_VULKAN,
+    AutoKokoro,
+    EngineError,
+    GpuUnavailable,
+    KokoroServer,
+    check_system,
+    required_assets,
+)
 
 # A stand-in for audiocpp_server: same command line, same HTTP API, no model.
 FAKE_SERVER = textwrap.dedent(
     """
     import http.server, json, math, os, struct, sys, wave, io
 
+    if "--list-devices" in sys.argv:
+        print("ggml_vulkan: Found 2 Vulkan devices", file=sys.stderr)
+        print(os.environ.get("FAKE_DEVICES", "{}"))
+        sys.exit(0)
     config = json.load(open(sys.argv[sys.argv.index("--config") + 1]))
     log = open(os.environ["FAKE_LOG"], "a")
     log.write(json.dumps({"event": "start", "config": config, "env": {
         k: v for k, v in os.environ.items() if k.startswith(("AUDIOCPP_", "TMPDIR"))
     }}) + "\\n")
     log.flush()
-    if os.environ.get("FAKE_CRASH"):
+    if os.environ.get("FAKE_CRASH") or (
+        os.environ.get("FAKE_CRASH_VULKAN") and config["backend"] == "vulkan"
+    ):
         print("model failed to load", flush=True)
         sys.exit(3)
 
@@ -44,7 +59,9 @@ FAKE_SERVER = textwrap.dedent(
             self.send_response(200 if self.path == "/health" else 404)
             self.end_headers()
             # The real audio.cpp 0.9.4 reply (checked against the binary).
-            self.wfile.write(b'{"status":"ok","backend":"cpu","version":"0.9.4"}')
+            backend = os.environ.get("FAKE_REPORT_BACKEND") or config["backend"]
+            self.wfile.write(
+                json.dumps({"status": "ok", "backend": backend, "version": "0.9.4"}).encode())
 
         def do_POST(self):
             REQUESTS[0] += 1
@@ -283,3 +300,136 @@ def test_ctrl_c_while_starting_stops_the_engine(
         engine.start()
     assert engine._process is None
     assert engine._tempdir is None
+
+
+# --- The graphics card ------------------------------------------------------------------------
+
+_DEVICES = json.dumps(
+    {
+        "schema_version": 1,
+        "devices": [
+            {"backend": "vulkan", "index": 0, "name": "Vulkan0", "type": "gpu",
+             "description": "NVIDIA RTX PRO 1000 Blackwell Generation Laptop GPU",
+             "memory": {"free_bytes": 7_000_000_000, "total_bytes": 8_000_000_000}},
+            {"backend": "vulkan", "index": 1, "name": "Vulkan1", "type": "igpu",
+             "description": "AMD Radeon 860M Graphics (RADV KRACKAN1)",
+             "memory": {"free_bytes": 9_000_000_000, "total_bytes": 20_000_000_000}},
+            {"backend": "cpu", "index": 0, "name": "CPU", "type": "cpu", "description": "CPU",
+             "memory": {"free_bytes": 1, "total_bytes": 2}},
+        ],
+    }
+)  # fmt: skip
+
+
+@pytest.fixture
+def with_devices(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("FAKE_DEVICES", _DEVICES)
+
+
+def _starts(tmp_path: Path) -> list[dict[str, object]]:
+    return [event for event in _events(tmp_path) if event["event"] == "start"]
+
+
+def test_the_server_config_says_which_backend_and_device(tmp_path: Path, fake_server: Path) -> None:
+    with _server(tmp_path, fake_server, backend="vulkan", device=1):
+        pass
+    config = _starts(tmp_path)[0]["config"]
+    assert isinstance(config, dict)
+    assert (config["backend"], config["device"]) == ("vulkan", 1)
+
+
+def test_the_cpu_config_has_no_device(tmp_path: Path, fake_server: Path) -> None:
+    with _server(tmp_path, fake_server):
+        pass
+    config = _starts(tmp_path)[0]["config"]
+    assert isinstance(config, dict)
+    assert config["backend"] == "cpu"
+    assert "device" not in config
+
+
+def test_a_vulkan_server_that_reports_the_cpu_is_gpu_unavailable(
+    tmp_path: Path, fake_server: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FAKE_REPORT_BACKEND", "cpu")
+    with pytest.raises(GpuUnavailable, match="reported the cpu backend"):
+        _server(tmp_path, fake_server, backend="vulkan", device=0).start()
+
+
+def test_a_vulkan_server_that_fails_to_start_is_gpu_unavailable(
+    tmp_path: Path, fake_server: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FAKE_CRASH_VULKAN", "1")
+    with pytest.raises(GpuUnavailable, match="model failed to load"):
+        _server(tmp_path, fake_server, backend="vulkan", device=0).start()
+
+
+def test_a_cpu_server_that_fails_is_a_plain_engine_error(
+    tmp_path: Path, fake_server: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FAKE_CRASH", "1")
+    with pytest.raises(EngineError) as error:
+        _server(tmp_path, fake_server).start()
+    assert not isinstance(error.value, GpuUnavailable)
+
+
+def test_auto_uses_the_discrete_card(tmp_path: Path, fake_server: Path, with_devices: None) -> None:
+    engine = AutoKokoro(tmp_path / "data", executable=fake_server, startup_timeout=20)
+    with engine:
+        assert (engine.backend, engine.device) == ("vulkan", 0)
+        assert engine.device_label == "NVIDIA RTX PRO 1000"
+        assert engine.gpu_description.startswith("NVIDIA RTX PRO 1000 Blackwell")
+        assert engine.warning is None
+    config = _starts(tmp_path)[0]["config"]
+    assert isinstance(config, dict)
+    assert (config["backend"], config["device"]) == ("vulkan", 0)
+
+
+def test_auto_falls_back_to_the_cpu_on_the_same_build(
+    tmp_path: Path, fake_server: Path, with_devices: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FAKE_CRASH_VULKAN", "1")
+    output = tmp_path / "out.wav"
+    engine = AutoKokoro(tmp_path / "data", executable=fake_server, startup_timeout=20)
+    with engine:
+        assert engine.backend == "cpu"
+        assert engine.device_label == "CPU"
+        assert engine.gpu_description == ""
+        assert engine.warning == "The graphics card didn't work, so Tomecast used the CPU."
+        engine.synthesize("It still speaks.", output)
+    assert wav_info(output).seconds > 0
+    configs = [start["config"] for start in _starts(tmp_path)]
+    assert [config["backend"] for config in configs] == ["vulkan", "cpu"]  # type: ignore[index]
+
+
+def test_auto_falls_back_when_the_server_reports_the_cpu(
+    tmp_path: Path, fake_server: Path, with_devices: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FAKE_REPORT_BACKEND", "cpu")
+    with AutoKokoro(tmp_path / "data", executable=fake_server, startup_timeout=20) as engine:
+        assert engine.backend == "cpu"
+        assert engine.warning == "The graphics card didn't work, so Tomecast used the CPU."
+
+
+def test_auto_uses_the_cpu_when_no_card_is_found(tmp_path: Path, fake_server: Path) -> None:
+    with AutoKokoro(tmp_path / "data", executable=fake_server, startup_timeout=20) as engine:
+        assert engine.backend == "cpu"
+        assert engine.warning == "No usable graphics card was found, so Tomecast used the CPU."
+    assert len(_starts(tmp_path)) == 1  # no failed GPU attempt first
+
+
+def test_auto_without_the_gpu_never_asks_about_devices(
+    tmp_path: Path, fake_server: Path, with_devices: None
+) -> None:
+    engine = AutoKokoro(tmp_path / "data", use_gpu=False, executable=fake_server)
+    with engine:
+        assert (engine.backend, engine.device, engine.warning) == ("cpu", None, None)
+
+
+def test_the_engine_build_follows_the_choice(tmp_path: Path) -> None:
+    assert AutoKokoro(tmp_path, use_gpu=True)._executable.parent.name.endswith("-vulkan")
+    assert AutoKokoro(tmp_path, use_gpu=False)._executable.parent.name.endswith("-cpu")
+    assert AUDIOCPP_VULKAN in required_assets(True)
+    assert AUDIOCPP_CPU not in required_assets(True)
+    assert AUDIOCPP_CPU in required_assets(False)
+    assert AUDIOCPP_VULKAN not in required_assets(False)
+    assert AUDIOCPP_VULKAN.path == "engines/audiocpp-0.9.4-vulkan"

@@ -38,8 +38,9 @@ from tomecast.convert import (
     convert_book,
     plan_chunks,
 )
-from tomecast.downloads import Asset, DownloadError, ensure, is_installed
-from tomecast.engines.audiocpp import EngineError, KokoroServer
+from tomecast.downloads import Asset, DownloadError, ensure, is_installed, local_path
+from tomecast.engines.audiocpp import AUDIOCPP_VULKAN, AutoKokoro, EngineError
+from tomecast.hardware import list_devices, pick_device
 from tomecast.packaging import PackagingError, stretch_wav
 from tomecast.readers.epub import InvalidEbookError, read_epub
 from tomecast.workdirs import WorkFolderBusy, exclusive, work_folder
@@ -57,18 +58,37 @@ class Engine(VoiceEngine, Protocol):
 
     voice: str
     speed: float
+    device_label: str  # after start(): what is in use, "CPU" or the card's short name
+    gpu_description: str  # after start(): the card's full description, or "" on the CPU
+    warning: str | None  # after start(): why the CPU is used when the card was wanted
 
     def start(self) -> None: ...
 
     def close(self) -> None: ...
 
 
-EngineFactory = Callable[[Path, str, float], Engine]  # (data folder, voice, speed)
+# (data folder, voice, speed, use the graphics card if possible)
+EngineFactory = Callable[[Path, str, float, bool], Engine]
+# (use the graphics card) -> the files that choice needs installed
+AssetsFor = Callable[[bool], Sequence[Asset]]
+# (data folder) -> the graphics card's description if one would be used, else ""
+DeviceScanner = Callable[[Path], str]
 
 
-def kokoro_engine(root: Path, voice: str, speed: float) -> Engine:
-    """The real engine: Kokoro through audio.cpp, with its files under ``root``."""
-    return KokoroServer(root, voice=voice, speed=speed)
+def kokoro_engine(root: Path, voice: str, speed: float, use_gpu: bool) -> Engine:
+    """The real engine: Kokoro through audio.cpp, with its files under ``root``. It uses the
+    graphics card when asked to and able, and falls back to the CPU."""
+    return AutoKokoro(root, voice=voice, speed=speed, use_gpu=use_gpu)
+
+
+def scan_gpu(root: Path) -> str:
+    """The description of the graphics card that would be used, or ``""``. Only looks if the
+    graphics-card engine is already installed; it never downloads."""
+    if not is_installed(AUDIOCPP_VULKAN, root):
+        return ""
+    executable = local_path(AUDIOCPP_VULKAN, root) / "audiocpp_server"
+    device = pick_device(list_devices(executable))
+    return device.description if device else ""
 
 
 class TimedControl(ConversionControl):
@@ -110,12 +130,20 @@ class ReadJob:
 
 
 @dataclass(frozen=True, slots=True)
+class ScanJob:
+    """Look for the graphics card (when its engine is installed) to show its name."""
+
+    job: int
+
+
+@dataclass(frozen=True, slots=True)
 class PreviewJob:
     job: int
     text: str
     voice: str
     speed: float
     output: Path  # where the finished WAV goes (it's cached there)
+    use_gpu: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,9 +156,10 @@ class ConvertJob:
     voice: str
     speed: float
     control: TimedControl
+    use_gpu: bool = False
 
 
-Job = ReadJob | PreviewJob | ConvertJob
+Job = ReadJob | ScanJob | PreviewJob | ConvertJob
 
 
 # --- Results (worker → window) ---------------------------------------------------------------
@@ -247,23 +276,27 @@ class ConversionWorker(QObject):
     converted = Signal(int, object)  # job, ConvertResult
     cancelled = Signal(int)  # job
     failed = Signal(int, str)  # job, message for the error banner
+    deviceChosen = Signal(str)  # the graphics card's description, or "" for the CPU
 
     def __init__(
         self,
         *,
         engine_factory: EngineFactory,
-        assets: Sequence[Asset],
+        assets: AssetsFor,
         data_root: Path,
         system_check: Callable[[], None],
+        device_scanner: DeviceScanner = scan_gpu,
     ) -> None:
         super().__init__()
         self._engine_factory = engine_factory
-        self._assets = tuple(assets)
+        self._assets_for = assets
         self._root = data_root
         self._system_check = system_check
+        self._device_scanner = device_scanner
         self._stopping = threading.Event()
-        self._assets_ready = False
+        self._assets_ready: dict[bool, bool] = {}  # per "use the graphics card"
         self._preview_engine: Engine | None = None
+        self._preview_gpu = False
 
     def stop(self) -> None:
         """Skip every job that hasn't started yet. Safe to call from any thread."""
@@ -277,6 +310,8 @@ class ConversionWorker(QObject):
         try:
             if isinstance(job, ReadJob):
                 self._read(job)
+            elif isinstance(job, ScanJob):
+                self.deviceChosen.emit(self._device_scanner(self._root))
             elif isinstance(job, PreviewJob):
                 self._preview(job)
             else:
@@ -310,14 +345,17 @@ class ConversionWorker(QObject):
     def _preview(self, job: PreviewJob) -> None:
         try:
             self._system_check()
-            if not self._have_assets():
+            # Use the graphics card's engine for the preview only if it's installed already
+            # (previews never download); otherwise the CPU engine will do.
+            use_gpu = job.use_gpu and self._have_assets(True)
+            if not use_gpu and not self._have_assets(False):
                 self.failed.emit(
                     job.job,
                     "The voice model downloads once, when you start converting a book. "
                     "Previews work after that.",
                 )
                 return
-            engine = self._preview_engine_for(job.voice, job.speed)
+            engine = self._preview_engine_for(job.voice, job.speed, use_gpu)
             self._voice_text(engine, job.text, job.output)
         except (
             EngineError,
@@ -332,11 +370,15 @@ class ConversionWorker(QObject):
             return
         self.previewReady.emit(job.job, str(job.output))
 
-    def _preview_engine_for(self, voice: str, speed: float) -> Engine:
+    def _preview_engine_for(self, voice: str, speed: float, use_gpu: bool) -> Engine:
+        if self._preview_engine is not None and use_gpu != self._preview_gpu:
+            self._close_preview_engine()  # the choice changed: start on the other hardware
         if self._preview_engine is None:
-            engine = self._engine_factory(self._root, voice, speed)
+            engine = self._engine_factory(self._root, voice, speed, use_gpu)
             engine.start()
             self._preview_engine = engine
+            self._preview_gpu = use_gpu
+            self.deviceChosen.emit(engine.gpu_description)
         self._preview_engine.voice = voice
         self._preview_engine.speed = speed
         return self._preview_engine
@@ -377,7 +419,7 @@ class ConversionWorker(QObject):
         try:
             self._close_preview_engine()  # one model in memory at a time
             self._system_check()
-            engine = self._engine_factory(self._root, job.voice, job.speed)
+            engine = self._engine_factory(self._root, job.voice, job.speed, job.use_gpu)
             plan = plan_chunks(job.book, engine.max_chars, job.chapters)
             chunks = [chunk for chapter in plan for chunk in chapter]
             first_chapter = next((position for position, c in enumerate(plan) if c), 0)
@@ -387,7 +429,9 @@ class ConversionWorker(QObject):
             self._download_missing(job)
             if job.control.cancelled:
                 raise ConversionCancelled
-            workdir = work_folder(self._root, job.book_path, job.voice, job.speed)
+            workdir = work_folder(
+                self._root, job.book_path, job.voice, job.speed, use_gpu=job.use_gpu
+            )
             with exclusive(workdir):
                 self.stageChanged.emit(job.job, "starting")
                 outcome = self._voice_book(job, engine, chunks, workdir)
@@ -413,6 +457,7 @@ class ConversionWorker(QObject):
         control = job.control
         try:
             engine.start()
+            self.deviceChosen.emit(engine.gpu_description)
             started = time.monotonic()
             paused_before = control.paused_seconds
             meter = _Meter(engine, control, chunks)
@@ -433,7 +478,7 @@ class ConversionWorker(QObject):
             chapters=len(result.chapters),
             size_bytes=result.output.stat().st_size,
             seconds_taken=max(0.0, taken),
-            warnings=result.warnings,
+            warnings=(*((engine.warning,) if engine.warning else ()), *result.warnings),
             speedup=meter.speedup(),
         )
 
@@ -452,24 +497,28 @@ class ConversionWorker(QObject):
             ),
         )
 
-    def _have_assets(self) -> bool:
-        if not self._assets_ready:
-            self._assets_ready = all(is_installed(asset, self._root) for asset in self._assets)
-        return self._assets_ready
+    def _have_assets(self, use_gpu: bool) -> bool:
+        if not self._assets_ready.get(use_gpu):
+            self._assets_ready[use_gpu] = all(
+                is_installed(asset, self._root) for asset in self._assets_for(use_gpu)
+            )
+        return self._assets_ready[use_gpu]
 
     def _download_missing(self, job: ConvertJob) -> None:
         """Download the engine and model if needed. Pressing Start counts as agreeing to it,
         so the label says it's a one-time download."""
-        if self._have_assets():
+        if self._have_assets(job.use_gpu):
             return
-        missing = [asset for asset in self._assets if not is_installed(asset, self._root)]
+        missing = [
+            asset for asset in self._assets_for(job.use_gpu) if not is_installed(asset, self._root)
+        ]
         self.stageChanged.emit(job.job, "downloading")
         for number, asset in enumerate(missing, start=1):
             step = f" ({number} OF {len(missing)})" if len(missing) > 1 else ""
             show = self._download_reporter(job, f"DOWNLOADING ONCE{step} · {asset.name.upper()}")
             show(0, asset.size)
             ensure(asset, self._root, progress=show)
-        self._assets_ready = True
+        self._assets_ready[job.use_gpu] = True
 
     def _download_reporter(self, job: ConvertJob, label: str) -> Callable[[int, int], None]:
         shown = -1

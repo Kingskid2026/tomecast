@@ -193,6 +193,9 @@ class DemoBackend(QObject):
     themeChanged = Signal()
     reduceMotionChanged = Signal()
     hardwareLabelChanged = Signal()
+    gpuAvailableChanged = Signal()
+    useGpuChanged = Signal()
+    gpuNameChanged = Signal()
     errorMessageChanged = Signal()
     bookLoadedChanged = Signal()
     loadingChanged = Signal()
@@ -279,6 +282,9 @@ class DemoBackend(QObject):
             "theme": "dark",
             "reduceMotion": False,
             "hardwareLabel": f"CPU · ABOUT {speedup}× REAL TIME",
+            "gpuAvailable": False,
+            "useGpu": True,
+            "gpuName": "",
             "errorMessage": "",
             "bookLoaded": False,
             "loading": False,
@@ -403,6 +409,11 @@ class DemoBackend(QObject):
     def set_download_note(self, text: str) -> None:
         self._set("downloadNote", text)
 
+    def set_gpu(self, available: bool, name: str = "") -> None:
+        """Pretend a graphics driver is (not) installed, and which card it would use."""
+        self._set("gpuAvailable", available)
+        self._set("gpuName", name)
+
     def set_loading(self, on: bool) -> None:
         self._set("loading", on)
 
@@ -513,6 +524,11 @@ class DemoBackend(QObject):
         self._set("speed", round(MIN_SPEED + steps * SPEED_STEP, 2))
         self._set("selectionSummary", self._summary())
 
+    @Slot(bool)
+    def setUseGpu(self, on: bool) -> None:
+        self._record("setUseGpu", on)
+        self._set("useGpu", on)
+
     @Slot()
     def togglePreview(self) -> None:
         self._record("togglePreview")
@@ -577,6 +593,11 @@ class DemoBackend(QObject):
     hardwareLabel = Property(
         str, lambda self: self._get("hardwareLabel"), notify=hardwareLabelChanged
     )
+    gpuAvailable = Property(
+        bool, lambda self: self._get("gpuAvailable"), notify=gpuAvailableChanged
+    )
+    useGpu = Property(bool, lambda self: self._get("useGpu"), notify=useGpuChanged)
+    gpuName = Property(str, lambda self: self._get("gpuName"), notify=gpuNameChanged)
     errorMessage = Property(str, lambda self: self._get("errorMessage"), notify=errorMessageChanged)
     bookLoaded = Property(bool, lambda self: self._get("bookLoaded"), notify=bookLoadedChanged)
     loading = Property(bool, lambda self: self._get("loading"), notify=loadingChanged)

@@ -52,12 +52,16 @@ Every property has a `<name>Changed` notify signal. Lists are plain JS arrays of
 | `themeSetting` | string | `"system"`, `"dark"` or `"light"` (saved between runs) |
 | `theme` | string | the effective theme: `"dark"` or `"light"` |
 | `reduceMotion` | bool | true when animations should be skipped |
-| `hardwareLabel` | string | e.g. `"CPU · 8 THREADS"`, then `"CPU · ABOUT 4.7× REAL TIME"` once a conversion has measured it |
+| `hardwareLabel` | string | what is voicing. `"CPU · 8 THREADS"` on the CPU, or the graphics card's short name (`short_name()`: `"NVIDIA RTX PRO 1000"`) when it is available, switched on and known. Once a conversion has measured the speed it ends `" · ABOUT 19.8× REAL TIME"` (`"CPU · ABOUT 4.7× REAL TIME"` on the CPU). The measurement is forgotten when `useGpu` changes, since it belonged to the other hardware |
+| `gpuAvailable` | bool | true when `vulkan_possible()` was true at start: a Vulkan loader and a graphics device exist. `VoiceScreen.qml` shows the "Use graphics card" row only then |
+| `useGpu` | bool | the "Use graphics card" choice, default true, saved between runs (`QSettings` key `useGpu`). It has an effect only while `gpuAvailable` is true |
+| `gpuName` | string | the full description of the card that is (or would be) used, e.g. `"NVIDIA RTX PRO 1000 Blackwell Generation Laptop GPU"`; `""` until known. It is learned by a scan at start-up (only if the graphics-card engine is installed) and each time an engine starts, which also sets it back to `""` when the engine fell back to the CPU |
 | `errorMessage` | string | a problem to show in the error banner; `""` when there's none |
 
 | Slot | Does |
 |---|---|
 | `setThemeSetting(name)` | switch the theme |
+| `setUseGpu(on)` | use the graphics card (through the driver already installed) or the CPU. Saved. Refreshes `downloadNote` and `hardwareLabel` |
 | `goTo(screen)` | move between screens that are allowed from here (back buttons) |
 | `chooseBookFolder()` → string | the folder the file dialog should open in (last used, else `~`) |
 | `dismissError()` | clear `errorMessage` |
@@ -98,7 +102,7 @@ Front matter is guessed until the real cleanup lands (issue #4): sections before
 | `previewText` | string | the first sentence of the first selected chapter |
 | `previewPlaying` | bool | |
 | `previewAvailable` | bool | false when no system audio player was found (the button explains) |
-| `downloadNote` | string | what Start will download: `""` when every file in `REQUIRED_ASSETS` is installed, otherwise `"STARTING DOWNLOADS THE VOICE ONCE · 271 MB"` (the sizes of the *missing* assets added up, in MB, rounded up). Recomputed each time the voice screen is shown and once a conversion's downloads have finished. A file already checked against its SHA-256 isn't hashed again until its size or modification time changes. `VoiceScreen.qml` shows it as a muted `MonoLabel` right above Start converting. |
+| `downloadNote` | string | what Start will download: `""` when every file in `required_assets(use_gpu)` (the Vulkan build with the card on, the CPU build with it off, plus eSpeak and Kokoro) is installed, otherwise `"STARTING DOWNLOADS THE VOICE ONCE · 271 MB"` (the sizes of the *missing* assets added up, in MB, rounded up). Recomputed each time the voice screen is shown, when `useGpu` changes, and once a conversion's downloads have finished. A file already checked against its SHA-256 isn't hashed again until its size or modification time changes. `VoiceScreen.qml` shows it as a muted `MonoLabel` right above Start converting. |
 
 | Slot | Does |
 |---|---|
@@ -159,6 +163,12 @@ The window passes `overwrite=False`. `startConversion` picks `<title>.m4b` (or `
 |---|---|
 | `openOutputFolder()` | open the folder in the file manager |
 | `convertAnother()` | back to `"drop"`, keeping voice and speed |
+
+### The graphics card
+
+The jobs sent to the worker carry `use_gpu` (`useGpu` and `gpuAvailable`). The engine factory is `(data folder, voice, speed, use_gpu) -> Engine`; the real one is `AutoKokoro`, which falls back to the CPU itself and sets `engine.warning`, `engine.device_label` and `engine.gpu_description` once started. The worker reports the description through its `deviceChosen` signal, and adds the engine's warning to the conversion's `warnings` (so the done screen shows "The graphics card didn't work, so Tomecast used the CPU."). Previews use the card's engine only if it is already installed (previews never download), else the CPU's. The work folder is keyed by `use_gpu`, so a card run and a CPU run of one book never share chunks.
+
+On `VoiceScreen.qml`, in the preview panel below the speed meter and only when `gpuAvailable`: a `CheckRow` (the same component as "Skip front matter") labelled "Use graphics card" (`useGpuSwitch`), and a muted `MonoLabel` (`gpuNote`): "FASTER · USES THE DRIVER ALREADY INSTALLED" when on, "USING THE CPU · THE GRAPHICS CARD IS USUALLY SEVERAL TIMES FASTER" when off.
 
 ## `DotGrid` (QML type from `dotgrid.py`)
 
