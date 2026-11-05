@@ -40,8 +40,10 @@ command -v python3 >/dev/null || export PATH="/opt/python/cp312-cp312/bin:$PATH"
 log() { printf '\n=== %s\n' "$*"; }
 
 # --- Check the source ---------------------------------------------------------------------
-# The checkout belongs to the runner's user; let git read it, so --version shows the commit.
+# The checkout belongs to the runner's user; let git read it, so --version shows the commit,
+# abbreviated to the same 8 characters as upstream's own builds.
 git config --global --add safe.directory "$src"
+git config --global core.abbrev 8
 actual=$(git -C "$src" rev-parse HEAD)
 if [ "$actual" != "$AUDIOCPP_COMMIT" ]; then
     echo "expected audio.cpp at $AUDIOCPP_COMMIT, found $actual" >&2
