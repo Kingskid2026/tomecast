@@ -273,6 +273,14 @@ def test_times(written: str, spoken: str) -> None:
         ("€10", "ten euros"),
         ("¥500", "five hundred yen"),
         ("paid $ 5 for it", "paid five dollars for it"),
+        # After a/an, an amount describing the next word: "an eight-dollar flat".
+        ("lived in an $8 flat.", "lived in an eight-dollar flat."),
+        ("a £5 note", "a five-pound note"),
+        ("a $20 bill and", "a twenty-dollar bill and"),
+        ("a $1.50 coffee", "a one dollar and fifty cents coffee"),  # cents: plain amount
+        ("a $5 or $6 tip", "a five dollars or six dollars tip"),  # next word isn't a noun
+        ("an $8 per week rent", "an eight dollars per week rent"),
+        ("the $8 flat", "the eight dollars flat"),  # only after a/an
         ("12%", "twelve percent"),
         ("3.5%", "three point five percent"),
         ("100 %", "one hundred percent"),

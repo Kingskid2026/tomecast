@@ -303,10 +303,29 @@ _CURRENCY = re.compile(
 _PERCENT = re.compile(rf"(?<![\w.,/])(?P<whole>{_NUMBER})(?:\.(?P<frac>\d+))?\s?%")
 
 
+# "an $8 flat" is "an eight-dollar flat": after a/an, a whole amount describing the next
+# word takes the singular, hyphenated form. These next words mean it's a plain amount instead.
+_NOT_A_NOUN = frozenset(
+    "a an the and or but per each for to of in on at by from with than so if as is was were "
+    "be been are this that it".split()
+)
+_ARTICLE_BEFORE = re.compile(r"\b(?:a|an)\s+$", re.IGNORECASE)
+_WORD_AFTER = re.compile(r"\s+([a-z][a-z'’-]*)")
+
+
+def _describes_next_word(text: str, match: re.Match[str]) -> bool:
+    if not _ARTICLE_BEFORE.search(text[: match.start()]):
+        return False
+    after = _WORD_AFTER.match(text, match.end())
+    return after is not None and after.group(1).lower() not in _NOT_A_NOUN
+
+
 def _currency(text: str) -> str:
     def replace(match: re.Match[str]) -> str:
         one, many, cent_one, cent_many = _CURRENCIES[match["sym"]]
         whole, fraction, scale = match["whole"], match["frac"], match["scale"]
+        if not scale and not fraction and _describes_next_word(text, match):
+            return f"{spoken_number(whole)}-{one}"
         if scale:
             return f"{spoken_number(whole, fraction)} {scale.lower()} {many}"
         digits = whole.replace(",", "")
