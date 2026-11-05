@@ -24,8 +24,8 @@ QML_DROP_SCREEN = Path(readers.__file__).parents[1] / "gui" / "qml" / "screens" 
 
 
 def test_formats_are_listed_in_display_order() -> None:
-    assert FORMATS == ("EPUB", "DOCX", "FB2", "HTML", "TXT")
-    assert SUFFIXES == (".epub", ".docx", ".fb2", ".html", ".htm", ".xhtml", ".txt")
+    assert FORMATS == ("EPUB", "PDF", "DOCX", "FB2", "HTML", "TXT")
+    assert SUFFIXES == (".epub", ".pdf", ".docx", ".fb2", ".html", ".htm", ".xhtml", ".txt")
 
 
 def test_the_file_dialog_offers_every_supported_suffix() -> None:
@@ -113,7 +113,7 @@ def test_a_zip_that_is_neither_epub_nor_docx_is_refused(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("name", "kind"),
     [
-        ("book.pdf", ".pdf files"),
+        ("book.azw3", ".azw3 files"),
         ("book.mobi", ".mobi files"),
         ("book", "files without an extension"),
     ],
@@ -122,14 +122,14 @@ def test_unsupported_files_are_refused_with_a_clear_sentence(
     tmp_path: Path, name: str, kind: str
 ) -> None:
     path = tmp_path / name
-    path.write_bytes(b"%PDF-1.7 something")
+    path.write_bytes(b"BOOKMOBI something")
 
     with pytest.raises(InvalidEbookError) as error:
         read_book(path)
 
     assert (
         str(error.value)
-        == f"Tomecast can't read {kind}. It reads EPUB, DOCX, FB2, HTML and TXT books."
+        == f"Tomecast can't read {kind}. It reads EPUB, PDF, DOCX, FB2, HTML and TXT books."
     )
 
 

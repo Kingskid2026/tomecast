@@ -32,6 +32,7 @@ from PySide6.QtGui import QDesktopServices, QGuiApplication
 
 from tomecast.book import Book
 from tomecast.chunking import split_sentences
+from tomecast.cleanup import CleanupOptions, clean
 from tomecast.downloads import Asset, data_dir, is_installed
 from tomecast.engines.audiocpp import (
     DEFAULT_VOICE,
@@ -68,8 +69,8 @@ MIN_SPEED, MAX_SPEED, SPEED_STEP = 0.5, 3.0, 0.25  # 11 meter dots; 1.00x is the
 PLAYERS = ("pw-play", "paplay", "aplay")  # the first one found plays previews
 
 FORMATS_LABEL = " · ".join(FORMATS)  # only what Tomecast can read today
-# Formats the window lists but can't read yet.
-COMING_SOON = {".pdf": "PDF"}
+# Formats the window lists but can't read yet (none at the moment), by extension.
+COMING_SOON: dict[str, str] = {}
 _FORMAT_LIST = f"{', '.join(FORMATS[:-1])} and {FORMATS[-1]}"
 STOPPED_MESSAGE = "Stopped. Start again to continue where you left off."
 UNKNOWN_TIME = "--:--:--"
@@ -227,6 +228,9 @@ class Backend(QObject):
     formatsLabelChanged = Signal()
     chaptersChanged = Signal()
     skipFrontMatterChanged = Signal()
+    bookHasPagesChanged = Signal()
+    skipPageNumbersChanged = Signal()
+    footnotesAtEndChanged = Signal()
     selectionSummaryChanged = Signal()
 
     voiceGroupsChanged = Signal()
@@ -286,7 +290,8 @@ class Backend(QObject):
         self._control: TimedControl | None = None
         self._chapter_labels: list[str] = []
         self._speedup: float | None = None  # measured in this session
-        self._book: Book | None = None
+        self._raw_book: Book | None = None  # as read, before cleanup
+        self._book: Book | None = None  # cleaned with the skip switches
         self._book_path: Path | None = None
         self._cover_count = 0
         self._has_cover = False
@@ -320,6 +325,9 @@ class Backend(QObject):
         self._bookTitle = ""
         self._bookAuthors = ""
         self._skipFrontMatter = True
+        self._bookHasPages = False
+        self._skipPageNumbers = True
+        self._footnotesAtEnd = False
         self._chapters = ChapterModel(self)
         self._chapters.selectionChanged.connect(self._on_selection_changed)
         # Voice
@@ -419,6 +427,9 @@ class Backend(QObject):
 
     chapters = _property(QObject, _get_chapters, chaptersChanged)
     skipFrontMatter: bool = _field(bool, "skipFrontMatter", skipFrontMatterChanged)
+    bookHasPages: bool = _field(bool, "bookHasPages", bookHasPagesChanged)
+    skipPageNumbers: bool = _field(bool, "skipPageNumbers", skipPageNumbersChanged)
+    footnotesAtEnd: bool = _field(bool, "footnotesAtEnd", footnotesAtEndChanged)
 
     def _get_selection_summary(self) -> dict[str, str]:
         return self._chapters.summary(self._speedup or DEFAULT_SPEEDUP, self._speed)
@@ -566,6 +577,21 @@ class Backend(QObject):
         self._update("skipFrontMatter", on)
         self._chapters.set_front_matter_selected(not on)
 
+    @Slot(bool)
+    def setSkipPageNumbers(self, on: bool) -> None:
+        """Leave out (or read) page numbers and running headers and footers, then refresh
+        the chapter list. Only books with pages (PDF) have them."""
+        if on != self._skipPageNumbers:
+            self._update("skipPageNumbers", on)
+            self._apply_cleanup(keep_selection=True)
+
+    @Slot(bool)
+    def setFootnotesAtEnd(self, on: bool) -> None:
+        """Read footnotes at the end of their chapter (or leave them out), then refresh."""
+        if on != self._footnotesAtEnd:
+            self._update("footnotesAtEnd", on)
+            self._apply_cleanup(keep_selection=True)
+
     # --- Slots: voice ----------------------------------------------------------------------
 
     @Slot(str)
@@ -709,6 +735,7 @@ class Backend(QObject):
         if self._screen == "converting":
             return
         self._stop_preview()
+        self._raw_book = None
         self._book = None
         self._book_path = None
         self._read_job = None
@@ -716,6 +743,7 @@ class Backend(QObject):
         self._set_cover(None)
         for name, value in (
             ("bookLoaded", False), ("loading", False), ("bookTitle", ""), ("bookAuthors", ""),
+            ("bookHasPages", False),
             ("outputPath", ""), ("audioLength", ""), ("doneSummary", ""), ("warnings", []),
             ("errorMessage", ""),
         ):  # fmt: skip
@@ -756,9 +784,10 @@ class Backend(QObject):
             # it would strand the conversion that is running.
             self._update("loading", False)
             return
-        self._book = book
+        self._raw_book = book
         self._book_path = self._read_path
-        self._chapters.set_book(book, skip_front_matter=self._skipFrontMatter)
+        self._update("bookHasPages", book.has_pages)
+        self._apply_cleanup(keep_selection=False)
         self._update("bookTitle", book.title)
         self._update("bookAuthors", ", ".join(book.authors))
         self._set_cover(book.cover.data if book.cover else None)
@@ -845,6 +874,28 @@ class Backend(QObject):
         self._update("errorMessage", message)
 
     # --- Helpers ---------------------------------------------------------------------------
+
+    def _cleanup_options(self) -> CleanupOptions:
+        """The cleanup the switches ask for. Front and back matter is found but not removed:
+        "Skip front matter" unticks those rows instead, so they can be ticked again."""
+        return CleanupOptions(
+            page_numbers=self._skipPageNumbers,
+            footnotes="end" if self._footnotesAtEnd else "drop",
+            skip=frozenset(),
+        )
+
+    def _apply_cleanup(self, *, keep_selection: bool) -> None:
+        """Clean the book as read with the current switches and refresh the chapter list."""
+        if self._raw_book is None:
+            return
+        result = clean(self._raw_book, self._cleanup_options())
+        self._book = result.book
+        self._chapters.set_book(
+            result.book,
+            skip_front_matter=self._skipFrontMatter,
+            matter=result.matter,
+            keep_selection=keep_selection,
+        )
 
     def _update(self, name: str, value: object) -> None:
         """Set the property ``name`` and emit ``<name>Changed`` if its value changed."""

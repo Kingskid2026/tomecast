@@ -6,16 +6,17 @@
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
 > [!NOTE]
-> **Early development.** Tomecast can already turn **EPUB, DOCX, FB2, HTML and TXT** books into **M4B** audiobooks with chapters, using the Kokoro voice, from the command line. PDFs, smarter cleanup, the desktop window and the premium voice are on the [roadmap](https://github.com/Kingskid2026/tomecast/milestones). The voice engine currently needs a recent Linux (glibc 2.43+, see below).
+> **Early development.** Tomecast can already turn **EPUB, PDF, DOCX, FB2, HTML and TXT** books into **M4B** audiobooks with chapters, using the Kokoro voice, from the command line. It reads the book, not the page: page numbers, running headers, footnotes, captions, links and front matter are left out. Scanned PDFs, the desktop window and the premium voice are on the [roadmap](https://github.com/Kingskid2026/tomecast/milestones). The voice engine currently needs a recent Linux (glibc 2.43+, see below).
 
 ## Try it
 
 ```sh
 uv tool install tomecast                      # or: pipx install tomecast
 tomecast convert book.epub                    # writes book.m4b next to the book
-tomecast convert book.docx                    # EPUB, DOCX, FB2, HTML and TXT work today (PDF is coming)
+tomecast convert book.docx                    # EPUB, PDF, DOCX, FB2, HTML and TXT work today
 tomecast convert book.epub --voice bm_george --speed 1.1   # speed: 0.5 to 3.0 (default 1.0)
 tomecast convert book.epub --format mp3       # a folder "book/" with one MP3 per chapter
+tomecast convert book.pdf --footnotes end     # read footnotes at the end of each chapter
 tomecast voices                               # list the 54 built-in voices
 tomecast names book.epub                      # list names the voice might get wrong
 tomecast preview "Galadriel"                  # hear a word (or -o word.wav to save it)

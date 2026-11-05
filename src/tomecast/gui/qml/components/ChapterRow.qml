@@ -17,6 +17,7 @@ T.AbstractButton {
     required property string minutesLabel
     required property int meterLit
     required property bool frontMatter
+    required property string matterLabel  // "FRONT MATTER" or "BACK MATTER"
     required property bool selected
 
     // Set by the screen: the window is 680 px wide or less.
@@ -70,7 +71,7 @@ T.AbstractButton {
             }
         }
 
-        // Title, elided to fit, then the FRONT MATTER tag on its baseline.
+        // Title, elided to fit, then the FRONT (or BACK) MATTER tag on its baseline.
         Item {
             id: titleCell
             readonly property real tagRoom: frontTag.visible ? 10 + frontTag.implicitWidth : 0
@@ -98,7 +99,7 @@ T.AbstractButton {
                 visible: row.frontMatter
                 x: chapterTitle.width + 10
                 y: chapterTitle.y + chapterTitle.baselineOffset - baselineOffset
-                text: "FRONT MATTER"
+                text: row.matterLabel || "FRONT MATTER"
                 size: 10
                 tracking: 0.12
             }

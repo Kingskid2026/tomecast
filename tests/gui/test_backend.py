@@ -21,17 +21,20 @@ from pytestqt.qtbot import QtBot
 
 from tomecast.audio import wav_info
 from tomecast.book import Book, Chapter
+from tomecast.cleanup import is_numbered_chapter
 from tomecast.convert import plan_chunks
 from tomecast.downloads import Asset, is_installed
 from tomecast.engines.audiocpp import EngineError, split_speed
 from tomecast.gui import backend as backend_module
 from tomecast.gui.backend import STOPPED_MESSAGE, Backend, safe_file_name, unique_output
-from tomecast.gui.models import ChapterModel, display_title, is_numbered_chapter, summarize
+from tomecast.gui.models import ChapterModel, display_title, summarize
 from tomecast.gui.worker import TimedControl, preview_file
+from tomecast.textprep import TextPrep
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # for epub_factory
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # for epub_factory, pdf_factory
 from epub_factory import NavPoint, Page, build_epub, tiny_png
 from format_factory import book_in_format
+from pdf_factory import SAMPLE_CHAPTERS, build_sample_book, plain
 
 SAMPLE_RATE = 24000
 CHARS_PER_SECOND = 15.0
@@ -267,7 +270,7 @@ def test_opening_a_book_lists_its_chapters(
     assert backend.bookAuthors == "Test Author"
     assert backend.coverSource.startswith("image://dots/cover/dark?")
     assert backend.artSource == "image://dots/cantoria/dark"
-    assert backend.formatsLabel == "EPUB · DOCX · FB2 · HTML · TXT"  # formats with a reader
+    assert backend.formatsLabel == "EPUB · PDF · DOCX · FB2 · HTML · TXT"  # formats with a reader
     rows = _rows(backend.chapters)
     assert all("number" not in row for row in rows)  # no index tags: rows are listed by title
     assert [row["title"] for row in rows] == [
@@ -461,27 +464,23 @@ def test_changing_the_speed_updates_the_estimates(
     ("name", "message"),
     [
         (
-            "book.pdf",
-            "PDF support is coming soon. For now, Tomecast reads EPUB, DOCX, FB2, HTML and TXT "
-            "books.",
-        ),
-        (
             "book.xyz",
-            "Tomecast can't read .xyz files. It reads EPUB, DOCX, FB2, HTML and TXT books.",
+            "Tomecast can't read .xyz files. It reads EPUB, PDF, DOCX, FB2, HTML and TXT books.",
         ),
         (
             "book",
-            "Tomecast can't read files without an extension. It reads EPUB, DOCX, FB2, HTML and "
-            "TXT books.",
+            "Tomecast can't read files without an extension. It reads EPUB, PDF, DOCX, FB2, "
+            "HTML and TXT books.",
         ),
         ("missing.epub", "Couldn't find missing.epub."),
+        ("missing.pdf", "Couldn't find missing.pdf."),
     ],
 )
 def test_books_that_cant_be_read_explain_why(
     make_backend: MakeBackend, tmp_path: Path, name: str, message: str
 ) -> None:
     backend = make_backend()
-    if name != "missing.epub":
+    if not name.startswith("missing."):
         (tmp_path / name).write_bytes(b"something")
 
     backend.openBook(_url(tmp_path / name))
@@ -1677,3 +1676,111 @@ def test_the_preview_follows_the_hardware_choice(
 
     assert [engine.use_gpu for engine in engines.made] == [True, False]
     assert engines.made[0].closed
+
+
+# --- PDF books and the skip switches ---------------------------------------------------------
+
+
+def _words_of(model: ChapterModel) -> list[int]:
+    return [section.words for section in model.sections]
+
+
+def test_a_pdf_opens_with_its_front_matter_flagged(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    backend = make_backend()
+    _open(qtbot, backend, build_sample_book(tmp_path / "magi.pdf"))
+
+    assert backend.bookHasPages is True
+    assert backend.skipPageNumbers is True
+    assert backend.footnotesAtEnd is False
+    rows = _rows(backend.chapters)
+    assert [row["title"] for row in rows] == [
+        "The Gift of the Magi. O. Henry", "Contents", "One Dollar and Eighty-Seven Cents",
+        "Mr. James Dillingham Young", "The Pier-Glass",
+    ]  # fmt: skip
+    assert [row["matterLabel"] for row in rows] == ["FRONT MATTER"] * 2 + [""] * 3
+    assert [row["frontMatter"] for row in rows] == [True, True, False, False, False]
+    assert [row["selected"] for row in rows] == [False, False, True, True, True]
+    assert backend.previewText == "One dollar and eighty-seven cents."
+
+
+def test_page_numbers_can_be_read_and_the_list_follows(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    backend = make_backend()
+    _open(qtbot, backend, build_sample_book(tmp_path / "magi.pdf"))
+    backend.setChapterSelected(4, False)  # the reader's own choice is kept
+    skipped = _words_of(backend.chapters)
+    seen: list[bool] = []
+    backend.skipPageNumbersChanged.connect(lambda: seen.append(backend.skipPageNumbers))
+
+    backend.setSkipPageNumbers(False)
+
+    assert seen == [False]
+    kept = _words_of(backend.chapters)
+    # Each of the 4 story pages has a header ("THE GIFT OF THE MAGI", 5 words) and a number.
+    # A header is read before the chapter heading under it, so it ends the chapter before.
+    assert [after - before for before, after in zip(skipped, kept, strict=True)] == [
+        0, 5, 6, 12, 1
+    ]  # fmt: skip
+    assert backend.chapters.selected_rows() == [2, 3]
+    assert backend._book is not None
+    assert "THE GIFT OF THE MAGI" in backend._book.chapters[2].paragraphs
+
+    backend.setSkipPageNumbers(True)
+    assert _words_of(backend.chapters) == skipped
+    backend.setSkipPageNumbers(True)  # no change, no signal
+    assert seen == [False, True]
+
+
+def test_footnotes_can_be_read_at_chapter_end(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    backend = make_backend()
+    _open(qtbot, backend, build_sample_book(tmp_path / "magi.pdf"))
+    before = _words_of(backend.chapters)
+
+    backend.setFootnotesAtEnd(True)
+
+    assert backend.footnotesAtEnd is True
+    assert backend._book is not None
+    assert backend._book.chapters[2].paragraphs[-1] == "Della is Mrs. James Dillingham Young."
+    assert _words_of(backend.chapters)[2] == before[2] + 6
+    assert backend.selectionSummary["sections"] == "3 OF 5 SECTIONS"
+
+
+def test_an_epub_has_no_page_numbers_to_skip(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    backend = make_backend()
+    _open(qtbot, backend, build_sample_book(tmp_path / "magi.pdf"))
+    assert backend.bookHasPages is True
+
+    backend.goTo("drop")
+    _open(qtbot, backend, _short_book(tmp_path))
+    assert backend.bookHasPages is False
+    backend.goTo("drop")
+    _open(qtbot, backend, build_sample_book(tmp_path / "magi.pdf"))
+    backend.convertAnother()
+    assert backend.bookHasPages is False
+
+
+def test_a_pdf_is_voiced_without_its_page_furniture(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    engines = Engines()
+    backend = make_backend(engines)
+    _open(qtbot, backend, build_sample_book(tmp_path / "magi.pdf"))
+    for row in (2, 3):
+        backend.setChapterSelected(row, False)  # only "The Pier-Glass", to keep it quick
+
+    _convert(qtbot, backend)
+
+    assert backend.screen == "done"
+    voiced = " ".join(engines.texts)
+    assert "THE GIFT OF THE MAGI" not in voiced
+    title, paragraphs = SAMPLE_CHAPTERS[2]
+    # Spoken as text prep says it ("III." as "three.", "$8 flat" as "eight-dollar flat").
+    prep = TextPrep.for_language("en")
+    assert voiced == " ".join([prep.heading(title), *(prep.body(plain(p)) for p in paragraphs)])

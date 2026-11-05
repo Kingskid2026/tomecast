@@ -1,4 +1,4 @@
-// A tick box with a label, 44 px tall: the skip switch.
+// A tick box with a label, 44 px tall: the skip switches.
 // It doesn't toggle itself: bind `checked` to the backend and act in onClicked.
 import QtQuick
 import QtQuick.Templates as T

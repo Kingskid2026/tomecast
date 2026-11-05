@@ -75,20 +75,27 @@ Every property has a `<name>Changed` notify signal. Lists are plain JS arrays of
 | `bookTitle`, `bookAuthors` | string | authors joined with ", " |
 | `coverSource` | string | `"image://dots/cover/<theme>?<n>"` (`<n>` changes per book), or `""` without a cover (a cover whose shape is thinner than 1:4 or wider than 4:1 counts as none) |
 | `artSource` | string | `"image://dots/cantoria/<theme>"` |
-| `formatsLabel` | string | the formats Tomecast can read today, from `tomecast.readers.FORMATS` joined with `" · "` ("EPUB · DOCX · FB2 · HTML · TXT" today). The file dialog's filter in `DropScreen.qml` must list the same suffixes as `tomecast.readers.SUFFIXES` (a test checks this). Books are read with `tomecast.readers.read_book`, which also picks the reader by content, so a mis-named book still opens once it's chosen |
+| `formatsLabel` | string | the formats Tomecast can read today, from `tomecast.readers.FORMATS` joined with `" · "` ("EPUB · PDF · DOCX · FB2 · HTML · TXT" today). The file dialog's filter in `DropScreen.qml` must list the same suffixes as `tomecast.readers.SUFFIXES` (a test checks this). Books are read with `tomecast.readers.read_book`, which also picks the reader by content, so a mis-named book still opens once it's chosen |
 | `chapters` | ChapterModel | one row per section of the book. A section with no title is called `"Untitled section"` (its accessible name is "Include untitled section") |
-| `skipFrontMatter` | bool | ticks and unticks the rows marked front matter |
+| `skipFrontMatter` | bool | ticks and unticks the rows marked front or back matter. On by default; not saved between runs |
+| `bookHasPages` | bool | the open book is laid out in pages (a PDF), so it can have page numbers and running headers. `ChaptersScreen.qml` shows "Skip page numbers" only when this is true |
+| `skipPageNumbers` | bool | leave out page numbers and running headers and footers (the `page-numbers` cleanup rule). On by default; not saved between runs |
+| `footnotesAtEnd` | bool | read footnote text at the end of its chapter instead of leaving it out (`footnotes="end"`). Off by default; not saved between runs |
 | `selectionSummary` | object | `{sections, words, audio, make}`: ready-to-show uppercase strings, as in the mockup. `audio` is the length of the finished book, so it shrinks as the speed goes up; `make` is the time to voice it, which stops shrinking above 1.5× because the voice never speaks faster than that. It is recomputed when the speed changes ("12 OF 15 SECTIONS", "26,371 WORDS", "ABOUT 2 H 47 MIN OF AUDIO", "ABOUT 36 MIN TO MAKE HERE") |
 
-`ChapterModel` roles: `title` (without a leading "Chapter N."; rows show titles only, no index numbers), `wordsLabel` (`"2,181"`), `minutesLabel` (`"14 min"`, `"<1 min"`), `meterLit` (0–17 dots), `frontMatter` (bool), `selected` (bool, editable).
+`ChapterModel` roles: `title` (without a leading "Chapter N."; rows show titles only, no index numbers), `wordsLabel` (`"2,181"`), `minutesLabel` (`"14 min"`, `"<1 min"`), `meterLit` (0–17 dots), `frontMatter` (bool: front or back matter, which "Skip front matter" unticks), `matterLabel` (`"FRONT MATTER"` before the story, `"BACK MATTER"` after it, `""` otherwise; the tag after the title shows it), `selected` (bool, editable).
 
 | Slot | Does |
 |---|---|
 | `openBook(url)` | read a book (a `file://` URL from the file dialog, or a dropped file), then go to `"chapters"` |
 | `setChapterSelected(row, selected)` | |
 | `setSkipFrontMatter(on)` | |
+| `setSkipPageNumbers(on)` | cleans the book again with the new switch and refreshes the chapter list (see below) |
+| `setFootnotesAtEnd(on)` | the same, for footnotes |
 
-Front matter is guessed until the real cleanup lands (issue #4): sections before the first numbered chapter whose title looks like a title page, contents, copyright, dedication or edition note, or which have under 100 words.
+**Cleanup.** The worker reads the book with `read_book()` and sends it as read (for a PDF, with its layout in `Book.raw`). The backend keeps that and runs `tomecast.cleanup.clean()` on the GUI thread, with `page_numbers=skipPageNumbers`, `footnotes="end"` if `footnotesAtEnd` else `"drop"`, and `skip=frozenset()`: front and back matter is found (`CleanupResult.matter`) but not removed, because "Skip front matter" unticks those rows instead, so they can be ticked again. Cleaning doesn't parse the PDF again, so it's quick: about 35 ms for a 360-page book (reading that book takes about 2.5 s). When `setSkipPageNumbers` or `setFootnotesAtEnd` changes a switch, the book is cleaned again and the rows replaced; a row that is still the same section (same position, title and front-matter flag) keeps its tick. `startConversion` sends the cleaned book. Front and back matter rules are in docs/architecture.md ("Cleanup").
+
+The switches sit above the chapter list in a `Flow`, as in `Chapters.dc.html`: "Skip page numbers", "Skip front matter", "Read footnotes at chapter end", each a `CheckRow`, wrapping with 24 px between switches and 10 px between rows (the Flow's spacing is 10, and the first two switches sit in slots 14 px wider than themselves). Their object names are `skipPageNumbersSwitch`, `skipFrontMatterSwitch` and `footnotesAtEndSwitch`.
 
 ### Voice
 

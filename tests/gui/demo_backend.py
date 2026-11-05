@@ -100,6 +100,10 @@ class Section:
     chunks: int
     selected: bool = True
 
+    @property
+    def matter_label(self) -> str:
+        return "FRONT MATTER" if self.front_matter else ""
+
 
 class DemoChapterModel(QAbstractListModel):
     """``ChapterModel``-compatible list: the roles documented in docs/gui.md."""
@@ -110,6 +114,7 @@ class DemoChapterModel(QAbstractListModel):
     MeterLitRole = Qt.ItemDataRole.UserRole + 4
     FrontMatterRole = Qt.ItemDataRole.UserRole + 5
     SelectedRole = Qt.ItemDataRole.UserRole + 6
+    MatterLabelRole = Qt.ItemDataRole.UserRole + 7
 
     _ROLE_NAMES: ClassVar[dict[int, bytes]] = {
         TitleRole: b"title",
@@ -118,6 +123,7 @@ class DemoChapterModel(QAbstractListModel):
         MeterLitRole: b"meterLit",
         FrontMatterRole: b"frontMatter",
         SelectedRole: b"selected",
+        MatterLabelRole: b"matterLabel",
     }
 
     selectionChanged = Signal()
@@ -154,6 +160,8 @@ class DemoChapterModel(QAbstractListModel):
             return section.front_matter
         if role == self.SelectedRole:
             return section.selected
+        if role == self.MatterLabelRole:
+            return section.matter_label
         return None
 
     def setData(self, index: _ModelIndex, value: Any, role: int = Qt.ItemDataRole.EditRole) -> bool:
@@ -206,6 +214,9 @@ class DemoBackend(QObject):
     formatsLabelChanged = Signal()
     chaptersChanged = Signal()
     skipFrontMatterChanged = Signal()
+    bookHasPagesChanged = Signal()
+    skipPageNumbersChanged = Signal()
+    footnotesAtEndChanged = Signal()
     selectionSummaryChanged = Signal()
     voiceGroupsChanged = Signal()
     voiceChanged = Signal()
@@ -293,8 +304,12 @@ class DemoBackend(QObject):
             "bookAuthors": ", ".join(data["authors"]),
             "coverSource": "",
             "artSource": "",
-            "formatsLabel": "EPUB · DOCX · FB2 · HTML · TXT",
+            "formatsLabel": "EPUB · PDF · DOCX · FB2 · HTML · TXT",
             "skipFrontMatter": True,
+            # The mockup shows all three switches, as for a book with pages.
+            "bookHasPages": True,
+            "skipPageNumbers": True,
+            "footnotesAtEnd": False,
             "selectionSummary": {},
             "voiceGroups": self._voice_groups(),
             "voice": "af_heart",
@@ -425,6 +440,9 @@ class DemoBackend(QObject):
     def set_warnings(self, warnings: list[str]) -> None:
         self._set("warnings", list(warnings))
 
+    def set_book_has_pages(self, on: bool) -> None:
+        self._set("bookHasPages", on)
+
     def show(self, screen: str, theme: str | None = None) -> None:
         """Jump straight to any screen (and theme), opening Alice first if needed.
 
@@ -510,6 +528,16 @@ class DemoBackend(QObject):
             if section.front_matter:
                 self._chapters.set_selected(row, not on)
         self._set("skipFrontMatter", on)
+
+    @Slot(bool)
+    def setSkipPageNumbers(self, on: bool) -> None:
+        self._record("setSkipPageNumbers", on)
+        self._set("skipPageNumbers", on)
+
+    @Slot(bool)
+    def setFootnotesAtEnd(self, on: bool) -> None:
+        self._record("setFootnotesAtEnd", on)
+        self._set("footnotesAtEnd", on)
 
     # -- Voice ----------------------------------------------------------------------------------
 
@@ -617,6 +645,15 @@ class DemoBackend(QObject):
     chapters = Property(QObject, _chapters_model, notify=chaptersChanged)
     skipFrontMatter = Property(
         bool, lambda self: self._get("skipFrontMatter"), notify=skipFrontMatterChanged
+    )
+    bookHasPages = Property(
+        bool, lambda self: self._get("bookHasPages"), notify=bookHasPagesChanged
+    )
+    skipPageNumbers = Property(
+        bool, lambda self: self._get("skipPageNumbers"), notify=skipPageNumbersChanged
+    )
+    footnotesAtEnd = Property(
+        bool, lambda self: self._get("footnotesAtEnd"), notify=footnotesAtEndChanged
     )
     selectionSummary = Property(
         dict, lambda self: self._get("selectionSummary"), notify=selectionSummaryChanged

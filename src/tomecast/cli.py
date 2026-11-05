@@ -19,8 +19,9 @@ from typing import Literal, TextIO
 
 from tomecast import __version__, pronunciations
 from tomecast.audio import concatenate_wavs
-from tomecast.book import Book
+from tomecast.book import Book, Chapter
 from tomecast.chunking import CoverageError, chunk_paragraphs
+from tomecast.cleanup import RULES, CleanupOptions, Matter, Removal, clean
 from tomecast.convert import (
     ConversionProgress,
     MissingAudioError,
@@ -123,6 +124,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="use the graphics card through the driver already installed "
         "(default: on when one is found); --no-gpu uses the CPU",
     )  # fmt: skip
+    cleanup = convert.add_argument_group(
+        "cleanup", "What to leave out. By default Tomecast reads the book, not the page."
+    )
+    cleanup.add_argument(
+        "--keep-page-numbers",
+        action="store_true",
+        help="read page numbers and running headers and footers (PDF)",
+    )
+    cleanup.add_argument(
+        "--keep-front-matter",
+        action="store_true",
+        help="read the front and back matter too: title page, copyright, contents, index, "
+        '"Also by" lists and previews of other books',
+    )
+    cleanup.add_argument(
+        "--footnotes",
+        choices=("drop", "end"),
+        default="drop",
+        help="leave footnotes out (drop, the default) or read them at the end of their chapter",
+    )
 
     commands.add_parser("voices", help="list the available voices")
 
@@ -296,8 +317,13 @@ def _convert(args: argparse.Namespace) -> int:
         check_system()
     except (InvalidEbookError, EngineError, OSError) as error:
         raise CliError(str(error)) from error
-    if not book.chapters:
+    cleaned = clean(book, _cleanup_options(args))
+    book = cleaned.book
+    chapters = cleaned.kept
+    if not chapters:
         raise CliError(f"no readable text found in {book_path.name}")
+    for line in _cleanup_notes(cleaned.removed, book.chapters):
+        print(line)
 
     use_gpu = _wants_gpu(args.gpu)
     root = data_dir()
@@ -310,9 +336,9 @@ def _convert(args: argparse.Namespace) -> int:
     except OSError as error:
         raise CliError(str(error)) from error
 
-    chunk_count = sum(len(chunks) for chunks in plan_chunks(book, MAX_CHARS, prep=prep))
+    chunk_count = sum(len(chunks) for chunks in plan_chunks(book, MAX_CHARS, chapters, prep=prep))
     print(
-        f"Converting “{book.title}”: {_plural(len(book.chapters), 'chapter')}, "
+        f"Converting “{book.title}”: {_plural(len(chapters), 'chapter')}, "
         f"{_plural(chunk_count, 'piece')} of text, voice {args.voice}."
     )
     if prep.pronunciations:
@@ -338,6 +364,7 @@ def _convert(args: argparse.Namespace) -> int:
                     progress=progress.update,
                     format=output_format,
                     prep=prep,
+                    chapters=chapters,
                 )
         except KeyboardInterrupt:
             progress.finish()
@@ -537,6 +564,37 @@ def _voice_text(engine: VoiceEngine, text: str, output: Path) -> None:
             engine.synthesize(piece, part)
             parts.append(part)
         concatenate_wavs(parts, output, gap_seconds=0.2)
+
+
+def _cleanup_options(args: argparse.Namespace) -> CleanupOptions:
+    return CleanupOptions(
+        page_numbers=not args.keep_page_numbers,
+        footnotes="end" if args.footnotes == "end" else "drop",
+        skip=frozenset() if args.keep_front_matter else frozenset(Matter),
+    )
+
+
+def _cleanup_notes(removed: Sequence[Removal], chapters: Sequence[Chapter]) -> list[str]:
+    """What cleanup left out, in a few lines: sections skipped, then counts per rule."""
+    sections = [r for r in removed if r.rule in set(Matter)]
+    counts: dict[str, int] = {}
+    for removal in removed:
+        if removal.rule not in set(Matter):
+            counts[removal.rule] = counts.get(removal.rule, 0) + 1
+    lines = []
+    if sections:
+        names = ", ".join(f"“{_display_name(r, chapters)}”" for r in sections)
+        lines.append(f"Skipping {_plural(len(sections), 'section')}: {names}.")
+    if counts:
+        parts = ", ".join(f"{RULES[rule]} ({count:,})" for rule, count in counts.items())
+        lines.append(f"Left out: {parts}.")
+    return lines
+
+
+def _display_name(removal: Removal, chapters: Sequence[Chapter]) -> str:
+    if removal.chapter is not None and chapters[removal.chapter].title:
+        return chapters[removal.chapter].title
+    return removal.text
 
 
 def _interrupt(signum: int, frame: object) -> None:
