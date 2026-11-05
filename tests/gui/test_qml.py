@@ -16,7 +16,9 @@ import demo_backend
 import pytest
 from demo_backend import SCREENS, DemoBackend
 from PySide6.QtCore import (
+    Q_ARG,
     QMessageLogContext,
+    QMetaObject,
     QPointF,
     Qt,
     QtMsgType,
@@ -99,8 +101,20 @@ class Window:
             for item in self.window.contentItem().findChildren(QQuickItem)
         )
 
+    def scroll_into_view(self, item: QQuickItem) -> None:
+        """Scroll the page holding ``item`` so it's on screen, as a person would."""
+        node = item.parentItem()
+        while node is not None:
+            meta = node.metaObject()
+            if meta.indexOfMethod("ensureVisible(QVariant)") != -1:
+                QMetaObject.invokeMethod(node, "ensureVisible", Q_ARG("QVariant", item))
+                self.settle()
+                return
+            node = node.parentItem()
+
     def click(self, name_or_item: str | QQuickItem, at: QPointF | None = None) -> None:
         item = self.get(name_or_item) if isinstance(name_or_item, str) else name_or_item
+        self.scroll_into_view(item)
         local = at if at is not None else QPointF(item.width() / 2, item.height() / 2)
         point = item.mapToScene(local).toPoint()
         QTest.mouseClick(
@@ -773,14 +787,14 @@ def test_output_format_choice(app_window: Window, messages: Messages, width: int
     app_window.show("voice")
     m4b, mp3 = app_window.get("format_m4b"), app_window.get("format_mp3")
     assert (m4b.property("text"), mp3.property("text")) == (
-        "AUDIOBOOK · M4B",
-        "MP3 · ONE PER CHAPTER",
+        "M4B audiobook",
+        "MP3 per chapter",
     )
     assert (m4b.property("chosen"), mp3.property("chosen")) == (True, False)
-    # Next to Start converting, and wholly inside the window.
-    start = app_window.get("startConvertingButton")
+    # Under SPEED in the preview panel, like the panel's other settings, and inside the window.
     choice = app_window.get("outputFormatChoice")
-    assert choice.mapToScene(QPointF(0, 0)).y() < start.mapToScene(QPointF(0, 0)).y()
+    meter = app_window.get("speedMeter")
+    assert choice.mapToScene(QPointF(0, 0)).y() > meter.mapToScene(QPointF(0, 0)).y()
     for pill in (m4b, mp3):
         left = pill.mapToScene(QPointF(0, 0)).x()
         assert left >= 0 and left + pill.width() <= width

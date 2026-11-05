@@ -10,7 +10,6 @@ from __future__ import annotations
 import itertools
 import math
 import os
-import re
 import shutil
 import subprocess
 import tempfile
@@ -59,6 +58,7 @@ from tomecast.gui.worker import (
     scan_gpu,
 )
 from tomecast.hardware import short_name, vulkan_possible
+from tomecast.packaging import portable_name
 from tomecast.readers import FORMATS, SUFFIXES
 
 SCREENS = ("drop", "chapters", "voice", "converting", "done")
@@ -130,14 +130,9 @@ def voice_label(voice: str) -> str:
 
 
 def safe_file_name(title: str) -> str:
-    """``title`` as a file name: no slashes, control characters or leading dots, and short
-    enough for any Linux file system."""
-    text = re.sub(r"[\x00-\x1f\x7f]", " ", title).replace("/", "-")
-    text = " ".join(text.split()).lstrip(".").strip()
-    encoded = text.encode()
-    if len(encoded) > 200:
-        text = encoded[:200].decode(errors="ignore")
-    return text.rstrip(" .")
+    """``title`` as a file or folder name that works on every common file system, including
+    the FAT32 and exFAT of USB sticks (see :func:`tomecast.packaging.portable_name`)."""
+    return portable_name(title)
 
 
 def unique_output(folder: Path, title: str, output_format: str = "m4b") -> Path:

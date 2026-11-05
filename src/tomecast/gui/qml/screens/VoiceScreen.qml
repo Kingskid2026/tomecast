@@ -183,33 +183,6 @@ ScreenPage {
         ColumnLayout {
             spacing: 10
 
-            // What to make: one audiobook file, or a folder of MP3s (the same pills as the voices).
-            Flow {
-                objectName: "outputFormatChoice"
-                Layout.alignment: Qt.AlignRight
-                Layout.maximumWidth: page.innerWidth
-                layoutDirection: Qt.RightToLeft
-                spacing: 8
-                Accessible.role: Accessible.Grouping
-                Accessible.name: "Output format"
-
-                ChoicePill {
-                    objectName: "format_mp3"
-                    text: "MP3 · ONE PER CHAPTER"
-                    chosen: Backend.outputFormat === "mp3"
-                    Accessible.name: "MP3, one file per chapter"
-                    onClicked: Backend.setOutputFormat("mp3")
-                }
-
-                ChoicePill {
-                    objectName: "format_m4b"
-                    text: "AUDIOBOOK · M4B"
-                    chosen: Backend.outputFormat === "m4b"
-                    Accessible.name: "Audiobook, one M4B file"
-                    onClicked: Backend.setOutputFormat("m4b")
-                }
-            }
-
             // What Start will download, if anything (the first time only).
             MonoLabel {
                 objectName: "downloadNote"
@@ -309,6 +282,42 @@ ScreenPage {
 
                 SpeedControl {
                     Layout.fillWidth: true
+                }
+
+                // OUTPUT: one audiobook file, or a folder of MP3s, in the same pills as the voices.
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: 8
+
+                    MonoLabel {
+                        text: "OUTPUT"
+                        size: 11
+                        tracking: 0.14
+                    }
+
+                    Flow {
+                        objectName: "outputFormatChoice"
+                        Layout.fillWidth: true
+                        spacing: 8
+                        Accessible.role: Accessible.Grouping
+                        Accessible.name: "Output format"
+
+                        ChoicePill {
+                            objectName: "format_m4b"
+                            text: "M4B audiobook"
+                            chosen: Backend.outputFormat === "m4b"
+                            Accessible.name: "Audiobook, one M4B file with chapters"
+                            onClicked: Backend.setOutputFormat("m4b")
+                        }
+
+                        ChoicePill {
+                            objectName: "format_mp3"
+                            text: "MP3 per chapter"
+                            chosen: Backend.outputFormat === "mp3"
+                            Accessible.name: "MP3, one file per chapter"
+                            onClicked: Backend.setOutputFormat("mp3")
+                        }
+                    }
                 }
 
                 // Only when a graphics driver is there to use.

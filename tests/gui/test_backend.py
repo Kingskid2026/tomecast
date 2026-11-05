@@ -839,7 +839,7 @@ def test_an_existing_audiobook_is_never_overwritten(
 
 
 def test_output_names_are_safe_and_unique(tmp_path: Path) -> None:
-    assert safe_file_name("Either/Or: A Fragment\nof Life") == "Either-Or: A Fragment of Life"
+    assert safe_file_name("Either/Or: A Fragment\nof Life") == "Either-Or - A Fragment of Life"
     assert safe_file_name("...Hidden") == "Hidden"
     assert len(safe_file_name("é" * 300).encode()) <= 200
     (tmp_path / "Book.m4b").write_bytes(b"")
@@ -1339,8 +1339,8 @@ def test_converting_to_mp3_writes_a_folder_and_opens_it(
     assert backend.screen == "done"
     folder = tmp_path / "Short Book"
     assert sorted(p.name for p in folder.iterdir()) == [
-        "1 - Chapter 1: The Night.mp3",
-        "2 - Chapter 2.mp3",
+        "01 - Chapter 1 - The Night.mp3",
+        "02 - Chapter 2.mp3",
     ]
     assert not list(tmp_path.glob("*.m4b"))
     assert backend.outputPath == str(folder)

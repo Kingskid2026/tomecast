@@ -139,8 +139,8 @@ def test_convert_writes_one_mp3_per_chapter(
 
     folder = tmp_path / "story"
     assert sorted(p.name for p in folder.iterdir()) == [
-        "1 - Chapter One.mp3",
-        "2 - Chapter Two.mp3",
+        "01 - Chapter One.mp3",
+        "02 - Chapter Two.mp3",
     ]
     assert not (tmp_path / "story.m4b").exists()
     assert f"Done: {folder} " in capsys.readouterr().out

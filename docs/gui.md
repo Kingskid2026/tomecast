@@ -97,7 +97,7 @@ Front matter is guessed until the real cleanup lands (issue #4): sections before
 | `voiceGroups` | list | `[{label: "AMERICAN · FEMALE", voices: [{id: "af_heart", name: "Heart"}, …]}, …]` for American and British English |
 | `voice` | string | the chosen voice id (saved between runs) |
 | `voiceLabel` | string | `"HEART · AMERICAN · FEMALE"` |
-| `outputFormat` | string | `"m4b"` (one audiobook file, the default) or `"mp3"` (a folder with one MP3 per chapter), saved between runs (`QSettings` key `outputFormat`; anything else falls back to `"m4b"`). `VoiceScreen.qml` shows it as two `ChoicePill`s (the pills the voice list uses), "AUDIOBOOK · M4B" (`format_m4b`) and "MP3 · ONE PER CHAPTER" (`format_mp3`), in a `Flow` (`outputFormatChoice`) above the Start converting button |
+| `outputFormat` | string | `"m4b"` (one audiobook file, the default) or `"mp3"` (a folder with one MP3 per chapter), saved between runs (`QSettings` key `outputFormat`; anything else falls back to `"m4b"`). `VoiceScreen.qml` shows it as two `ChoicePill`s (the pills the voice list uses), "M4B audiobook" (`format_m4b`) and "MP3 per chapter" (`format_mp3`), in a `Flow` (`outputFormatChoice`) under an OUTPUT label below the speed meter |
 | `speed` | real | 0.5–3.0 in steps of 0.25 on the meter, 11 dots with 1.00× the third (saved between runs; an older saved value such as 1.05 snaps to the nearest step) |
 | `minSpeed`, `maxSpeed`, `speedStep` | real | the meter's range (`MIN_SPEED`, `MAX_SPEED`, `SPEED_STEP` in `backend.py`). Constants, so no notify signal. `VoiceScreen.qml` reads its end labels ("0.5×", "3×") and dot values from them instead of hard-coding the range |
 | `previewText` | string | the first sentence of the first selected chapter |

@@ -582,8 +582,8 @@ def test_mp3_format_writes_a_folder_with_every_sentence(tmp_path: Path) -> None:
 
     assert result.output == target
     assert sorted(p.name for p in target.iterdir()) == [
-        "1 - Chapter One.mp3",
-        "2 - Chapter Two.mp3",
+        "01 - Chapter One.mp3",
+        "02 - Chapter Two.mp3",
     ]
     assert [c.title for c in result.chapters] == ["Chapter One", "Chapter Two"]
     spoken = "".join("".join(t.split()) for t in engine.texts)

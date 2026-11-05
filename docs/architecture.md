@@ -173,7 +173,7 @@ Both sit behind one small interface (`voices()`, `languages()`, `synthesize(chun
 ### 7. Packager
 - `ffmpeg` (available on every distro) joins the chunks.
 - **M4B:** AAC, 64 kbps mono (about 30 MB per hour), chapter markers from the book's chapters, plus cover art, title, author and "narrator: <voice>".
-- **MP3 per chapter** (`write_mp3s`, chosen with `--format mp3` or the window's output choice): a folder named after the book, one file per chapter, `NN - Chapter title.mp3` with NN zero-padded to the chapter count and the title made safe for a file name.
+- **MP3 per chapter** (`write_mp3s`, chosen with `--format mp3` or the window's output choice): a folder named after the book, one file per chapter, `NN - Chapter title.mp3` with NN at least two digits, and every file and folder name made safe for FAT32, exFAT and NTFS (`portable_name`), since USB sticks for car stereos are usually FAT32 or exFAT.
   - Each chapter is its own ffmpeg encode (libmp3lame, mono, the voice's 24 kHz, 64 kbps constant bit rate, about 28.8 MB per hour). CBR rather than VBR: the size is predictable, every player and car stereo seeks correctly, and speech gains little from VBR. Unlike the M4B there is no priming-delay drift to avoid, because each file stands alone and its length is its own chapter.
   - The audio of each chapter is exactly what the M4B has for it: the same segments, gaps, titles and `atempo`. The test suite checks every chunk is in exactly one file.
   - ID3v2.3 tags: title = chapter, album = book, artist and album artist = authors, track = `n/total`, composer = narrator, genre "Audiobook", plus the validated cover as the front-cover picture in every file.

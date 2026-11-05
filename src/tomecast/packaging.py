@@ -298,16 +298,36 @@ def write_mp3s(
     )
 
 
-def mp3_file_name(number: int, count: int, title: str) -> str:
-    """``NN - Title.mp3``, with NN zero-padded to the width of ``count``. Slashes, control
-    characters and a leading dot in the title are replaced, and a long title is trimmed."""
-    text = re.sub(r"[\x00-\x1f\x7f]", " ", title).replace("/", "-")
+# Characters FAT32, exFAT and NTFS refuse (USB sticks for car stereos are usually FAT32 or
+# exFAT): a colon reads naturally as " -", the rest are dropped or become a dash.
+_NOT_PORTABLE = str.maketrans(
+    {":": " -", '"': "'", "\\": "-", "|": "-", "*": "", "?": "", "<": "", ">": ""}
+)
+# Names Windows (and so most USB-stick tooling) reserves, with or without an extension.
+_RESERVED = {"CON", "PRN", "AUX", "NUL"} | {f"{p}{n}" for p in ("COM", "LPT") for n in range(1, 10)}
+
+
+def portable_name(text: str, max_bytes: int = 200) -> str:
+    """``text`` as a file or folder name that works on every common file system (ext4, FAT32,
+    exFAT, NTFS): no slashes, ``\\ : * ? " < > |``, control characters, leading dots or
+    trailing dots and spaces, not a reserved device name, and at most ``max_bytes`` bytes.
+    Returns "" if nothing usable is left."""
+    text = re.sub(r"[\x00-\x1f\x7f]", " ", text).replace("/", "-").translate(_NOT_PORTABLE)
     text = " ".join(text.split()).lstrip(".").strip()
     encoded = text.encode()
-    if len(encoded) > _MP3_TITLE_BYTES:
-        text = encoded[:_MP3_TITLE_BYTES].decode(errors="ignore")
+    if len(encoded) > max_bytes:
+        text = encoded[:max_bytes].decode(errors="ignore")
     text = text.rstrip(" .")
-    width = len(str(count))
+    if text.split(".", 1)[0].upper() in _RESERVED:
+        text += "_"
+    return text
+
+
+def mp3_file_name(number: int, count: int, title: str) -> str:
+    """``NN - Title.mp3``: NN has at least two digits (more for 100+ chapters), so every player
+    sorts the files in order, and the title is made portable (see :func:`portable_name`)."""
+    text = portable_name(title, _MP3_TITLE_BYTES)
+    width = max(2, len(str(count)))
     return f"{number:0{width}d} - {text}.mp3" if text else f"{number:0{width}d}.mp3"
 
 

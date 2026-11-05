@@ -63,9 +63,9 @@ def test_one_file_per_chapter_named_and_ordered(
     packaged, _ = book
     assert packaged.output.name == "The Test Book"
     assert [p.name for p in files(packaged.output)] == [
-        "1 - Prologue.mp3",
-        "2 - The Road.mp3",
-        "3 - Home.mp3",
+        "01 - Prologue.mp3",
+        "02 - The Road.mp3",
+        "03 - Home.mp3",
     ]
     assert [c.title for c in packaged.chapters] == ["Prologue", "The Road", "Home"]
     assert sorted(p.name for p in packaged.output.parent.iterdir()) == ["The Test Book"]
@@ -73,14 +73,14 @@ def test_one_file_per_chapter_named_and_ordered(
 
 def test_numbers_are_zero_padded_to_the_chapter_count() -> None:
     assert mp3_file_name(3, 12, "Home") == "03 - Home.mp3"
-    assert mp3_file_name(3, 9, "Home") == "3 - Home.mp3"
+    assert mp3_file_name(3, 9, "Home") == "03 - Home.mp3"
     assert mp3_file_name(7, 120, "Home") == "007 - Home.mp3"
     assert mp3_file_name(1, 12, "   ") == "01.mp3"
 
 
 def test_file_names_are_safe() -> None:
-    assert mp3_file_name(1, 1, "AC/DC: \x00Live\n") == "1 - AC-DC: Live.mp3"
-    assert mp3_file_name(1, 1, "..hidden") == "1 - hidden.mp3"
+    assert mp3_file_name(1, 1, "AC/DC: \x00Live\n") == "01 - AC-DC - Live.mp3"
+    assert mp3_file_name(1, 1, "..hidden") == "01 - hidden.mp3"
     long = mp3_file_name(1, 1, "é" * 200)
     assert len(long.encode()) < 120
     assert long.endswith("é.mp3")
@@ -223,7 +223,7 @@ def test_no_cover_means_no_picture(book: tuple[PackagedBook, list[ChapterAudio]]
 def test_empty_titles_become_chapter_n(tmp_path: Path) -> None:
     chapters = [chapter(tmp_path, "", [(0.3, 0.1)]), chapter(tmp_path, "Two", [(0.3, 0.1)])]
     packaged = make(tmp_path, chapters)
-    assert [p.name for p in files(packaged.output)] == ["1 - Chapter 1.mp3", "2 - Two.mp3"]
+    assert [p.name for p in files(packaged.output)] == ["01 - Chapter 1.mp3", "02 - Two.mp3"]
     assert read_metadata(files(packaged.output)[0]).tags["title"] == "Chapter 1"
 
 
@@ -251,7 +251,7 @@ def test_never_overwrite_numbers_the_folder(tmp_path: Path) -> None:
     )
 
     assert packaged.output == out / "The Test Book (3)"
-    assert [p.name for p in files(packaged.output)] == ["1 - A.mp3"]
+    assert [p.name for p in files(packaged.output)] == ["01 - A.mp3"]
     assert (out / "The Test Book" / "mine.txt").read_text() == "keep"
     assert [p.name for p in (out / "The Test Book").iterdir()] == ["mine.txt"]
     assert sorted(p.name for p in out.iterdir()) == [
@@ -291,8 +291,8 @@ def test_overwrite_replaces_old_chapters_but_keeps_other_files(tmp_path: Path) -
     out = tmp_path / "out"
     target = out / "The Test Book"
     target.mkdir(parents=True)
-    (target / "1 - Old.mp3").write_bytes(b"old")
-    (target / "2 - Gone.mp3").write_bytes(b"old")
+    (target / "01 - Old.mp3").write_bytes(b"old")
+    (target / "02 - Gone.mp3").write_bytes(b"old")
     (target / "notes.txt").write_text("mine")
 
     packaged = write_mp3s(
@@ -300,8 +300,8 @@ def test_overwrite_replaces_old_chapters_but_keeps_other_files(tmp_path: Path) -
     )
 
     assert packaged.output == target
-    assert sorted(p.name for p in target.iterdir()) == ["1 - New.mp3", "notes.txt"]
-    assert probe(target / "1 - New.mp3").duration > 0.3
+    assert sorted(p.name for p in target.iterdir()) == ["01 - New.mp3", "notes.txt"]
+    assert probe(target / "01 - New.mp3").duration > 0.3
 
 
 def test_overwrite_refuses_a_file_in_the_way(tmp_path: Path) -> None:
@@ -339,3 +339,22 @@ def test_bad_input_is_rejected_before_encoding(tmp_path: Path) -> None:
     with pytest.raises(PackagingError, match="no chapters"):
         make(tmp_path, [])
     assert list((tmp_path / "out").iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("title", "expected"),
+    [
+        ("Chapter 1: The Night", "Chapter 1 - The Night"),
+        ('What? "No" <yes> a|b\\c*', "What 'No' yes a-b-c"),
+        ("CON", "CON_"),
+        ("nul.txt", "nul.txt_"),
+        ("  ..Hidden. ", "Hidden"),
+        ("Tab\there/slash", "Tab here-slash"),
+    ],
+)
+def test_names_work_on_usb_sticks(title: str, expected: str) -> None:
+    # Car stereos read FAT32/exFAT sticks, which refuse \ : * ? " < > | and device names.
+    from tomecast.packaging import portable_name
+
+    assert portable_name(title) == expected
+    assert not set(portable_name(title)) & set('\\:*?"<>|/')
