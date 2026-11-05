@@ -47,12 +47,12 @@ All three are open-licensed (SIL OFL) and get bundled with the app.
 - **Bracketed indices** for chapters: `[ 03 ]`.
 - **Dot meters** for amounts, like speed as an 11-dot meter.
 - **A round play/pause** for the voice preview, with a row of dots as its waveform.
-- **Crop-mark corners** on panels instead of boxes.
+- **No boxes:** sections are separated by space, or a plain 1 px line where a list needs one. No dotted outlines and no crop-mark corners.
 - **Images in dots (covers and art):** a classic halftone, drawn the same way as the art on the maintainer's site: round dots on a grid turned about 29° (so they never line up into rows and columns like a pixel screen), **3.4 px apart**, with each dot's *area* following the ink (radius = half the spacing × √ink). The biggest dots just touch, so every dot stays a whole circle. Each dot shows the average tone of its whole cell, after an autocontrast so dull covers still use every dot size. The image keeps its own shape. Dark theme: light dots on near-black, never inverted (inverted faces look like ghosts). Light theme: dark dots on paper. Drawn with Qt (no Pillow) once per book and size, not live. Fine line engravings don't survive this (their hatching is smaller than a dot), so artwork should be paintings or sculpture.
 
 ## Screens
 
-1. **Drop:** a near-black field with a dotted outline that brightens when a book is dragged over it. Inside: the *Cantoria* in dots with its credit ("LUCA DELLA ROBBIA · CANTORIA · 1431–38"), "DROP A BOOK HERE", the formats (EPUB · PDF · DOCX · FB2 · HTML · TXT) and Choose a book. The hardware result sits quietly in a corner ("CPU · about 4.7× real time").
+1. **Drop:** a near-black field with no outline. While a book is dragged over the window, "DROP A BOOK HERE" turns the accent colour. Inside: the *Cantoria* in dots with its credit ("LUCA DELLA ROBBIA · CANTORIA · 1431–38"), "DROP A BOOK HERE", the formats (EPUB · PDF · DOCX · FB2 · HTML · TXT) and Choose a book. The hardware result sits quietly in a corner ("CPU · about 4.7× real time").
 2. **Chapters:** a spec-table layout (`[ 03 ]`, title, words, estimated minutes) with checkboxes and a dot meter for each chapter's length. The skip switches (page numbers, footnotes, front matter…) appear as toggles.
 3. **Voice:** a voice menu grouped by language and gender ("American · female"), speed as a dot meter, and Preview with the round player.
 4. **Converting:** time left in Doto, "4.7× real time", the sentence grid, the live caption, Pause, and the dotted cover.
@@ -69,7 +69,8 @@ When the image ships with the app, add it to `THIRD_PARTY.md` too.
 ## Building it (Qt)
 
 - **Qt Quick (QML)** through PySide6, with our own components on the Basic Controls style. Plain widget stylesheets can't do the dots.
-- **Native window decorations.** Custom title bars break on tiling window managers and Wayland. Layouts must reflow when the window is tiled to half or a third of the screen.
+- **Native window decorations.** Custom title bars break on tiling window managers and Wayland.
+- **Small windows first.** Tomecast usually sits in a corner of the screen, not full screen. Below about 640 px wide, every screen switches to a compact one-column layout (designed at 400 × 600 px): smaller art, 3 px sentence dots, the main controls kept. Wider windows, including a window tiled to half the screen, get the wide layout.
 - **Theme:** read the desktop setting (`QStyleHints.colorScheme()`, Qt 6.5+) and offer a manual override, because some setups (Hyprland and Omarchy, for example) may not report it.
 - **Reduced motion:** respect GNOME's and KDE's animation settings, plus an in-app switch.
 - **Light on resources while converting:** redraw only on progress events, never a continuous shader, since the voice engine needs the CPU. Animate state changes at 150–400 ms.
