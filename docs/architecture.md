@@ -164,7 +164,7 @@ Both sit behind one small interface (`voices()`, `languages()`, `synthesize(chun
 - **Terminal:** `tomecast convert book.epub --voice UK_George --format m4b`, plus `tomecast voices`, `tomecast preview "text"`, `tomecast scan`. Easy for a techy user to script over a folder of books.
 
 ### 9. Install: the app sets everything up itself
-Users paste **one line** into a terminal: `curl -fsSL kingskid2026.github.io/tomecast/install.sh | sh`.
+Users paste **one line** into a terminal: `curl -fsSL https://raw.githubusercontent.com/Kingskid2026/tomecast/main/install.sh | sh`. No `sudo`: everything goes into the user's home folder.
 - It's a short script, kept in the repo, so a techy user can read it first.
 - It installs **uv** if it's missing, and uv then fetches the right Python and installs the app.
 - If they already have uv, it's just `uv tool install tomecast`.
@@ -248,7 +248,7 @@ Rough totals for a **CPU-only machine** (estimates, to be measured in build step
    - To move to a newer engine or model: change the manifest in a pull request, run the tests and the GPU checks on real hardware, then release.
    - On the user's next launch, the app downloads the new pieces and runs its self-check. It switches over only if the check passes, and **keeps the old version until then**, so it can roll back automatically.
    - **Never "latest":** a new llama.cpp or audio.cpp could break things, so users only ever get versions we've tested.
-3. **The install script** is served from GitHub Pages in the same repo (`kingskid2026.github.io/tomecast/install.sh`). It changes through pull requests like the code.
+3. **The install script** is served straight from the repo's `main` branch (`raw.githubusercontent.com/Kingskid2026/tomecast/main/install.sh`), so it's always the reviewed version. It changes through pull requests like the code.
 
 **What makes it a high-quality repo**
 
