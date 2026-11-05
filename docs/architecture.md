@@ -43,7 +43,7 @@ book file
   → Packager (ffmpeg)                 → M4B with chapters + cover + title/author, or MP3 per chapter
 ```
 
-The app is written in **Python 3.11+**, which has the best ebook and PDF libraries and holds everything together. The heavy model work runs in fast C++ engines (audio.cpp for voices, llama.cpp for the AI add-ons).
+The app is written in **Python 3.12+** (uv downloads it if the system's Python is older), which has the best ebook and PDF libraries and holds everything together. The heavy model work runs in fast C++ engines (audio.cpp for voices, llama.cpp for the AI add-ons).
 
 ## Core guarantee: every sentence gets spoken
 

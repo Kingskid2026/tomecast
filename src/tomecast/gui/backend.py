@@ -16,7 +16,7 @@ import subprocess
 import tempfile
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Any, Literal, TypeVar, cast
+from typing import Any, Literal, cast
 
 from PySide6.QtCore import (
     Property,
@@ -88,13 +88,11 @@ _VOICE_ORDER = (
     "bm_george", "bm_lewis", "bm_daniel", "bm_fable",
 )  # fmt: skip
 
-_T = TypeVar("_T")
 
-
-def _property(kind: Any, getter: Callable[[Any], _T], notify: Signal) -> _T:
+def _property[T](kind: Any, getter: Callable[[Any], T], notify: Signal) -> T:
     """A read-only Qt property. Typed as its value, so Python callers (and tests) see a str,
     bool… rather than a ``Property``."""
-    return cast(_T, Property(kind, getter, notify=notify))
+    return cast(T, Property(kind, getter, notify=notify))
 
 
 def _field(kind: Any, name: str, notify: Signal) -> Any:
