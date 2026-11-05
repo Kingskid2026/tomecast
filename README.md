@@ -48,7 +48,7 @@ The full design, including why each model and quantization was chosen, is in [do
 ## Install (planned for v0.1.0)
 
 ```sh
-curl -fsSL https://kingskid2026.github.io/tomecast/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Kingskid2026/tomecast/main/install.sh | sh
 ```
 
 The script is [short and readable](install.sh). It installs [uv](https://docs.astral.sh/uv/) if it's missing, then installs Tomecast from [PyPI](https://pypi.org/project/tomecast/) into your home folder. On first launch, Tomecast downloads only the engines and models your machine needs, and asks before downloading.
