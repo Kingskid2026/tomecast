@@ -6,7 +6,7 @@
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
 > [!NOTE]
-> **Early development.** Tomecast can already turn **EPUB** books into **M4B** audiobooks with chapters, using the Kokoro voice, from the command line. PDFs and other formats, smarter cleanup, the desktop window and the premium voice are on the [roadmap](https://github.com/Kingskid2026/tomecast/milestones). The voice engine currently needs a recent Linux (glibc 2.43+, see below).
+> **Early development.** Tomecast can already turn **EPUB** books into **M4B** audiobooks with chapters, using the Kokoro voice, from the command line. PDFs and other formats, smarter cleanup, the desktop window and the premium voice are on the [roadmap](https://github.com/Kingskid2026/tomecast/milestones). It runs on most Linux distros from 2019 on (see below).
 
 ## Try it
 
@@ -55,8 +55,9 @@ The script is [short and readable](install.sh). It installs [uv](https://docs.as
 
 | Your system | Support |
 |---|---|
-| Distros with glibc 2.43 or newer, like Arch-based ones and openSUSE Tumbleweed (check with `ldd --version`) | Everything |
-| Ubuntu 22.04 and 24.04, Debian 12 and 13, current Fedora | Installs, but the voice engine needs a newer system. Planned in [#18](https://github.com/Kingskid2026/tomecast/issues/18) |
+| Distros from 2019 on (glibc 2.29 or newer, check with `ldd --version`): Ubuntu 20.04+, Debian 11+, Fedora and Bazzite, RHEL/Alma/Rocky 9+, Arch-based ones, openSUSE Tumbleweed | Everything. Tested on every engine change with real conversions on Ubuntu 22.04/24.04, Debian 12/13, Fedora 44 and Arch |
+| Older distros (Ubuntu 18.04, Debian 10, RHEL 8) | Not supported |
+| Processors without AVX2 (Intel before 2013, AMD before 2015, many Pentium and Celeron chips) | Not supported yet |
 | Alpine, NixOS, ARM computers | Not supported yet |
 
 ## Privacy

@@ -1,4 +1,5 @@
 import json
+import platform
 import stat
 import sys
 import textwrap
@@ -13,7 +14,7 @@ from tomecast.engines.audiocpp import EngineError, KokoroServer, check_system
 # A stand-in for audiocpp_server: same command line, same HTTP API, no model.
 FAKE_SERVER = textwrap.dedent(
     """
-    import http.server, json, math, os, struct, sys, wave, io
+    import http.server, json, math, os, socket, struct, sys, time, wave, io
 
     config = json.load(open(sys.argv[sys.argv.index("--config") + 1]))
     log = open(os.environ["FAKE_LOG"], "a")
@@ -50,6 +51,10 @@ FAKE_SERVER = textwrap.dedent(
             REQUESTS[0] += 1
             die_after = os.environ.get("FAKE_DIE_AFTER")
             if die_after is not None and REQUESTS[0] > int(die_after):
+                if os.environ.get("FAKE_SLOW_EXIT"):
+                    # The connection drops first, and the process only ends a bit later.
+                    self.connection.shutdown(socket.SHUT_RDWR)
+                    time.sleep(float(os.environ["FAKE_SLOW_EXIT"]))
                 os._exit(1)  # crash mid-request, like an engine running out of memory
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             text = body["input"]
@@ -167,19 +172,84 @@ def test_rejects_unknown_voices_and_bad_speeds(tmp_path: Path) -> None:
         KokoroServer(tmp_path, speed=5.0)
 
 
+# An x86-64 machine with every CPU feature the engine needs, on Ubuntu 22.04's glibc.
+GOOD_FLAGS = frozenset(["fpu", "sse4_2", "avx", "avx2", "fma", "f16c", "bmi1", "bmi2"])
+
+
+@pytest.fixture
+def capable_machine(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(audiocpp, "glibc_version", lambda: (2, 35))
+    monkeypatch.setattr(audiocpp, "cpu_flags", lambda: GOOD_FLAGS)
+
+
 @pytest.mark.parametrize(
     ("version", "ok"),
-    [((2, 44), True), ((2, 43), True), ((2, 39), False), (None, False)],
-)
-def test_check_system_needs_a_new_enough_glibc(
+    [((2, 44), True), ((2, 35), True), ((2, 31), True), ((2, 29), True), ((2, 28), False),
+     ((2, 17), False), (None, False)],
+)  # fmt: skip
+@pytest.mark.usefixtures("capable_machine")
+def test_check_system_needs_glibc_2_29(
     monkeypatch: pytest.MonkeyPatch, version: tuple[int, int] | None, ok: bool
 ) -> None:
     monkeypatch.setattr(audiocpp, "glibc_version", lambda: version)
     if ok:
         check_system()
     else:
-        with pytest.raises(EngineError, match=r"glibc 2\.43"):
+        with pytest.raises(EngineError, match=r"needs glibc 2\.29 or newer"):
             check_system()
+
+
+@pytest.mark.usefixtures("capable_machine")
+def test_check_system_needs_avx2(monkeypatch: pytest.MonkeyPatch) -> None:
+    old_cpu = frozenset(["fpu", "sse4_2", "avx"])  # e.g. a 2012 Ivy Bridge laptop
+    monkeypatch.setattr(audiocpp, "cpu_flags", lambda: old_cpu)
+    with pytest.raises(EngineError, match=r"AVX2.*missing: avx2, fma, f16c, bmi2"):
+        check_system()
+
+
+@pytest.mark.usefixtures("capable_machine")
+def test_check_system_lets_the_engine_try_when_cpu_flags_are_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(audiocpp, "cpu_flags", lambda: None)
+    check_system()
+
+
+@pytest.mark.usefixtures("capable_machine")
+def test_check_system_needs_an_x86_64_processor(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(platform, "machine", lambda: "aarch64")
+    with pytest.raises(EngineError, match=r"x86-64.*aarch64"):
+        check_system()
+
+
+def test_cpu_flags_come_from_cpuinfo(tmp_path: Path) -> None:
+    cpuinfo = tmp_path / "cpuinfo"
+    cpuinfo.write_text(
+        "processor\t: 0\nmodel name\t: Some CPU\nflags\t\t: fpu avx avx2 fma\n\n"
+        "processor\t: 1\nflags\t\t: fpu avx avx2 fma\n"
+    )
+    assert audiocpp.cpu_flags(cpuinfo) == frozenset({"fpu", "avx", "avx2", "fma"})
+
+
+def test_cpu_flags_are_unknown_without_a_flags_line(tmp_path: Path) -> None:
+    arm = tmp_path / "cpuinfo"
+    arm.write_text("processor\t: 0\nFeatures\t: fp asimd\n")  # ARM says "Features"
+    assert audiocpp.cpu_flags(arm) is None
+    assert audiocpp.cpu_flags(tmp_path / "missing") is None
+
+
+def test_the_engine_comes_from_tomecasts_own_build() -> None:
+    asset = audiocpp.AUDIOCPP_CPU
+    assert asset.url == (
+        "https://github.com/Kingskid2026/tomecast/releases/download/"
+        f"{audiocpp.AUDIOCPP_BUILD}/{audiocpp.AUDIOCPP_BUILD}-linux-x86_64-cpu.tar.gz"
+    )
+    assert audiocpp.AUDIOCPP_BUILD.startswith(f"audiocpp-v{audiocpp.AUDIOCPP_VERSION}-tc")
+    assert len(asset.sha256) == 64
+    assert int(asset.sha256, 16) >= 0  # a real hex digest, not a placeholder
+    assert asset.size > 0
+    assert asset.archive == "tar.gz"
 
 
 def test_label_names_the_voice(tmp_path: Path) -> None:
@@ -208,6 +278,19 @@ def test_a_crash_mid_book_restarts_the_engine(
         engine.synthesize("Second.", tmp_path / "2.wav")  # crashes, restarts, succeeds
     starts = [e for e in _events(tmp_path) if e["event"] == "start"]
     assert len(starts) == 2
+    assert wav_info(tmp_path / "2.wav").frames > 0
+
+
+def test_a_crash_is_handled_even_if_the_engine_takes_a_moment_to_exit(
+    tmp_path: Path, fake_server: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FAKE_DIE_AFTER", "1")
+    monkeypatch.setenv("FAKE_SLOW_EXIT", "0.5")
+    with _server(tmp_path, fake_server) as engine:
+        engine.synthesize("First.", tmp_path / "1.wav")
+        engine.synthesize("Second.", tmp_path / "2.wav")  # crashes slowly, restarts, succeeds
+    voiced = [e["body"]["input"] for e in _events(tmp_path) if e["event"] == "voiced"]  # type: ignore[index]
+    assert voiced == ["First.", "Second."]
     assert wav_info(tmp_path / "2.wav").frames > 0
 
 

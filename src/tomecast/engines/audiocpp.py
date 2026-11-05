@@ -4,7 +4,9 @@ audio.cpp (https://github.com/0xShug0/audio.cpp) runs the Kokoro voice model. To
 its HTTP server once per conversion, so the model is loaded a single time, and sends it one
 small chunk of text per request. Facts this module relies on were checked against v0.9.4:
 
-* the prebuilt Linux binaries need glibc 2.43 or newer;
+* upstream's prebuilt Linux binaries need glibc 2.43, so Tomecast uses its own unmodified
+  build of the same release (.github/workflows/engine-build.yml), which needs glibc 2.28 and
+  a CPU with AVX2;
 * Kokoro needs eSpeak NG at runtime for every sentence (found via environment variables);
 * eSpeak's data path must be shorter than 160 bytes;
 * more than 510 phonemes in one request is a hard error, not a silent cut;
@@ -17,6 +19,7 @@ import ctypes
 import http.client
 import json
 import os
+import platform
 import signal
 import socket
 import subprocess
@@ -32,18 +35,36 @@ from tomecast.chunking import split_long
 from tomecast.downloads import Asset, local_path
 
 AUDIOCPP_VERSION = "0.9.4"
-MIN_GLIBC = (2, 43)
+# Tomecast's own build of that release, published as a release of the Tomecast repo by
+# .github/workflows/engine-build.yml. A new build of the same source gets a new -tcN tag.
+AUDIOCPP_BUILD = f"audiocpp-v{AUDIOCPP_VERSION}-tc1"
+_ENGINE_DOWNLOADS = "https://github.com/Kingskid2026/tomecast/releases/download"
 
-AUDIOCPP_CPU = Asset(
-    name=f"audio.cpp {AUDIOCPP_VERSION} voice engine (CPU)",
-    url=(
-        "https://github.com/0xShug0/audio.cpp/releases/download/"
-        f"v{AUDIOCPP_VERSION}/audio-v{AUDIOCPP_VERSION}-bin-ubuntu-x64-cpu.tar.gz"
-    ),
-    sha256="13529ee5366daeb13546190ba25e8118f46bece9c8811e7eb113c41bd121a41a",
-    size=64_040_913,
-    path=f"engines/audiocpp-{AUDIOCPP_VERSION}-cpu",
-    archive="tar.gz",
+# Our engine build needs glibc 2.28; the eSpeak NG library from the espeakng-loader wheel
+# needs 2.29 (its exp and pow), so that's the floor for voicing.
+MIN_GLIBC = (2, 29)
+# The engine's CPU kernels are built for x86-64-v3: Intel from 2013 (Haswell) and AMD from
+# 2015 (Excavator) on. Without these, it would crash with "illegal instruction".
+CPU_FEATURES = ("avx", "avx2", "fma", "f16c", "bmi2")
+
+
+def engine_build(variant: str, label: str, *, sha256: str, size: int) -> Asset:
+    """One of the engine tarballs (``cpu``, ``vulkan``) published with :data:`AUDIOCPP_BUILD`."""
+    return Asset(
+        name=f"audio.cpp {AUDIOCPP_VERSION} voice engine ({label})",
+        url=f"{_ENGINE_DOWNLOADS}/{AUDIOCPP_BUILD}/{AUDIOCPP_BUILD}-linux-x86_64-{variant}.tar.gz",
+        sha256=sha256,
+        size=size,
+        path=f"engines/audiocpp-{AUDIOCPP_VERSION}-{variant}",
+        archive="tar.gz",
+    )
+
+
+AUDIOCPP_CPU = engine_build(
+    "cpu",
+    "CPU",
+    sha256="TBD",
+    size=0,
 )
 
 ESPEAK_NG = Asset(
@@ -172,16 +193,43 @@ def glibc_version() -> tuple[int, int] | None:
         return None
 
 
+def cpu_flags(cpuinfo: Path = Path("/proc/cpuinfo")) -> frozenset[str] | None:
+    """The CPU's feature flags from ``/proc/cpuinfo``, or ``None`` if they can't be read."""
+    try:
+        with cpuinfo.open(encoding="utf-8", errors="replace") as lines:
+            for line in lines:
+                name, _, value = line.partition(":")
+                if name.strip() == "flags":
+                    return frozenset(value.split())
+    except OSError:
+        pass
+    return None
+
+
 def check_system() -> None:
-    """Raise :class:`EngineError` if this system can't run the prebuilt engine."""
+    """Raise :class:`EngineError` if this computer can't run the voice engine."""
+    machine = platform.machine()
+    if machine != "x86_64":
+        raise EngineError(
+            "The Kokoro voice engine needs a 64-bit Intel or AMD processor (x86-64), and this "
+            f"computer has {machine or 'an unknown kind'}, which isn't supported yet."
+        )
     found = glibc_version()
     if found is None or found < MIN_GLIBC:
-        have = "a non-glibc system" if found is None else f"glibc {found[0]}.{found[1]}"
+        have = "a system without glibc" if found is None else f"glibc {found[0]}.{found[1]}"
         raise EngineError(
             f"The Kokoro voice engine needs glibc {MIN_GLIBC[0]}.{MIN_GLIBC[1]} or newer, and "
-            f"this system has {have}. Recent rolling distros (Arch, openSUSE Tumbleweed) work "
-            "today; support for older ones is planned: "
-            "https://github.com/Kingskid2026/tomecast/issues"
+            f"this computer has {have}. Distros from 2019 on have it (Ubuntu 20.04, Debian 11, "
+            "Fedora 30, RHEL 9 and newer); Alpine and other musl-based ones aren't supported."
+        )
+    flags = cpu_flags()
+    if flags is None:
+        return  # can't tell; let the engine try
+    missing = [feature for feature in CPU_FEATURES if feature not in flags]
+    if missing:
+        raise EngineError(
+            "The Kokoro voice engine needs a processor with AVX2 (Intel from 2013 or AMD from "
+            f"2015 on), and this one is missing: {', '.join(missing)}."
         )
 
 
@@ -299,7 +347,7 @@ class KokoroServer:
         try:
             data = self._request(text)
         except _ConnectionLost as error:
-            if self._process is None or self._process.poll() is None:
+            if self._process is None or not _has_exited(self._process):
                 raise  # still running, just not answering
             log = _tail(self._log_path)
             if self._consecutive_restarts >= _MAX_RESTARTS:
@@ -452,6 +500,16 @@ def _stop_with_parent() -> None:
     window must start the engine from a thread that lives as long as the conversion.
     """
     _PRCTL(_PR_SET_PDEATHSIG, signal.SIGTERM)
+
+
+def _has_exited(process: subprocess.Popen[bytes], grace: float = 2.0) -> bool:
+    """Whether ``process`` has stopped. A crashed engine drops its connections a moment
+    before the system reports it as exited, so this waits briefly instead of just looking."""
+    try:
+        process.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        return False
+    return True
 
 
 def _free_port() -> int:
