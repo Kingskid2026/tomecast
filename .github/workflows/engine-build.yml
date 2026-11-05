@@ -1,0 +1,213 @@
+name: Engine build
+
+# Builds the audio.cpp voice engine from its pinned upstream release on an old base system
+# (manylinux_2_28: AlmaLinux 8, glibc 2.28), so one build runs on nearly every Linux distro
+# from 2019 on. Upstream's own Linux binaries need glibc 2.43 (#18).
+#
+# - Pull requests that change the build: build and check it, publish nothing.
+# - A pushed tag like audiocpp-v0.9.4-tc1: build from scratch (no caches), attest where each
+#   tarball came from, and publish them as a release of this repo (never marked "latest",
+#   so the app's own releases are unaffected). Tomecast then pins their URLs and SHA-256s
+#   in src/tomecast/engines/audiocpp.py. Bump the -tcN suffix for each new build.
+#
+# The tag must not look like the app's release tags (v0.1.0), which release-please owns.
+
+on:
+  push:
+    tags: ["audiocpp-v*"]
+  pull_request:
+    paths:
+      - .github/workflows/engine-build.yml
+      - .github/scripts/build-audiocpp.sh
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: engine-build-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  AUDIOCPP_VERSION: "0.9.4"
+  AUDIOCPP_COMMIT: f7ac446fb75e594a6913c846bea6c85b637f6ac0 # tag v0.9.4
+  # quay.io/pypa/manylinux_2_28_x86_64, 2026-11-01: AlmaLinux 8.10, glibc 2.28, gcc-toolset-14
+  BUILD_IMAGE: quay.io/pypa/manylinux_2_28_x86_64@sha256:7e41b1c7fd64dfc69703a1124b43c404382973ee06ec5d764b85c34d2221fded
+
+jobs:
+  build:
+    name: Build (${{ matrix.variant }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [cpu, vulkan]
+    env:
+      VARIANT: ${{ matrix.variant }}
+      RELEASE: ${{ startsWith(github.ref, 'refs/tags/audiocpp-v') }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: tomecast
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: 0xShug0/audio.cpp
+          ref: ${{ env.AUDIOCPP_COMMIT }}
+          persist-credentials: false
+          path: audiocpp
+      - name: Name the bundle
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ "$RELEASE" = true ]; then tag="$REF_NAME"; else tag="audiocpp-v$AUDIOCPP_VERSION-dev"; fi
+          echo "BUNDLE=$tag-linux-x86_64-$VARIANT" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/ccache" "$RUNNER_TEMP/vulkan-tools"
+      # Caches only speed up pull-request builds. Release builds start from scratch.
+      - name: Restore compiler cache
+        if: env.RELEASE != 'true'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0 # zizmor: ignore[cache-poisoning]
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: audiocpp-ccache-${{ env.AUDIOCPP_COMMIT }}-${{ matrix.variant }}-${{ hashFiles('tomecast/.github/scripts/build-audiocpp.sh') }}-${{ github.run_id }}
+          restore-keys: |
+            audiocpp-ccache-${{ env.AUDIOCPP_COMMIT }}-${{ matrix.variant }}-
+      - name: Restore Vulkan build tools
+        if: env.RELEASE != 'true' && matrix.variant == 'vulkan'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0 # zizmor: ignore[cache-poisoning]
+        with:
+          path: ${{ runner.temp }}/vulkan-tools
+          key: audiocpp-vulkan-tools-${{ hashFiles('tomecast/.github/scripts/build-audiocpp.sh') }}
+      - name: Build in the manylinux container
+        env:
+          BUILD_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          cache_env=()
+          if [ "$RELEASE" != true ]; then
+            cache_env=(-e CCACHE_DIR=/ccache -e CCACHE_MAXSIZE=2G -e VULKAN_TOOLS=/vulkan-tools)
+          fi
+          docker run --rm \
+            -e AUDIOCPP_VERSION -e AUDIOCPP_COMMIT -e BUILD_URL "${cache_env[@]}" \
+            -v "$PWD/tomecast/.github/scripts:/scripts:ro" \
+            -v "$PWD/audiocpp:/src" \
+            -v "$PWD/out:/out" \
+            -v "$RUNNER_TEMP/ccache:/ccache" \
+            -v "$RUNNER_TEMP/vulkan-tools:/vulkan-tools" \
+            "$BUILD_IMAGE" \
+            /scripts/build-audiocpp.sh "$VARIANT" /src "/out/$BUNDLE"
+      - name: Pack the tarball
+        run: |
+          # Same layout as upstream's tarballs (files at the top level), packed reproducibly.
+          mtime=$(git -C audiocpp log -1 --format=%ct)
+          mkdir -p dist
+          tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$mtime" \
+            -C "out/$BUNDLE" -cf - . | gzip -9n > "dist/$BUNDLE.tar.gz"
+          ls -l "out/$BUNDLE" dist
+          (cd dist && sha256sum "$BUNDLE.tar.gz" | tee "$BUNDLE.tar.gz.sha256")
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ env.BUNDLE }}
+          path: dist/
+          if-no-files-found: error
+
+  smoke:
+    # Start each build on old and new systems, and list the devices it can use. The Vulkan
+    # build gets Mesa's software Vulkan driver (lavapipe), so it has a Vulkan device to find
+    # through each system's own libvulkan.so.1. Real voicing is tested by integration.yml.
+    name: Smoke test (${{ matrix.variant }}, ${{ matrix.image }})
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [cpu, vulkan]
+        image: [almalinux:8, debian:11, ubuntu:22.04, archlinux:latest]
+        include:
+          # How to install each system's Vulkan loader and Mesa's software driver, and
+          # whether that driver includes lavapipe (Mesa 21.1+), so a Vulkan device must show.
+          - image: almalinux:8
+            vulkan: dnf install -y -q vulkan-loader mesa-vulkan-drivers
+            expect_device: true
+          - image: debian:11
+            vulkan: apt-get update -qq && apt-get install -y -qq libvulkan1 mesa-vulkan-drivers >/dev/null
+            expect_device: false
+          - image: ubuntu:22.04
+            vulkan: apt-get update -qq && apt-get install -y -qq libvulkan1 mesa-vulkan-drivers >/dev/null
+            expect_device: true
+          - image: archlinux:latest
+            vulkan: pacman -Sy --noconfirm --needed vulkan-icd-loader vulkan-swrast >/dev/null
+            expect_device: true
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: "*-${{ matrix.variant }}"
+          merge-multiple: true
+          path: dist
+      - name: Run it in ${{ matrix.image }}
+        env:
+          IMAGE: ${{ matrix.image }}
+          VARIANT: ${{ matrix.variant }}
+          VULKAN_PREP: ${{ matrix.vulkan }}
+          EXPECT_DEVICE: ${{ matrix.expect_device }}
+        run: |
+          mkdir engine && tar -xzf dist/*.tar.gz -C engine
+          docker run --rm -e VARIANT -e VULKAN_PREP -e EXPECT_DEVICE \
+            -v "$PWD/engine:/engine:ro" "$IMAGE" sh -euc '
+            ldd --version | head -n1
+            /engine/audiocpp_server --version
+            if [ "$VARIANT" = cpu ]; then
+              /engine/audiocpp_server --list-devices --json
+              exit 0
+            fi
+            eval "$VULKAN_PREP"
+            /engine/audiocpp_server --backend vulkan --list-devices --json | tee /tmp/devices.json
+            if [ "$EXPECT_DEVICE" = true ]; then
+              grep -q "\"backend\":\"vulkan\"" /tmp/devices.json
+            fi
+          '
+
+  release:
+    name: Publish the release
+    if: startsWith(github.ref, 'refs/tags/audiocpp-v')
+    needs: [build, smoke]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # create the release
+      id-token: write # sign the provenance attestation
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: audiocpp-v*
+          merge-multiple: true
+          path: dist
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*.tar.gz
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          cat dist/*.sha256 > dist/SHA256SUMS
+          cat > notes.md <<EOF
+          Unmodified builds of [audio.cpp](https://github.com/0xShug0/audio.cpp) $AUDIOCPP_VERSION (commit \`$AUDIOCPP_COMMIT\`) for Tomecast's voice engine. They run on Linux with **glibc 2.28 or newer** (x86-64 CPUs with AVX2), where upstream's own builds need glibc 2.43 (#18).
+
+          Built by [this workflow run]($RUN_URL) from \`.github/workflows/engine-build.yml\` at this tag, in the \`manylinux_2_28\` image (AlmaLinux 8) with GCC 14, using upstream's release options. The C++ and OpenMP runtimes are linked in statically. The Vulkan build loads the system's own \`libvulkan.so.1\` and graphics driver; no driver is included. Each tarball has \`BUILD-INFO.txt\` with the exact options, and \`licenses/\` for the code compiled in.
+
+          This is not a Tomecast release, and you don't need to download these by hand: Tomecast fetches the one it needs and checks it against the SHA-256 pinned in its code.
+
+          Check where a file came from with \`gh attestation verify FILE --repo $GITHUB_REPOSITORY\`.
+
+          \`\`\`
+          $(cat dist/SHA256SUMS)
+          \`\`\`
+          EOF
+          gh release create "$TAG" dist/*.tar.gz dist/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --latest=false \
+            --title "audio.cpp $AUDIOCPP_VERSION engine builds" --notes-file notes.md
