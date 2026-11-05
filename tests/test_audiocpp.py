@@ -43,7 +43,8 @@ FAKE_SERVER = textwrap.dedent(
         def do_GET(self):
             self.send_response(200 if self.path == "/health" else 404)
             self.end_headers()
-            self.wfile.write(b'{"status":"ok"}')
+            # The real audio.cpp 0.9.4 reply (checked against the binary).
+            self.wfile.write(b'{"status":"ok","backend":"cpu","version":"0.9.4"}')
 
         def do_POST(self):
             REQUESTS[0] += 1
@@ -214,12 +215,11 @@ def test_an_engine_that_keeps_crashing_gives_a_clear_error(
     tmp_path: Path, fake_server: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("FAKE_DIE_AFTER", "0")  # every request crashes the engine
-    with _server(tmp_path, fake_server) as engine:
-        for _ in range(2):
-            with pytest.raises(EngineError):
-                engine.synthesize("Hello.", tmp_path / "out.wav")
-        with pytest.raises(EngineError, match="keeps crashing"):
-            engine.synthesize("Hello.", tmp_path / "out.wav")
+    with (
+        _server(tmp_path, fake_server) as engine,
+        pytest.raises(EngineError, match=r"crashed and didn't recover\. Its log:"),
+    ):
+        engine.synthesize("Hello.", tmp_path / "out.wav")
 
 
 def test_a_long_install_path_gets_a_short_private_espeak_link(

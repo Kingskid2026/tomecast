@@ -1,4 +1,5 @@
 import array
+import fcntl
 import math
 import wave
 from pathlib import Path
@@ -157,7 +158,9 @@ def test_engine_failures_are_reported_without_a_traceback(
 
     assert cli.main(["convert", str(_epub(tmp_path))]) == 1
 
-    assert "out of memory" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "out of memory" in err
+    assert "saved" not in err  # nothing was voiced, so there's nothing to resume
     assert not (tmp_path / "story.m4b").exists()
 
 
@@ -193,3 +196,16 @@ def test_a_failed_run_keeps_its_work_and_the_next_run_resumes(
     out = capsys.readouterr().out
     assert "Picked up where the last run stopped (2 pieces)" in out
     assert not list((tmp_path / "data" / "cache").glob("convert-*"))  # cleaned up on success
+
+
+def test_the_same_book_cant_be_converted_twice_at_once(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    book = _epub(tmp_path)
+    workdir = cli._work_folder(tmp_path / "data", book, "af_heart", 1.0)
+    with (workdir / ".lock").open("w") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)  # another run is busy with this book
+
+        assert cli.main(["convert", str(book)]) == 1
+
+    assert "already being converted" in capsys.readouterr().err

@@ -160,3 +160,15 @@ def test_random_mixed_script_text_is_always_fully_covered() -> None:
         max_chars = rng.randint(5, 150)
         chunks = chunk_paragraphs(0, paragraphs, max_chars=max_chars)
         assert all(0 < len(c.text) <= max_chars for c in chunks)
+
+
+@pytest.mark.parametrize(
+    ("paragraph", "expected"),
+    [
+        ("「行くぞ！」と彼は言った。次の日。", ["「行くぞ！」と彼は言った。", "次の日。"]),
+        ("「本当？」って聞いた。", ["「本当？」って聞いた。"]),
+        ("Wow！” and left. Then home.", ["Wow！” and left.", "Then home."]),
+    ],
+)
+def test_cjk_sentence_ends_that_continue_are_not_split(paragraph: str, expected: list[str]) -> None:
+    assert split_sentences(paragraph) == expected

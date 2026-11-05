@@ -130,13 +130,14 @@ VOICES = (
     "zm_yunyang",
 )
 DEFAULT_VOICE = "af_heart"
+DEFAULT_SEED = 42  # fixed, so a resumed book sounds the same as one made in one go
 
 # audio.cpp splits requests over 240 characters itself; staying under that keeps every
 # request a single model pass, and well clear of the 510-phoneme limit for normal prose.
 MAX_CHARS = 200
 _ESPEAK_PATH_LIMIT = 150  # bytes; eSpeak NG 1.52 has a 160-byte path buffer
 SAMPLE_RATE = 24_000  # Kokoro's output
-_MAX_RESTARTS = 2  # per conversion, if the engine crashes mid-book
+_MAX_RESTARTS = 2  # in a row, on the same text, before giving up
 _PHONEME_LIMIT_MESSAGE = "exceeds 510"
 
 
@@ -200,7 +201,7 @@ class KokoroServer:
         voice: str = DEFAULT_VOICE,
         speed: float = 1.0,
         threads: int | None = None,
-        seed: int = 42,
+        seed: int = DEFAULT_SEED,
         startup_timeout: float = 120.0,
         request_timeout: float = 300.0,
         executable: Path | None = None,
@@ -220,7 +221,7 @@ class KokoroServer:
         self._process: subprocess.Popen[bytes] | None = None
         self._tempdir: tempfile.TemporaryDirectory[str] | None = None
         self._base_url = ""
-        self._restarts = 0
+        self._consecutive_restarts = 0
 
     @property
     def label(self) -> str:
@@ -290,19 +291,30 @@ class KokoroServer:
             concatenate_wavs(wavs, output, gap_seconds=0.05)
 
     def _request_with_recovery(self, text: str) -> bytes:
-        """Send ``text``; if the engine has crashed, restart it (a couple of times) and retry."""
+        """Send ``text``; if the engine has crashed, restart it and try once more.
+
+        Restarts are counted per piece of text, so a long book survives an occasional crash,
+        but an engine that crashes on the same text again and again gives up with its log.
+        """
         try:
-            return self._request(text)
+            data = self._request(text)
         except _ConnectionLost as error:
             if self._process is None or self._process.poll() is None:
                 raise  # still running, just not answering
             log = _tail(self._log_path)
-            if self._restarts >= _MAX_RESTARTS:
-                raise EngineError(f"the voice engine keeps crashing:\n{log}") from error
-            self._restarts += 1
+            if self._consecutive_restarts >= _MAX_RESTARTS:
+                raise EngineError(f"the voice engine keeps crashing. Its log:\n{log}") from error
+            self._consecutive_restarts += 1
             self._stop_process()
             self._launch()
-            return self._request(text)
+            try:
+                data = self._request(text)
+            except _ConnectionLost as retry_error:
+                raise EngineError(
+                    f"the voice engine crashed and didn't recover. Its log:\n{log}"
+                ) from retry_error
+        self._consecutive_restarts = 0
+        return data
 
     @property
     def _log_path(self) -> Path:
@@ -427,10 +439,19 @@ class KokoroServer:
         }
 
 
+# Looked up once, here in the parent: loading a library in the forked child (before the
+# engine starts) could deadlock if Tomecast has threads, as the desktop window will.
+_PRCTL = ctypes.CDLL(None, use_errno=True).prctl
+_PR_SET_PDEATHSIG = 1
+
+
 def _stop_with_parent() -> None:
-    """Runs in the engine's process before it starts: stop it if Tomecast itself dies."""
-    pr_set_pdeathsig = 1
-    ctypes.CDLL(None).prctl(pr_set_pdeathsig, signal.SIGTERM)
+    """Runs in the engine's process before it starts: stop it if Tomecast itself dies.
+
+    Linux sends the signal when the *thread* that started the engine exits, so the desktop
+    window must start the engine from a thread that lives as long as the conversion.
+    """
+    _PRCTL(_PR_SET_PDEATHSIG, signal.SIGTERM)
 
 
 def _free_port() -> int:

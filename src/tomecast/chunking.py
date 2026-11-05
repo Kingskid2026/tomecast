@@ -74,6 +74,8 @@ _SENTENCE_END = re.compile(f"[.!?\u2026\u0964]+[{re.escape(_CLOSING_PUNCTUATION)
 # Chinese and Japanese sentence ends (fullwidth full stop, ! and ?), with no space after them.
 _CJK_CLOSING = "\u300d\u300f\u201d\u2019\uff09"  # closing brackets and quotes
 _CJK_SENTENCE_END = re.compile(f"[\u3002\uff01\uff1f]+[{_CJK_CLOSING}]*")
+# Japanese quoting particles that continue a sentence after a quote: to, tte, tto.
+_CJK_CONTINUATIONS = ("\u3068", "\u3063\u3066", "\u3063\u3068")
 # Places a long sentence may be split, best first. Fullwidth (CJK) marks need no space.
 _SPLIT_PREFERENCES = (
     re.compile("[;:](?=\\s)|[\uff1b\uff1a]"),
@@ -105,8 +107,12 @@ def split_sentences(paragraph: str) -> list[str]:
     }
     for match in _CJK_SENTENCE_END.finditer(text):
         end = match.end()
-        if end < len(text):
-            boundaries.add((end, 1 if text[end] == " " else 0))
+        following = text[end:].lstrip(" " + _OPENING_PUNCTUATION)
+        # Not a sentence end if the sentence carries on: a quoting particle after a quote
+        # (as in "...!" he said), or a lowercase word in mixed text.
+        if not following or following[:1].islower() or following.startswith(_CJK_CONTINUATIONS):
+            continue
+        boundaries.add((end, 1 if text[end] == " " else 0))
 
     sentences: list[str] = []
     start = 0

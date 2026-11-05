@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import hashlib
 import shutil
 import signal
 import sys
 import time
 import wave
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import TextIO
 
@@ -26,6 +28,7 @@ from tomecast.downloads import (
 )
 from tomecast.engines.audiocpp import (
     AUDIOCPP_VERSION,
+    DEFAULT_SEED,
     DEFAULT_VOICE,
     MAX_CHARS,
     REQUIRED_ASSETS,
@@ -147,31 +150,36 @@ def _convert(args: argparse.Namespace) -> int:
         raise CliError(f"no readable text found in {book_path.name}")
 
     root = data_dir()
-    _install(REQUIRED_ASSETS, root, assume_yes=args.yes)
+    try:
+        _install(REQUIRED_ASSETS, root, assume_yes=args.yes)
+        workdir = _work_folder(root, book_path, args.voice, args.speed)
+    except OSError as error:
+        raise CliError(str(error)) from error
 
     chunk_count = sum(len(chunks) for chunks in plan_chunks(book, MAX_CHARS))
     print(
         f"Converting “{book.title}”: {_plural(len(book.chapters), 'chapter')}, "
         f"{_plural(chunk_count, 'piece')} of text, voice {args.voice}."
     )
-    workdir = _work_folder(root, book_path, args.voice, args.speed)
     progress = _ProgressPrinter(sys.stderr)
     started = time.monotonic()
-    try:
-        with KokoroServer(root, voice=args.voice, speed=args.speed) as engine:
-            result = convert_book(book, engine, output, workdir=workdir, progress=progress.update)
-    except KeyboardInterrupt:
+    with _exclusive(workdir):
+        try:
+            with KokoroServer(root, voice=args.voice, speed=args.speed) as engine:
+                result = convert_book(
+                    book, engine, output, workdir=workdir, progress=progress.update
+                )
+        except KeyboardInterrupt:
+            progress.finish()
+            if note := _saved_note(workdir):
+                print(note)
+            raise
+        except (
+            EngineError, MissingAudioError, PackagingError, CoverageError, OSError, wave.Error
+        ) as error:  # fmt: skip
+            progress.finish()
+            raise CliError(f"{error}\n{_saved_note(workdir)}".rstrip()) from error
         progress.finish()
-        print("The audio made so far is saved. Run the same command again to continue.")
-        raise
-    except (
-        EngineError, MissingAudioError, PackagingError, CoverageError, OSError, wave.Error
-    ) as error:  # fmt: skip
-        progress.finish()
-        raise CliError(
-            f"{error}\nThe audio made so far is saved. Run the same command again to continue."
-        ) from error
-    progress.finish()
     shutil.rmtree(workdir, ignore_errors=True)
 
     for warning in result.warnings:
@@ -203,11 +211,34 @@ def _work_folder(root: Path, book: Path, voice: str, speed: float) -> Path:
     with book.open("rb") as f:
         while block := f.read(1024 * 1024):
             digest.update(block)
-    digest.update(f"{voice}|{speed}|audiocpp-{AUDIOCPP_VERSION}".encode())
+    # Anything that changes how the audio sounds goes in the key, so a resumed book never
+    # mixes two voices, speeds or model versions.
+    settings = [voice, str(speed), f"seed={DEFAULT_SEED}", f"audiocpp-{AUDIOCPP_VERSION}"]
+    settings += [asset.sha256 for asset in REQUIRED_ASSETS]
+    digest.update("|".join(settings).encode())
     folder = cache / f"convert-{digest.hexdigest()[:16]}"
     folder.mkdir(exist_ok=True)
     folder.touch()  # counts as recently used
     return folder
+
+
+@contextlib.contextmanager
+def _exclusive(workdir: Path) -> Iterator[None]:
+    """Hold a lock on ``workdir`` so two runs can't convert the same book at once."""
+    with (workdir / ".lock").open("w") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise CliError(
+                "this book is already being converted with the same settings (in another terminal?)"
+            ) from None
+        yield
+
+
+def _saved_note(workdir: Path) -> str:
+    if any((workdir / "chunks").glob("*.wav")):
+        return "The audio made so far is saved. Run the same command again to continue."
+    return ""
 
 
 def _install(assets: Sequence[Asset], root: Path, *, assume_yes: bool) -> None:

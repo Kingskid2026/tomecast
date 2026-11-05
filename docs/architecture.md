@@ -138,7 +138,14 @@ Both sit behind one small interface (`voices()`, `languages()`, `synthesize(chun
 - The **"Use graphics card"** switch is always visible, with the measured speedup next to it ("about 4× faster on your machine").
 
 ### 6. Pause & resume, preview
-- Each book gets a project folder (`~/.local/share/tomecast/projects/<book-id>/`) holding finished audio chunks and a progress file. Closing the app, a crash or a reboot loses at most one sentence. Changing voice or speed starts fresh.
+- **Resume (built):**
+  - Each conversion keeps its chunk audio in `~/.local/share/tomecast/cache/convert-<key>/`.
+  - The key is a hash of the book file, the voice, the speed, the seed, and the engine and model versions, so a resumed book never mixes two voices or models.
+  - Each chunk's file name includes a hash of its exact text, and a file only gets its final name once its audio has passed the checks. So stopping (Ctrl-C, `kill`, a crash, a reboot) loses at most the chunk in progress, and changed text is always voiced again.
+  - Running the same command again picks up where it stopped. The folder is deleted after success, and unused ones after 14 days.
+  - A lock stops two runs of the same book from colliding.
+  - The engine process is stopped with Tomecast, even if Tomecast is killed.
+- **Pause** in the desktop window will use the same mechanism.
 - **Preview:** play the first paragraph of any chapter, or any typed text, in the chosen voice and speed before converting.
 
 ### 7. Packager

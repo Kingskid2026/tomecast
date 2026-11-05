@@ -85,9 +85,6 @@ _SKIPPED_CLASSES = frozenset({"pagenum", "pg-boilerplate"})
 
 _XML_ENCODING = re.compile(rb"""^\s*<\?xml[^>]*?\sencoding\s*=\s*["']([A-Za-z0-9._:-]+)""")
 _META_CHARSET = re.compile(rb"""<meta[^>]*?charset\s*=\s*["']?([A-Za-z0-9._:-]+)""", re.IGNORECASE)
-# Image classes that mark a drop cap: "dropcap", "drop-cap", "cap", "capital", but not
-# "caption", "landscape" or "escape".
-_DROP_CAP_CLASS = re.compile(r"drop|\bcap(?!tion)", re.IGNORECASE)
 _WORD = re.compile(r"[^\W_]+")
 _NUMBER_WORDS = {
     "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8,
@@ -276,11 +273,15 @@ def _read_spine(package: etree._Element, manifest: Mapping[str, _Item]) -> list[
 
 
 def _document_to_read(item: _Item, manifest: Mapping[str, _Item]) -> _Item | None:
-    """Return the item to read for a spine item, or None for an image (which has no text).
+    """Return the item to read for a spine item, or None if it has no book text.
 
-    A spine item that isn't (X)HTML may name a fallback that is, as EPUB 3 allows. Failing
-    that, it's still read, as long as it turns out to be markup (see :func:`_read_spine_item`).
+    Images have no text, and an NCX (the EPUB 2 table of contents, which some books list in
+    the spine by mistake) isn't book text. A spine item that isn't (X)HTML may name a fallback
+    that is, as EPUB 3 allows. Failing that, it's still read, as long as it turns out to be
+    markup (see :func:`_read_spine_item`).
     """
+    if item.media_type == _NCX_MEDIA_TYPE:
+        return None
     candidate: _Item | None = item
     seen: set[str] = set()
     while candidate is not None and candidate.path not in seen:
@@ -509,6 +510,7 @@ class _DocumentWalker:
     Text is gathered until the next block boundary (the start or end of a block element), so
     a block's text, including inline children like ``<em>`` and ``<a>``, becomes one
     paragraph. A container's loose text around nested blocks is kept as paragraphs of its own.
+    Images are only read as drop caps (see :func:`_drop_cap_letters`).
     """
 
     def __init__(self, targets: Mapping[str, Sequence[str]]) -> None:
@@ -516,6 +518,8 @@ class _DocumentWalker:
         self._events: list[_Event] = []
         self._text: list[str] = []
         self._has_text = False  # whether the paragraph so far has text besides drop caps
+        self._images: list[str] = []  # the paragraph's images: drop-cap letters, or ""
+        self._detached_drop_cap = ""  # a drop cap that had a block to itself
         self._heading_depth = 0
 
     def walk(self, root: etree._Element) -> list[_Event]:
@@ -538,8 +542,9 @@ class _DocumentWalker:
         if _is_skipped(element, name):
             return  # the caller still reads the text after it (its tail)
         if name == "img":
-            # No space after it: a drop cap is the start of the word that follows.
-            self._text.append(_drop_cap_letters(element))
+            letters = _drop_cap_letters(element)
+            self._images.append(letters)
+            self._text.append(letters)  # no space after it: a drop cap starts the next word
             return
         if is_heading:
             self._heading_depth += 1
@@ -559,6 +564,7 @@ class _DocumentWalker:
             if titles:
                 self._end_paragraph()
                 self._events.extend(_ChapterStart(title) for title in titles)
+                self._detached_drop_cap = ""  # a drop cap never carries into another chapter
 
     def _add(self, text: str | None) -> None:
         if text:
@@ -566,30 +572,34 @@ class _DocumentWalker:
             self._has_text = self._has_text or not text.isspace()
 
     def _end_paragraph(self) -> None:
-        # A drop cap with no text around it is an image on its own, not part of a word.
+        # Without text around it, an image isn't part of a word, so it isn't read here.
         text = normalize_whitespace("".join(self._text)) if self._has_text else ""
+        lone_image = self._images[0] if not self._has_text and len(self._images) == 1 else ""
+        is_heading = self._heading_depth > 0
         self._text.clear()
+        self._images.clear()
         self._has_text = False
         if text:
-            self._events.append(_Block(text, is_heading=self._heading_depth > 0))
+            # A drop cap in a block of its own (Project Gutenberg's illustrated capitals) starts
+            # the next paragraph, if that paragraph begins mid-word with a lowercase letter.
+            if self._detached_drop_cap and not is_heading and text[0].islower():
+                text = self._detached_drop_cap + text
+            self._detached_drop_cap = ""
+            self._events.append(_Block(text, is_heading))
+        elif lone_image:
+            self._detached_drop_cap = lone_image
 
 
 def _drop_cap_letters(image: etree._Element) -> str:
-    """Return the alt text of an image that holds the first letter of a word, else ``""``.
+    """Return an image's alt text if it's a drop cap's letters, else ``""``.
 
-    Illustrated drop caps draw a word's first letter as a picture (``<img alt="T"/>he quick
-    fox``), so the letter must be read for the word to make sense. An image counts as one when
-    its alt text is one or two characters, or when it or its parent has a drop-cap class, and
-    the alt text has a letter or digit (so ornaments like ``*`` aren't read). Any other alt
-    text describes a picture, which isn't read.
+    Illustrated drop caps draw the first letter of a paragraph as a picture, as in
+    ``<img alt="T"/>he quick fox``, so the letter must be read for the word to make sense.
+    Only alt text of one or two letters or digits counts: longer alt text describes a picture
+    (which isn't read), whatever the image's class says, and ``*`` is an ornament.
     """
     alt = (image.get("alt") or "").strip()
-    if not any(character.isalnum() for character in alt):
-        return ""
-    parent = image.getparent()
-    parent_class = parent.get("class") if parent is not None else None
-    classes = f"{image.get('class') or ''} {parent_class or ''}"
-    return alt if len(alt) <= 2 or _DROP_CAP_CLASS.search(classes) else ""
+    return alt if len(alt) <= 2 and alt.isalnum() else ""
 
 
 def _is_skipped(element: etree._Element, name: str) -> bool:

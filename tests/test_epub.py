@@ -325,6 +325,17 @@ def test_images_in_the_spine_are_skipped(tmp_path: Path) -> None:
     assert all_paragraphs(book) == ["Chapter one."]
 
 
+def test_an_ncx_listed_in_the_spine_is_not_read(tmp_path: Path) -> None:
+    pages = [Page("one.xhtml", "<p>Chapter one.</p>")]
+    toc = [NavPoint("One", "one.xhtml")]
+    path = build_epub(tmp_path / "book.epub", pages, version=2, toc=toc)
+    replace_in_file(
+        path, "OEBPS/content.opf", '<spine toc="ncx">', '<spine toc="ncx"><itemref idref="ncx"/>'
+    )
+
+    assert read_epub(path).chapters == (Chapter("One", ("Chapter one.",)),)
+
+
 def test_a_foreign_spine_item_is_read_through_its_fallback(tmp_path: Path) -> None:
     pages = [
         Page("one.xhtml", "<p>Chapter one.</p>"),
@@ -396,24 +407,63 @@ def test_head_scripts_styles_and_picture_descriptions_are_never_read(tmp_path: P
 def test_drop_cap_images_keep_their_letter(tmp_path: Path) -> None:
     body = """
         <p><img src="T.png" alt="T"/>he quick fox.</p>
-        <p><span class="DropCap"><img src="O.png" alt="Once"/></span> upon a time.</p>
-        <p><img class="drop-cap" src="W.png" alt="Whe"/>n it rained.</p>
+        <p><img class="dropcap" src="W.png" alt="Wh"/>en it rained.</p>
         <p>A map <img src="map.png" alt="Map of the island"/>appears here.</p>
-        <p><img class="caption-icon" src="i.png" alt="Note"/>Captions aren't drop caps.</p>
+        <p><img class="figure-capture" alt="A map of the island"/>The island lay north.</p>
+        <p><img class="backdrop" src="b.png" alt="A stormy sky"/>The storm broke.</p>
+        <p><img class="dropcap" src="E.png" alt="Ornate letter E"/>The class alone isn't enough.</p>
         <p><img src="star.png" alt="*"/>An ornament.</p>
-        <div class="illustration"><img src="fig.png" alt="A"/></div>
     """
 
     book = read_epub(build_epub(tmp_path / "book.epub", [Page("book.xhtml", body)]))
 
     assert all_paragraphs(book) == [
         "The quick fox.",
-        "Once upon a time.",
         "When it rained.",
         "A map appears here.",
-        "Captions aren't drop caps.",
+        "The island lay north.",
+        "The storm broke.",
+        "The class alone isn't enough.",
         "An ornament.",
     ]
+
+
+def test_a_drop_cap_in_its_own_block_starts_the_next_paragraph(tmp_path: Path) -> None:
+    body = """
+        <div class="figleft"><img src="t.jpg" alt="T"/></div>
+        <p>he quick fox.</p>
+        <div class="figcenter"><img src="map.jpg" alt="A"/></div>
+        <p>Next comes a capital, so that image wasn't a drop cap.</p>
+        <div class="figleft"><img src="i.jpg" alt="I"/></div>
+        <h2>a heading, even in lowercase, never takes a drop cap</h2>
+        <p>t isn't carried past the heading either.</p>
+        <div class="illustration"><img src="end.jpg" alt="Z"/></div>
+    """
+
+    book = read_epub(build_epub(tmp_path / "book.epub", [Page("book.xhtml", body)]))
+
+    assert all_paragraphs(book) == [
+        "The quick fox.",
+        "Next comes a capital, so that image wasn't a drop cap.",
+        "a heading, even in lowercase, never takes a drop cap",
+        "t isn't carried past the heading either.",
+    ]
+
+
+def test_a_detached_drop_cap_never_crosses_into_another_chapter(tmp_path: Path) -> None:
+    body = """
+        <p>The first chapter.</p>
+        <div class="figleft"><img src="w.jpg" alt="W"/></div>
+        <p id="two">hich chapter does this belong to?</p>
+    """
+    toc = [NavPoint("One", "book.xhtml"), NavPoint("Two", "book.xhtml#two")]
+
+    book = read_epub(build_epub(tmp_path / "book.epub", [Page("book.xhtml", body)], toc=toc))
+
+    assert book.chapters == (
+        Chapter("One", ("The first chapter.",)),
+        Chapter("Two", ("hich chapter does this belong to?",)),
+    )
 
 
 def test_page_numbers_and_gutenberg_boilerplate_are_skipped(tmp_path: Path) -> None:
