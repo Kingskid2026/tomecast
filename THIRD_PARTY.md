@@ -34,6 +34,12 @@ This list reflects the current design ([docs/architecture.md](docs/architecture.
 | uv | Installing Tomecast | Apache 2.0 or MIT | [astral-sh/uv](https://github.com/astral-sh/uv) |
 | Qt 6 / PySide6-Essentials | The desktop window | LGPL-3.0 (installed from PyPI as a separate library, not modified) | [PySide6-Essentials](https://pypi.org/project/PySide6-Essentials/), [qt.io](https://www.qt.io/licensing/open-source-lgpl-obligations) |
 
+## Data files we generate
+
+| Item | Used for | License | Source |
+|---|---|---|---|
+| `src/tomecast/data/common_words.txt` | The name finder's list of ordinary English words, so it doesn't list them as names | Public domain: a list of words (every word that appears in lowercase at least 3 times) counted from 23 public-domain Project Gutenberg books | Rebuild with `scripts/make_wordlist.py`; book list in that script |
+
 ## Bundled with the app
 
 These ship inside the Tomecast package itself (`src/tomecast/gui/`).

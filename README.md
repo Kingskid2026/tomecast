@@ -17,6 +17,8 @@ tomecast convert book.docx                    # EPUB, DOCX, FB2, HTML and TXT wo
 tomecast convert book.epub --voice bm_george --speed 1.1   # speed: 0.5 to 3.0 (default 1.0)
 tomecast convert book.epub --format mp3       # a folder "book/" with one MP3 per chapter
 tomecast voices                               # list the 54 built-in voices
+tomecast names book.epub                      # list names the voice might get wrong
+tomecast preview "Galadriel"                  # hear a word (or -o word.wav to save it)
 ```
 
 `--format mp3` writes `book/01 - Chapter title.mp3`, `02 - …` and so on, for players and car stereos that don't know `.m4b`. Each file is tagged (album, author, track n/total, chapter title) and carries the cover. MP3 is 64 kbps mono, about 29 MB per hour, the same as the M4B. Like the M4B, it never overwrites without `--force`; the window always picks a free name ("book (2)").
@@ -36,6 +38,28 @@ If your computer has a graphics card with a working Vulkan driver (NVIDIA, AMD o
 - **Pause and resume.** Long books pick up where they left off after a crash or reboot.
 - **Pronunciation fixes.** A word list for names the voice gets wrong, a finder for unusual names before you convert, and a button to hear any word right away.
 - **One-line install.** It sets up its own engines and models, with no `sudo`.
+
+## Saying names and numbers right
+
+Tomecast turns numbers, dates, times, money, years, Roman numerals and abbreviations into words before the voice reads them (`Dr. Smith paid $5.50 on 4 July 1776.` becomes "Doctor Smith paid five dollars and fifty cents on the fourth of July, seventeen seventy-six."). For names and made-up words, you can tell it how to say them:
+
+1. **Find the names.** `tomecast names book.epub` lists the capitalised words the book uses often that aren't ordinary English, with how many times (`--min-count N` and `--limit N` change what is shown).
+2. **Hear them.** `tomecast preview "Galadriel"` says a word with the voice and speed you choose (`--voice`, `--speed`; `-o word.wav` saves it instead of playing it). It uses your pronunciation lists, so you hear what the book will sound like; `--raw` skips them.
+3. **Fix them.** Add a line to a pronunciation list, then convert as usual.
+
+A pronunciation list is a plain text file with one fix per line, *written → say it as*:
+
+```text
+# Lines starting with # are comments, and so is anything after " #".
+siobhan     → shi-vawn      # all lowercase: matches Siobhan, SIOBHAN, siobhan
+Nguyen      -> win          # "->" works as well as "→"
+New Zealand → noo zee-lund  # several words are fine
+```
+
+- **Two places.** `~/.local/share/tomecast/pronunciations.txt` applies to every book. A file next to the book, named like the book with `.pronunciations.txt` (`Title.epub` → `Title.pronunciations.txt`), applies to that book only and wins where the two disagree.
+- **Whole words only.** `Ron` doesn't change *Ronald*. A fix written with a capital letter matches that spelling (and its ALL-CAPS form in headings), so `Mark` leaves *mark* alone.
+- **The "say it as" part is a respelling**, written the way an English reader would sound it out, not a phonetic alphabet. The voice engine can't take exact phonetic spellings, so an IPA value like `/ɡəˈlædriəl/` is skipped with a warning. Hyphens make each piece its own word, and capital letters are lowercased when spoken (they only help you read the line), so try each fix with `tomecast preview` and adjust.
+- A line it can't use is skipped with a note naming the line; the rest of the list still works.
 
 ## How it works
 
