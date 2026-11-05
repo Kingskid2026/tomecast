@@ -22,8 +22,8 @@
 #   - the CPU kernels target AVX2-era CPUs (x86-64-v3) instead of whichever CPU the build
 #     machine happened to have (-march=native).
 #
-# Optional environment: CCACHE_DIR (use ccache), VULKAN_TOOLS (where to keep the Vulkan
-# headers, loader and glslc built here, so CI can cache them), BUILD_URL (for BUILD-INFO).
+# Optional environment: CCACHE_DIR (use ccache), VULKAN_TOOLS (where to keep what
+# build-vulkan-tools.sh builds, so CI can cache it), BUILD_URL (for BUILD-INFO.txt).
 set -euo pipefail
 
 variant=${1:?usage: build-audiocpp.sh cpu|vulkan SOURCE OUTPUT}
@@ -37,68 +37,7 @@ work=$(mktemp -d)
 # The image's Pythons live in /opt/python; some build steps need a python3 on PATH.
 command -v python3 >/dev/null || export PATH="/opt/python/cp312-cp312/bin:$PATH"
 
-# --- Pinned sources for the Vulkan build tools (only the Vulkan variant needs them) -------
-# Vulkan headers and loader from the same SDK release upstream's Windows build uses, and
-# shaderc's glslc (with the exact glslang/SPIRV-Tools/SPIRV-Headers revisions its DEPS file
-# names), built here because no prebuilt glslc runs on glibc 2.28.
-VULKAN_SDK_TAG=vulkan-sdk-1.4.357.0
-SHADERC_COMMIT=b64fd42c4a2a9d501c47aca5d3571f7673a5e9cc # v2026.4
-GLSLANG_COMMIT=e1b562a8bed273a02f30b59b66a5d499793cede5
-SPIRV_TOOLS_COMMIT=ef96ed763b43b59b33b31b362f09a02b729fa1c9
-SPIRV_HEADERS_COMMIT=04fd3caa1e8267e4d95c806cad901181728e1006
-VULKAN_SOURCES=(
-    "vulkan-headers https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/$VULKAN_SDK_TAG.tar.gz e87dce08116151f6b6d7de6b6faf41498e87e6cf848ff16fa3bd5402190ad4a3"
-    "vulkan-loader https://github.com/KhronosGroup/Vulkan-Loader/archive/refs/tags/$VULKAN_SDK_TAG.tar.gz 54f2537df22313768da0317dda2abdaaab7711b4081c48c869a79db343d0ae70"
-    "shaderc https://github.com/google/shaderc/archive/$SHADERC_COMMIT.tar.gz b0f73c2f50df5f24e78fae6d04f1e95131c65ea3ea13fd8998a317a5d632a51f"
-    "shaderc/third_party/glslang https://github.com/KhronosGroup/glslang/archive/$GLSLANG_COMMIT.tar.gz 907174a24713c6202c146f164bf81783f1fbc79c8cb821a30f18f159eb980312"
-    "shaderc/third_party/spirv-tools https://github.com/KhronosGroup/SPIRV-Tools/archive/$SPIRV_TOOLS_COMMIT.tar.gz 82c62146083fd558735a3171cf97cfc47903ca7d368482e87f94bd44883c0f00"
-    "shaderc/third_party/spirv-headers https://github.com/KhronosGroup/SPIRV-Headers/archive/$SPIRV_HEADERS_COMMIT.tar.gz 392f4801409aad9c4f1b77745f179952fd6264e4c8bd0fc1bc45dfa6807bf6d0"
-)
-# Changes whenever any pinned Vulkan source does, so a cached toolchain is never reused stale.
-VULKAN_TOOLS_ID=$(printf '%s\n' "${VULKAN_SOURCES[@]}" | sha256sum | cut -c1-16)
-
 log() { printf '\n=== %s\n' "$*"; }
-
-# fetch URL SHA256 FOLDER: download a pinned source archive, check it, and unpack it.
-fetch() {
-    local archive="$work/download.tar.gz"
-    curl -fsSL --retry 3 -o "$archive" "$1"
-    echo "$2  $archive" | sha256sum --check --quiet
-    mkdir -p "$3"
-    tar -xzf "$archive" --strip-components=1 -C "$3"
-    rm "$archive"
-}
-
-build_vulkan_tools() {
-    local prefix=$1 vsrc="$work/vulkan-src" name url sha
-    log "Building the Vulkan headers, loader and glslc into $prefix"
-    for entry in "${VULKAN_SOURCES[@]}"; do
-        read -r name url sha <<<"$entry"
-        fetch "$url" "$sha" "$vsrc/$name"
-    done
-    mkdir -p "$prefix" && find "$prefix" -mindepth 1 -delete # may be a mount point
-    cmake -S "$vsrc/vulkan-headers" -B "$work/build-headers" -DCMAKE_INSTALL_PREFIX="$prefix"
-    cmake --install "$work/build-headers"
-    # Only linked against at build time: at run time the system's own libvulkan.so.1 is used.
-    cmake -S "$vsrc/vulkan-loader" -B "$work/build-loader" -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_INSTALL_PREFIX="$prefix" -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_PREFIX_PATH="$prefix" \
-        -DBUILD_WSI_XCB_SUPPORT=OFF -DBUILD_WSI_XLIB_SUPPORT=OFF \
-        -DBUILD_WSI_XLIB_XRANDR_SUPPORT=OFF -DBUILD_WSI_WAYLAND_SUPPORT=OFF -DBUILD_TESTS=OFF
-    cmake --build "$work/build-loader" --parallel "$jobs"
-    cmake --install "$work/build-loader"
-    cmake -S "$vsrc/shaderc" -B "$work/build-shaderc" -DCMAKE_BUILD_TYPE=Release \
-        -DSHADERC_SKIP_TESTS=ON -DSHADERC_SKIP_EXAMPLES=ON -DSHADERC_SKIP_COPYRIGHT_CHECK=ON \
-        -DSPIRV_SKIP_TESTS=ON -DSPIRV_SKIP_EXECUTABLES=ON -DSPIRV_WERROR=OFF \
-        -DENABLE_GLSLANG_BINARIES=OFF
-    cmake --build "$work/build-shaderc" --parallel "$jobs" --target glslc_exe
-    install -D -m 0755 "$work/build-shaderc/glslc/glslc" "$prefix/bin/glslc"
-    # ggml-vulkan includes <spirv/unified1/spirv.hpp>.
-    cp -r "$vsrc/shaderc/third_party/spirv-headers/include/spirv" "$prefix/include/"
-    mkdir -p "$prefix/licenses/vulkan-headers" "$prefix/licenses/spirv-headers"
-    cp "$vsrc/vulkan-headers/LICENSE.md" "$prefix/licenses/vulkan-headers/"
-    cp "$vsrc/shaderc/third_party/spirv-headers/LICENSE" "$prefix/licenses/spirv-headers/"
-    echo "$VULKAN_TOOLS_ID" >"$prefix/.tools-id"
-}
 
 # --- Check the source ---------------------------------------------------------------------
 # The checkout belongs to the runner's user; let git read it, so --version shows the commit.
@@ -137,17 +76,25 @@ cmake_args=(
     # needs libdl and libpthread, which glibc 2.28 still has as separate libraries. They're
     # in the linker flags so CMake's own OpenMP check links the same way.
     "-DCMAKE_EXE_LINKER_FLAGS=-static-libstdc++ -static-libgcc -L$static_libs -Wl,--no-as-needed -ldl -lpthread"
+    # No library search path baked in: the system's own libraries are the ones to use.
+    -DCMAKE_SKIP_RPATH=ON
 )
+server=("$out/audiocpp_server")
 if [ "$variant" = vulkan ]; then
+    # Vulkan headers, a loader to link against, and glslc, built from pinned sources.
     tools=${VULKAN_TOOLS:-$work/vulkan-tools}
-    if [ "$(cat "$tools/.tools-id" 2>/dev/null)" != "$VULKAN_TOOLS_ID" ]; then
-        build_vulkan_tools "$tools"
+    tools_script="$(dirname "$(realpath "$0")")/build-vulkan-tools.sh"
+    if [ "$(cat "$tools/.built-by" 2>/dev/null)" != "$(sha256sum "$tools_script" | cut -d' ' -f1)" ]; then
+        log "Building the Vulkan headers, loader and glslc into $tools"
+        "$tools_script" "$tools"
     else
-        log "Using the cached Vulkan tools in $tools"
+        log "Using the Vulkan tools already built in $tools"
     fi
     export VULKAN_SDK=$tools
     export PATH="$tools/bin:$PATH"
     cmake_args+=(-DENGINE_ENABLE_VULKAN=ON)
+    # The bundle has no library search path; here, point it at the build-time loader.
+    server=(env "LD_LIBRARY_PATH=$tools/lib" "$out/audiocpp_server")
 else
     cmake_args+=(-DENGINE_ENABLE_VULKAN=OFF)
 fi
@@ -207,7 +154,7 @@ Base:     $(grep -oP "(?<=^PRETTY_NAME=\").*(?=\")" /etc/os-release), $(ldd --ve
 Compiler: $(gcc --version | head -n1)
 Options:  ${cmake_args[*]}
 
-$("$out/audiocpp_server" --version)
+$("${server[@]}" --version)
 EOF
 cat "$out/BUILD-INFO.txt"
 

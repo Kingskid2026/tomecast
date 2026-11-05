@@ -19,6 +19,7 @@ on:
     paths:
       - .github/workflows/engine-build.yml
       - .github/scripts/build-audiocpp.sh
+      - .github/scripts/build-vulkan-tools.sh
   workflow_dispatch:
 
 permissions: {}
@@ -65,21 +66,23 @@ jobs:
           if [ "$RELEASE" = true ]; then tag="$REF_NAME"; else tag="audiocpp-v$AUDIOCPP_VERSION-dev"; fi
           echo "BUNDLE=$tag-linux-x86_64-$VARIANT" >> "$GITHUB_ENV"
           mkdir -p "$RUNNER_TEMP/ccache" "$RUNNER_TEMP/vulkan-tools"
-      # Caches only speed up pull-request builds. Release builds start from scratch.
+      # Caches only speed up pull-request builds, and are kept even when a build fails.
+      # Release builds start from scratch.
       - name: Restore compiler cache
         if: env.RELEASE != 'true'
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0 # zizmor: ignore[cache-poisoning]
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/ccache
-          key: audiocpp-ccache-${{ env.AUDIOCPP_COMMIT }}-${{ matrix.variant }}-${{ hashFiles('tomecast/.github/scripts/build-audiocpp.sh') }}-${{ github.run_id }}
+          key: audiocpp-ccache-${{ env.AUDIOCPP_COMMIT }}-${{ matrix.variant }}-${{ github.run_id }}
           restore-keys: |
             audiocpp-ccache-${{ env.AUDIOCPP_COMMIT }}-${{ matrix.variant }}-
       - name: Restore Vulkan build tools
+        id: vulkan-tools
         if: env.RELEASE != 'true' && matrix.variant == 'vulkan'
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0 # zizmor: ignore[cache-poisoning]
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/vulkan-tools
-          key: audiocpp-vulkan-tools-${{ hashFiles('tomecast/.github/scripts/build-audiocpp.sh') }}
+          key: audiocpp-vulkan-tools-${{ hashFiles('tomecast/.github/scripts/build-vulkan-tools.sh') }}
       - name: Build in the manylinux container
         env:
           BUILD_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -97,6 +100,24 @@ jobs:
             -v "$RUNNER_TEMP/vulkan-tools:/vulkan-tools" \
             "$BUILD_IMAGE" \
             /scripts/build-audiocpp.sh "$VARIANT" /src "/out/$BUNDLE"
+      - name: Save compiler cache
+        if: always() && env.RELEASE != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0 # zizmor: ignore[cache-poisoning]
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: audiocpp-ccache-${{ env.AUDIOCPP_COMMIT }}-${{ matrix.variant }}-${{ github.run_id }}
+      - name: Check whether the Vulkan tools were built
+        id: tools-built
+        if: always() && env.RELEASE != 'true' && matrix.variant == 'vulkan'
+        run: if [ -f "$RUNNER_TEMP/vulkan-tools/.built-by" ]; then echo "built=true" >> "$GITHUB_OUTPUT"; fi
+      - name: Save Vulkan build tools
+        if: >-
+          always() && steps.tools-built.outputs.built == 'true'
+          && steps.vulkan-tools.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0 # zizmor: ignore[cache-poisoning]
+        with:
+          path: ${{ runner.temp }}/vulkan-tools
+          key: audiocpp-vulkan-tools-${{ hashFiles('tomecast/.github/scripts/build-vulkan-tools.sh') }}
       - name: Pack the tarball
         run: |
           # Same layout as upstream's tarballs (files at the top level), packed reproducibly.
