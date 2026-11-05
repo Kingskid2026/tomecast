@@ -59,7 +59,7 @@ The app is written in **Python 3.11+**, which has the best ebook and PDF librari
 ## Components
 
 ### 1. Readers (one per format)
-- **EPUB:** `ebooklib` + an HTML parser. Follow the book's reading order and use its table of contents for chapter titles. Many EPUBs tag their own parts (`epub:type="footnote"`, `pagebreak`, `copyright-page`, `toc`, `index`), so junk can be skipped exactly instead of guessed. Cover image goes into the M4B.
+- **EPUB:** our own reader on `lxml` (BSD), with safe settings for untrusted files: no network, no entity expansion, and size limits against zip bombs. It follows the book's reading order and uses its table of contents for chapter titles. Many EPUBs tag their own parts (`epub:type="footnote"`, `pagebreak`, `copyright-page`, `toc`, `index`), so junk can be skipped exactly instead of guessed. Books with DRM-encrypted text are refused with a clear error. The cover image goes into the M4B. (We don't use `ebooklib`, because it's AGPL.)
 - **PDF:** `pypdfium2`, Apache/BSD-licensed, and the same PDF engine Chrome uses. It gives each character with its position (and font size through its low-level API), and we group those into lines. Chapters come from the PDF's bookmarks when present, otherwise from large or bold heading lines. We don't use PyMuPDF because it's AGPL, which doesn't fit an Apache 2.0 app.
 - **DOCX:** `python-docx`, where Heading styles mark chapters. **FB2:** XML sections. **TXT:** chapter-line patterns ("Chapter 12", "CHAPTER TWELVE", "XII"). **HTML:** same path as an EPUB chapter.
 - **Later, if wanted:** Kindle MOBI/AZW3 (DRM-free only) through Calibre's `ebook-convert` when Calibre is installed.
@@ -91,8 +91,8 @@ Known issue to watch: reading order is the hard part. Even Docling's own reading
   - A **global list** plus a **per-book list** of *written → say it as* pairs (e.g. Hermione → her-MY-oh-nee). Stored as plain text so it's easy to edit.
   - **Name finder:** before converting, list words that appear often but aren't in a dictionary (usually names and places) so the user can check them.
   - **Try it:** type a word, hear it immediately, adjust the spelling.
-  - Advanced: Kokoro also accepts exact phonetic spelling for a word.
-- **Made-up languages:** Kokoro sounds out unknown words with espeak-ng's spelling rules, and Ming guesses from the spelling. Both read *something* reasonable, and the list fixes the rest.
+  - Advanced: exact phonetic spellings (IPA) aren't possible yet, because audio.cpp v0.9.4 only accepts them through its C library, not its server. Lower-case respellings work.
+- **Made-up languages:** Kokoro sounds out unknown words with eSpeak NG's spelling rules (checked: "Namárië" becomes /nˈæməɹɹˌɪɛ/), and Ming guesses from the spelling. Both read *something* reasonable, and the list fixes the rest.
 
 ### 4. Voice engines
 Both sit behind one small interface (`voices()`, `languages()`, `synthesize(chunk, voice, speed)`), so more engines can be added later.
@@ -101,13 +101,19 @@ Both sit behind one small interface (`voices()`, `languages()`, `synthesize(chun
 - **No Python and no PyTorch.**
 - **Vulkan means NVIDIA *and* AMD graphics cards work the same way.**
 - Risk: it's young (first release June 2026) and run by one company, so we pin a tested version (v0.9.3 or newer, for Ming).
+- **Checked facts (v0.9.4):**
+  - Kokoro needs **eSpeak NG for every sentence**, not just unknown words. Tomecast downloads it as a separate runtime file (the `espeakng-loader` wheel, GPL-3.0) rather than as a Python dependency, and points audio.cpp at it. Its data path must stay under 160 bytes.
+  - The prebuilt binaries need **glibc 2.43**, which is newer than Ubuntu 24.04, Debian 13 and current Fedora (see section 9 and [#18](https://github.com/Kingskid2026/tomecast/issues/18)).
+  - Tomecast runs audio.cpp's **local HTTP server** once per book, so the model loads one time, and sends one chunk per request. That's about 30% faster than one process per sentence on short sentences.
+  - There's no silent truncation: more than **510 phonemes** in one request is a hard error. Tomecast keeps chunks at **200 characters**, and if a chunk still hits the limit (long numbers, mostly), it splits that chunk and joins the audio.
+  - Memory: about 1 GB while voicing, measured on a Ryzen AI 7 PRO 350 at about 4× faster than real time on 8 CPU threads.
 - Fallback if it breaks: Kokoro through `kokoro-onnx` (FP16-stored weights, never the INT8 file, see section 10), and Ming through its official Python repo in a sandbox.
 
 **Kokoro (default, every machine)**
 - 82M parameters, Apache 2.0, 54 voices. Languages: English (US/UK), Spanish, French, Italian, Portuguese, Hindi, Japanese, Chinese.
 - The English file is ~190 MB. Non-English books use a larger multilingual file (~0.93 GB), downloaded only when one shows up.
 - Runs on CPU, or on any graphics card through Vulkan.
-- To check in step 2: how audio.cpp's Kokoro sounds out unknown words (Elvish names), and whether it accepts exact phonetic spellings for the pronunciation list.
+- Pronunciation of unknown words is checked (above). Q8_0 vs BF16 by ear is still open ([#3](https://github.com/Kingskid2026/tomecast/issues/3)).
 
 **Ming-3.0-tts 0.5B (premium, graphics card)**
 - MIT license. Built-in voices include **UK_George** (labelled "audiobooks") and **US_Emma** (labelled "narration"). Languages: English, Chinese, German, Spanish, French, Korean, Japanese. Output is 44.1 kHz.
@@ -132,7 +138,14 @@ Both sit behind one small interface (`voices()`, `languages()`, `synthesize(chun
 - The **"Use graphics card"** switch is always visible, with the measured speedup next to it ("about 4× faster on your machine").
 
 ### 6. Pause & resume, preview
-- Each book gets a project folder (`~/.local/share/tomecast/projects/<book-id>/`) holding finished audio chunks and a progress file. Closing the app, a crash or a reboot loses at most one sentence. Changing voice or speed starts fresh.
+- **Resume (built):**
+  - Each conversion keeps its chunk audio in `~/.local/share/tomecast/cache/convert-<key>/`.
+  - The key is a hash of the book file, the voice, the speed, the seed, and the engine and model versions, so a resumed book never mixes two voices or models.
+  - Each chunk's file name includes a hash of its exact text, and a file only gets its final name once its audio has passed the checks. So stopping (Ctrl-C, `kill`, a crash, a reboot) loses at most the chunk in progress, and changed text is always voiced again.
+  - Running the same command again picks up where it stopped. The folder is deleted after success, and unused ones after 14 days.
+  - A lock stops two runs of the same book from colliding.
+  - The engine process is stopped with Tomecast, even if Tomecast is killed.
+- **Pause** in the desktop window will use the same mechanism.
 - **Preview:** play the first paragraph of any chapter, or any typed text, in the chosen voice and speed before converting.
 
 ### 7. Packager
@@ -167,7 +180,7 @@ On first launch the app runs the hardware scan, lists what it needs to download 
   - The CUDA build (~170 MB + 440 MB runtime) isn't needed for models this small.
   - The app starts `llama-server` in the background only while it's needed, and stops it afterwards.
 - **audio.cpp** (the voice engine): fetched the same way, from its official GitHub releases. CPU build 64 MB, or Vulkan build 116 MB for any graphics card.
-- **ffmpeg** comes as a Python package (`imageio-ffmpeg`), and so does espeak-ng if Kokoro's unknown-word handling needs it (`espeakng-loader`). So **nothing comes from the distro's package manager**.
+- **ffmpeg** comes inside a Python package (`imageio-ffmpeg`). **eSpeak NG** is downloaded like the models, from the `espeakng-loader` wheel, pinned by SHA-256. So **nothing comes from the distro's package manager**.
 - **No PyTorch anywhere:**
   - voices run on audio.cpp,
   - Heron runs on ONNX Runtime (a small Python package),
@@ -175,14 +188,14 @@ On first launch the app runs the hardware scan, lists what it needs to download 
 - **Models** come only from official repos, in the sizes from section 10. Where a smaller file than the official one is needed, the app makes it locally with llama.cpp's own `llama-quantize` (seconds), instead of downloading files from unknown uploaders.
 - **Self-check:** it runs a 2-second test of each piece. If a prebuilt engine won't start (for example on an older distro), it says so and falls back to its CPU build or the Python fallback.
 
-**Where it works: the honest limits.** These were checked against the build setups on 2026-11-05. audio.cpp's Linux downloads are built on Ubuntu 24.04. llama.cpp's main Linux downloads are built on Ubuntu 22.04.
+**Where it works: the honest limits.** These were checked on 2026-11-05. audio.cpp's prebuilt Linux binaries (v0.9.4) need **glibc 2.43 or newer**. llama.cpp's main Linux downloads are built on Ubuntu 22.04. To check a system, run `ldd --version`.
 
 | System | Result |
 |---|---|
-| Ubuntu 24.04+, Fedora 40+, Arch / Manjaro / EndeavourOS / Omarchy, Linux Mint 22+, Debian 13+, openSUSE Tumbleweed, Pop!_OS 24.04+ | **Everything works** |
-| Older releases: Ubuntu 22.04, Debian 12, Mint 21, RHEL/Rocky 9 | audio.cpp's downloads need a newer core system library (glibc 2.39), so the app **falls back to Kokoro through `kokoro-onnx`**, which runs on older systems. The **premium Ming voice isn't available** unless audio.cpp is compiled on the machine (the app can offer this if build tools are installed). The AI add-ons still work |
+| Distros with glibc 2.43+: rolling ones like Arch / Manjaro / EndeavourOS / Omarchy and openSUSE Tumbleweed, and new releases that ship 2.43 | **Everything works** |
+| Everything older, including Ubuntu 22.04 and 24.04, Debian 12 and 13, and current Fedora | **Not yet.** Tomecast installs, then explains that the voice engine needs glibc 2.43. Fix planned in [#18](https://github.com/Kingskid2026/tomecast/issues/18): build audio.cpp ourselves on an old base system (one build covers nearly every distro from 2019 on), with `kokoro-onnx` as a fallback |
 | Alpine (musl) or NixOS | The prebuilt engines don't run as-is. Possible with extra setup, but not a first target |
-| ARM Linux (Raspberry Pi, ARM laptops) | audio.cpp has no Linux ARM download, so the Kokoro fallback is used. llama.cpp does have ARM builds |
+| ARM Linux (Raspberry Pi, ARM laptops) | audio.cpp has no Linux ARM download yet, so this needs the `kokoro-onnx` fallback from #18. llama.cpp does have ARM builds |
 | Very old CPUs (no AVX2) | Use audio.cpp's "portable" CPU build, which avoids newer CPU instructions |
 
 **The one thing it can't install: graphics drivers.** Those need admin rights and differ per distro. The app uses whatever driver is already there. If Vulkan isn't working, it runs on the CPU and shows the single package to install for that distro (e.g. `vulkan-icd-loader` on Arch, `libvulkan1` on Ubuntu/Debian, `vulkan-loader` on Fedora).
