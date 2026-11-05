@@ -90,6 +90,20 @@ def build_parser() -> argparse.ArgumentParser:
     convert.add_argument("-f", "--force", action="store_true", help="overwrite the output file")
 
     commands.add_parser("voices", help="list the available voices")
+
+    gui = commands.add_parser(
+        "gui",
+        help="open the desktop window",
+        description="Open the Tomecast desktop window, optionally with a book already loaded.",
+    )
+    gui.add_argument("book", nargs="?", type=Path, help="a book to open in the window")
+
+    entry = commands.add_parser(
+        "desktop-entry",
+        help="add or remove Tomecast in your app launcher",
+        description="Add Tomecast to (or remove it from) your app launcher and EPUB 'Open with'.",
+    )
+    entry.add_argument("action", choices=("install", "uninstall"), help="what to do")
     return parser
 
 
@@ -104,6 +118,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _convert(args)
         if args.command == "voices":
             return _voices()
+        if args.command == "gui":
+            return _gui(args)
+        if args.command == "desktop-entry":
+            return _desktop_entry(args)
     except CliError as error:
         print(f"tomecast: error: {error}", file=sys.stderr)
         return 1
@@ -126,6 +144,28 @@ def _voices() -> int:
         names = [v for v in VOICES if v.startswith(code)]
         print(f"{language}: {', '.join(names)}")
     print(f"\nDefault: {DEFAULT_VOICE}. Use one with `tomecast convert BOOK --voice NAME`.")
+    return 0
+
+
+def _gui(args: argparse.Namespace) -> int:
+    book: Path | None = args.book
+    try:
+        # Imported here so the other commands never load Qt.
+        from tomecast.gui import run
+
+        return run([str(book)] if book else [])
+    except ImportError as error:
+        raise CliError(f"the desktop window can't start ({error})") from error
+
+
+def _desktop_entry(args: argparse.Namespace) -> int:
+    from tomecast import desktop
+
+    try:
+        messages = desktop.install() if args.action == "install" else desktop.uninstall()
+    except OSError as error:
+        raise CliError(str(error)) from error
+    print("\n".join(messages))
     return 0
 
 

@@ -27,6 +27,12 @@ jobs:
       - run: uv run mypy
       - name: Lint install.sh
         run: uvx --from shellcheck-py shellcheck install.sh
+      - name: Validate the desktop entry
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq desktop-file-utils
+          uv run python -c "from tomecast.desktop import desktop_entry_text; print(desktop_entry_text('/usr/bin/tomecast'), end='')" > "$RUNNER_TEMP/tomecast.desktop"
+          desktop-file-validate "$RUNNER_TEMP/tomecast.desktop"
 
   test:
     name: Tests (Python ${{ matrix.python }})

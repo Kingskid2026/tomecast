@@ -1,0 +1,868 @@
+"""Backend: the one QObject the QML window talks to, registered as the singleton ``Backend``.
+
+Every property, signal and slot here is part of the Python ↔ QML contract in docs/gui.md.
+Slow work (reading a book, voicing a preview, converting) runs on the
+:class:`~tomecast.gui.worker.ConversionWorker` thread and comes back through queued signals.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import itertools
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+from collections.abc import Callable, Sequence
+from pathlib import Path
+from typing import Any, Literal, TypeVar, cast
+
+from PySide6.QtCore import (
+    Property,
+    QObject,
+    QProcess,
+    QSettings,
+    Qt,
+    QThread,
+    QUrl,
+    Signal,
+    Slot,
+)
+from PySide6.QtGui import QDesktopServices, QGuiApplication
+
+from tomecast.book import Book
+from tomecast.chunking import split_sentences
+from tomecast.downloads import Asset, data_dir
+from tomecast.engines.audiocpp import (
+    DEFAULT_VOICE,
+    REQUIRED_ASSETS,
+    VOICES,
+    check_system,
+    default_threads,
+)
+from tomecast.gui.models import DEFAULT_SPEEDUP, ChapterModel
+from tomecast.gui.worker import (
+    ConversionWorker,
+    ConvertJob,
+    ConvertResult,
+    ConvertUpdate,
+    EngineFactory,
+    PreviewJob,
+    ReadJob,
+    TimedControl,
+    kokoro_engine,
+    megabytes,
+    preview_file,
+)
+
+SCREENS = ("drop", "chapters", "voice", "converting", "done")
+THEME_SETTINGS = ("system", "dark", "light")
+MIN_SPEED, MAX_SPEED, SPEED_STEP = 0.75, 1.25, 0.05
+PLAYERS = ("pw-play", "paplay", "aplay")  # the first one found plays previews
+
+ART_CREDIT = "LUCA DELLA ROBBIA · CANTORIA · 1431\u201338"
+FORMATS_LABEL = "EPUB · PDF · DOCX · FB2 · HTML · TXT"
+# Formats the window lists but can't read yet.
+COMING_SOON = {
+    ".pdf": "PDF", ".docx": "DOCX", ".fb2": "FB2", ".html": "HTML", ".htm": "HTML",
+    ".xhtml": "HTML", ".txt": "TXT",
+}  # fmt: skip
+STOPPED_MESSAGE = "Stopped. Start again to continue where you left off."
+UNKNOWN_TIME = "--:--:--"
+
+# Voice menu groups, and the order of voices in each (as in the maintainer's mockup).
+VOICE_GROUPS = (
+    ("af", "AMERICAN · FEMALE"),
+    ("am", "AMERICAN · MALE"),
+    ("bf", "BRITISH · FEMALE"),
+    ("bm", "BRITISH · MALE"),
+)
+_VOICE_ORDER = (
+    "af_heart", "af_bella", "af_nicole", "af_sarah", "af_sky", "af_nova", "af_river",
+    "af_jessica", "af_kore", "af_aoede", "af_alloy",
+    "am_michael", "am_adam", "am_eric", "am_liam", "am_onyx", "am_puck", "am_echo", "am_fenrir",
+    "am_santa",
+    "bf_emma", "bf_isabella", "bf_alice", "bf_lily",
+    "bm_george", "bm_lewis", "bm_daniel", "bm_fable",
+)  # fmt: skip
+
+_T = TypeVar("_T")
+
+
+def _property(kind: Any, getter: Callable[[Any], _T], notify: Signal) -> _T:
+    """A read-only Qt property. Typed as its value, so Python callers (and tests) see a str,
+    bool… rather than a ``Property``."""
+    return cast(_T, Property(kind, getter, notify=notify))
+
+
+def _field(kind: Any, name: str, notify: Signal) -> Any:
+    """A read-only Qt property backed by the attribute ``_<name>``."""
+    return Property(kind, lambda self: getattr(self, f"_{name}"), notify=notify)
+
+
+def voice_groups() -> list[dict[str, Any]]:
+    """The voice menu: American and British English, grouped by accent and gender."""
+    groups: list[dict[str, Any]] = []
+    for prefix, label in VOICE_GROUPS:
+        ids = [voice for voice in VOICES if voice.startswith(f"{prefix}_")]
+        ids.sort(key=lambda v: (_VOICE_ORDER.index(v) if v in _VOICE_ORDER else 99, v))
+        voices = [{"id": voice, "name": voice.split("_", 1)[1].capitalize()} for voice in ids]
+        groups.append({"label": label, "voices": voices})
+    return groups
+
+
+def voice_label(voice: str) -> str:
+    """``"HEART · AMERICAN · FEMALE"``."""
+    prefix, _, name = voice.partition("_")
+    group = dict(VOICE_GROUPS).get(prefix)
+    return f"{name.upper()} · {group}" if group else name.upper()
+
+
+def safe_file_name(title: str) -> str:
+    """``title`` as a file name: no slashes, control characters or leading dots, and short
+    enough for any Linux file system."""
+    text = re.sub(r"[\x00-\x1f\x7f]", " ", title).replace("/", "-")
+    text = " ".join(text.split()).lstrip(".").strip()
+    encoded = text.encode()
+    if len(encoded) > 200:
+        text = encoded[:200].decode(errors="ignore")
+    return text.rstrip(" .")
+
+
+def unique_output(folder: Path, title: str) -> Path:
+    """``<folder>/<title>.m4b``, with " (2)", " (3)"… added so nothing is ever overwritten."""
+    name = safe_file_name(title) or "Audiobook"
+    candidate = folder / f"{name}.m4b"
+    for number in itertools.count(2):
+        if not (candidate.exists() or candidate.is_symlink()):
+            return candidate
+        candidate = folder / f"{name} ({number}).m4b"
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+def find_player() -> str | None:
+    """The system audio player for previews: pw-play, then paplay, then aplay."""
+    return next((path for name in PLAYERS if (path := shutil.which(name))), None)
+
+
+def system_reduce_motion() -> bool:
+    """True if ``TOMECAST_REDUCE_MOTION=1`` or GNOME has animations turned off."""
+    if os.environ.get("TOMECAST_REDUCE_MOTION") == "1":
+        return True
+    gsettings = shutil.which("gsettings")
+    if gsettings is None:
+        return False
+    try:
+        result = subprocess.run(
+            [gsettings, "get", "org.gnome.desktop.interface", "enable-animations"],
+            capture_output=True, text=True, timeout=1, check=False,
+        )  # fmt: skip
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0 and result.stdout.strip() == "false"
+
+
+def _clock(seconds: float) -> str:
+    """``"00:30:32"``."""
+    total = max(0, round(seconds))
+    hours, rest = divmod(total, 3600)
+    minutes, secs = divmod(rest, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def _length(seconds: float) -> str:
+    """``"2:47:00"``."""
+    total = max(0, round(seconds))
+    hours, rest = divmod(total, 3600)
+    minutes, secs = divmod(rest, 60)
+    return f"{hours}:{minutes:02d}:{secs:02d}"
+
+
+def _took(seconds: float) -> str:
+    """``"36 MIN"``, ``"1 H 05 MIN"`` or ``"40 SEC"``."""
+    if seconds < 59.5:
+        return f"{max(1, round(seconds))} SEC"
+    minutes = round(seconds / 60)
+    hours, rest = divmod(minutes, 60)
+    return f"{hours} H {rest:02d} MIN" if hours else f"{rest} MIN"
+
+
+def _local_path(url: QUrl | str) -> Path | None:
+    if isinstance(url, QUrl):
+        return Path(url.toLocalFile()) if url.isLocalFile() else None
+    if url.startswith("file:"):
+        return _local_path(QUrl(url))
+    return Path(url).expanduser() if url else None
+
+
+class Backend(QObject):
+    """The window's state and actions. See docs/gui.md for the contract."""
+
+    # --- Signals (one per property) ------------------------------------------------------
+
+    screenChanged = Signal()
+    themeSettingChanged = Signal()
+    themeChanged = Signal()
+    reduceMotionChanged = Signal()
+    hardwareLabelChanged = Signal()
+    errorMessageChanged = Signal()
+
+    bookLoadedChanged = Signal()
+    loadingChanged = Signal()
+    bookTitleChanged = Signal()
+    bookAuthorsChanged = Signal()
+    coverSourceChanged = Signal()
+    artSourceChanged = Signal()
+    artCreditChanged = Signal()
+    formatsLabelChanged = Signal()
+    chaptersChanged = Signal()
+    skipFrontMatterChanged = Signal()
+    selectionSummaryChanged = Signal()
+
+    voiceGroupsChanged = Signal()
+    voiceChanged = Signal()
+    voiceLabelChanged = Signal()
+    speedChanged = Signal()
+    previewTextChanged = Signal()
+    previewPlayingChanged = Signal()
+    previewAvailableChanged = Signal()
+
+    stageChanged = Signal()
+    downloadLabelChanged = Signal()
+    chunksDoneChanged = Signal()
+    chunksTotalChanged = Signal()
+    chapterLabelChanged = Signal()
+    timeLeftChanged = Signal()
+    progressLabelChanged = Signal()
+    speedLabelChanged = Signal()
+    nowSpeakingChanged = Signal()
+    pausedChanged = Signal()
+
+    outputPathChanged = Signal()
+    audioLengthChanged = Signal()
+    doneSummaryChanged = Signal()
+    warningsChanged = Signal()
+
+    # To the worker (queued: the worker lives on its own thread).
+    _jobRequested = Signal(object)
+    _shutdownRequested = Signal()
+
+    def __init__(
+        self,
+        parent: QObject | None = None,
+        *,
+        engine_factory: EngineFactory = kokoro_engine,
+        assets: Sequence[Asset] = REQUIRED_ASSETS,
+        data_root: Path | None = None,
+        player: str | Literal["auto"] | None = "auto",
+        settings: QSettings | None = None,
+        system_check: Callable[[], None] = check_system,
+        cover_sink: Callable[[bytes | None], None] | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._settings = settings if settings is not None else QSettings()
+        self._data_root = data_root if data_root is not None else data_dir()
+        self._player = find_player() if player == "auto" else player
+        self._cover_sink = cover_sink
+        self._jobs = itertools.count(1)
+        self._read_job: int | None = None
+        self._read_path: Path | None = None
+        self._preview_job: int | None = None
+        self._convert_job: int | None = None
+        self._control: TimedControl | None = None
+        self._chapter_labels: list[str] = []
+        self._speedup: float | None = None  # measured in this session
+        self._book: Book | None = None
+        self._book_path: Path | None = None
+        self._cover_count = 0
+        self._has_cover = False
+        self._playback: QProcess | None = None
+        self._preview_cache: Path | None = None
+        self._shut_down = False
+
+        # App
+        self._screen = "drop"
+        saved_theme = str(self._settings.value("themeSetting", "system"))
+        self._themeSetting = saved_theme if saved_theme in THEME_SETTINGS else "system"
+        self._theme = self._effective_theme()
+        self._reduceMotion = system_reduce_motion()
+        threads = default_threads()
+        self._hardwareLabel = f"CPU · {threads} THREAD{'' if threads == 1 else 'S'}"
+        self._errorMessage = ""
+        # Book
+        self._bookLoaded = False
+        self._loading = False
+        self._bookTitle = ""
+        self._bookAuthors = ""
+        self._skipFrontMatter = True
+        self._chapters = ChapterModel(self)
+        self._chapters.selectionChanged.connect(self._on_selection_changed)
+        # Voice
+        self._voiceGroups = voice_groups()
+        saved_voice = str(self._settings.value("voice", DEFAULT_VOICE))
+        self._voice = saved_voice if saved_voice in self._voice_ids() else DEFAULT_VOICE
+        self._speed = self._valid_speed(self._settings.value("speed", 1.0))
+        self._previewText = ""
+        self._previewPlaying = False
+        # Converting
+        self._stage = "starting"
+        self._downloadLabel = ""
+        self._chunksDone = 0
+        self._chunksTotal = 0
+        self._chapterLabel = ""
+        self._timeLeft = UNKNOWN_TIME
+        self._progressLabel = self._progress_text(0, 0)
+        self._speedLabel = ""
+        self._nowSpeaking = ""
+        self._paused = False
+        # Done
+        self._outputPath = ""
+        self._audioLength = ""
+        self._doneSummary = ""
+        self._warnings: list[str] = []
+
+        hints = QGuiApplication.styleHints()
+        hints.colorSchemeChanged.connect(self._update_theme)
+
+        # The one worker thread, started once and kept until shutdown().
+        self._thread = QThread()
+        self._thread.setObjectName("tomecast-worker")
+        self._worker = ConversionWorker(
+            engine_factory=engine_factory,
+            assets=assets,
+            data_root=self._data_root,
+            system_check=system_check,
+        )
+        self._worker.moveToThread(self._thread)
+        self._jobRequested.connect(self._worker.run)
+        self._shutdownRequested.connect(self._worker.shutdown)
+        self._worker.bookRead.connect(self._on_book_read)
+        self._worker.previewReady.connect(self._on_preview_ready)
+        self._worker.stageChanged.connect(self._on_stage)
+        self._worker.downloadProgress.connect(self._on_download_progress)
+        self._worker.progressed.connect(self._on_progress)
+        self._worker.converted.connect(self._on_converted)
+        self._worker.failed.connect(self._on_failed)
+        self._thread.start()
+
+    # --- Properties: app -------------------------------------------------------------------
+
+    screen: str = _field(str, "screen", screenChanged)
+    themeSetting: str = _field(str, "themeSetting", themeSettingChanged)
+    theme: str = _field(str, "theme", themeChanged)
+    reduceMotion: bool = _field(bool, "reduceMotion", reduceMotionChanged)
+    hardwareLabel: str = _field(str, "hardwareLabel", hardwareLabelChanged)
+    errorMessage: str = _field(str, "errorMessage", errorMessageChanged)
+
+    # --- Properties: book ------------------------------------------------------------------
+
+    bookLoaded: bool = _field(bool, "bookLoaded", bookLoadedChanged)
+    loading: bool = _field(bool, "loading", loadingChanged)
+    bookTitle: str = _field(str, "bookTitle", bookTitleChanged)
+    bookAuthors: str = _field(str, "bookAuthors", bookAuthorsChanged)
+
+    def _get_cover_source(self) -> str:
+        if not self._has_cover:
+            return ""
+        return f"image://dots/cover/{self._theme}?{self._cover_count}"
+
+    coverSource = _property(str, _get_cover_source, coverSourceChanged)
+
+    def _get_art_source(self) -> str:
+        return f"image://dots/cantoria/{self._theme}"
+
+    artSource = _property(str, _get_art_source, artSourceChanged)
+
+    def _get_art_credit(self) -> str:
+        return ART_CREDIT
+
+    artCredit = _property(str, _get_art_credit, artCreditChanged)
+
+    def _get_formats_label(self) -> str:
+        return FORMATS_LABEL
+
+    formatsLabel = _property(str, _get_formats_label, formatsLabelChanged)
+
+    def _get_chapters(self) -> ChapterModel:
+        return self._chapters
+
+    chapters = _property(QObject, _get_chapters, chaptersChanged)
+    skipFrontMatter: bool = _field(bool, "skipFrontMatter", skipFrontMatterChanged)
+
+    def _get_selection_summary(self) -> dict[str, str]:
+        return self._chapters.summary(self._speedup or DEFAULT_SPEEDUP)
+
+    selectionSummary = _property(dict, _get_selection_summary, selectionSummaryChanged)
+
+    # --- Properties: voice -----------------------------------------------------------------
+
+    voiceGroups: list[dict[str, Any]] = _field(list, "voiceGroups", voiceGroupsChanged)
+    voice: str = _field(str, "voice", voiceChanged)
+
+    def _get_voice_label(self) -> str:
+        return voice_label(self._voice)
+
+    voiceLabel = _property(str, _get_voice_label, voiceLabelChanged)
+    speed: float = _field(float, "speed", speedChanged)
+    previewText: str = _field(str, "previewText", previewTextChanged)
+    previewPlaying: bool = _field(bool, "previewPlaying", previewPlayingChanged)
+
+    def _get_preview_available(self) -> bool:
+        return self._player is not None
+
+    previewAvailable = _property(bool, _get_preview_available, previewAvailableChanged)
+
+    # --- Properties: converting ------------------------------------------------------------
+
+    stage: str = _field(str, "stage", stageChanged)
+    downloadLabel: str = _field(str, "downloadLabel", downloadLabelChanged)
+    chunksDone: int = _field(int, "chunksDone", chunksDoneChanged)
+    chunksTotal: int = _field(int, "chunksTotal", chunksTotalChanged)
+    chapterLabel: str = _field(str, "chapterLabel", chapterLabelChanged)
+    timeLeft: str = _field(str, "timeLeft", timeLeftChanged)
+    progressLabel: str = _field(str, "progressLabel", progressLabelChanged)
+    speedLabel: str = _field(str, "speedLabel", speedLabelChanged)
+    nowSpeaking: str = _field(str, "nowSpeaking", nowSpeakingChanged)
+    paused: bool = _field(bool, "paused", pausedChanged)
+
+    # --- Properties: done ------------------------------------------------------------------
+
+    outputPath: str = _field(str, "outputPath", outputPathChanged)
+    audioLength: str = _field(str, "audioLength", audioLengthChanged)
+    doneSummary: str = _field(str, "doneSummary", doneSummaryChanged)
+    warnings: list[str] = _field(list, "warnings", warningsChanged)
+
+    # --- Slots: app ------------------------------------------------------------------------
+
+    @Slot(str)
+    def setThemeSetting(self, name: str) -> None:
+        if name not in THEME_SETTINGS:
+            return
+        self._update("themeSetting", name)
+        self._settings.setValue("themeSetting", name)
+        self._settings.sync()
+        self._update_theme()
+
+    @Slot(str)
+    def goTo(self, screen: str) -> None:
+        """Move between the screens a back (or next) button may reach from here."""
+        current = self._screen
+        if screen == current or current == "converting":
+            return
+        if screen == "drop":
+            self._show("drop")
+        elif screen == "chapters" and self._bookLoaded:
+            self._show("chapters")
+        elif screen == "voice" and self._bookLoaded and current in ("chapters", "done"):
+            if not self._chapters.selected_rows():
+                self._update("errorMessage", "Choose at least one section to convert.")
+                return
+            self._show("voice")
+
+    @Slot(result=str)
+    def chooseBookFolder(self) -> str:
+        """The folder the file dialog should open in, as a ``file://`` URL."""
+        saved = str(self._settings.value("lastBookFolder", "") or "")
+        folder = Path(saved) if saved and Path(saved).is_dir() else Path.home()
+        return QUrl.fromLocalFile(str(folder)).toString()
+
+    @Slot()
+    def dismissError(self) -> None:
+        self._update("errorMessage", "")
+
+    # --- Slots: book -----------------------------------------------------------------------
+
+    @Slot(QUrl)
+    def openBook(self, url: QUrl | str) -> None:
+        """Read a book (a ``file://`` URL or a path) on the worker, then show its chapters."""
+        if self._screen == "converting" or self._shut_down:
+            return
+        path = _local_path(url)
+        if path is None:
+            self._update("errorMessage", "Tomecast can only open books saved on this computer.")
+            return
+        suffix = path.suffix.lower()
+        if suffix in COMING_SOON:
+            name = COMING_SOON[suffix]
+            self._update(
+                "errorMessage",
+                f"{name} support is coming soon. For now, Tomecast reads EPUB books.",
+            )
+            return
+        if suffix != ".epub":
+            kind = f"{suffix} files" if suffix else "files without an extension"
+            self._update("errorMessage", f"Tomecast can't read {kind}. Choose an EPUB book.")
+            return
+        if not path.is_file():
+            self._update("errorMessage", f"Couldn't find {path.name}.")
+            return
+        self._settings.setValue("lastBookFolder", str(path.parent))
+        self._settings.sync()
+        self._update("errorMessage", "")
+        self._update("loading", True)
+        self._read_job = next(self._jobs)
+        self._read_path = path
+        self._jobRequested.emit(ReadJob(self._read_job, path))
+
+    @Slot(int, bool)
+    def setChapterSelected(self, row: int, selected: bool) -> None:
+        self._chapters.set_selected(row, selected)
+
+    @Slot(bool)
+    def setSkipFrontMatter(self, on: bool) -> None:
+        self._update("skipFrontMatter", on)
+        self._chapters.set_front_matter_selected(not on)
+
+    # --- Slots: voice ----------------------------------------------------------------------
+
+    @Slot(str)
+    def setVoice(self, voice: str) -> None:
+        if voice not in self._voice_ids() or voice == self._voice:
+            return
+        self._stop_preview()
+        self._update("voice", voice)
+        self.voiceLabelChanged.emit()
+        self._settings.setValue("voice", voice)
+        self._settings.sync()
+
+    @Slot(float)
+    def setSpeed(self, value: float) -> None:
+        speed = self._valid_speed(value)
+        if speed == self._speed:
+            return
+        self._stop_preview()
+        self._update("speed", speed)
+        self._settings.setValue("speed", speed)
+        self._settings.sync()
+
+    @Slot()
+    def togglePreview(self) -> None:
+        """Voice ``previewText`` with the chosen voice and speed and play it; again to stop."""
+        if self._previewPlaying:
+            self._stop_preview()
+            return
+        if self._player is None or not self._previewText or self._shut_down:
+            return
+        self._update("previewPlaying", True)
+        if self._preview_cache is None:
+            self._preview_cache = Path(tempfile.mkdtemp(prefix="tomecast-preview-"))
+        wav = preview_file(self._preview_cache, self._voice, self._speed, self._previewText)
+        if wav.is_file():
+            self._play(wav)
+            return
+        self._preview_job = next(self._jobs)
+        job = PreviewJob(self._preview_job, self._previewText, self._voice, self._speed, wav)
+        self._jobRequested.emit(job)
+
+    @Slot()
+    def startConversion(self) -> None:
+        """Write ``<book folder>/<book title>.m4b`` (never overwriting) on the worker."""
+        if self._screen == "converting" or self._book is None or self._book_path is None:
+            return
+        rows = self._chapters.selected_rows()
+        if not rows:
+            self._update("errorMessage", "Choose at least one section to convert.")
+            return
+        folder = self._book_path.parent
+        if not os.access(folder, os.W_OK):
+            self._update(
+                "errorMessage",
+                f"Tomecast can't save the audiobook in {folder}. Move the book to a folder you "
+                "can write to, and open it again.",
+            )
+            return
+        self._stop_preview()
+        sections = self._chapters.sections
+        book = dataclasses.replace(self._book, chapters=tuple(sections[r].chapter for r in rows))
+        output = unique_output(folder, self._book.title or self._book_path.stem)
+        self._chapter_labels = [sections[r].label for r in rows]
+        self._control = TimedControl()
+        self._convert_job = next(self._jobs)
+        self._reset_progress()
+        self._update("chapterLabel", self._chapter_labels[0])
+        self._update("errorMessage", "")
+        self._show("converting")
+        self._jobRequested.emit(
+            ConvertJob(
+                self._convert_job, book, self._book_path, output, self._voice, self._speed,
+                self._control,
+            )
+        )  # fmt: skip
+
+    # --- Slots: converting -----------------------------------------------------------------
+
+    @Slot()
+    def pauseConversion(self) -> None:
+        if self._control is not None:
+            self._control.pause()
+            self._update("paused", True)
+
+    @Slot()
+    def resumeConversion(self) -> None:
+        if self._control is not None:
+            self._control.resume()
+            self._update("paused", False)
+
+    @Slot()
+    def cancelConversion(self) -> None:
+        """Stop after the current sentence. The work is kept, so starting again resumes."""
+        if self._control is None:
+            return
+        self._control.cancel()
+        self._end_conversion()
+        self._update("errorMessage", STOPPED_MESSAGE)
+        self._show("voice")
+
+    # --- Slots: done -----------------------------------------------------------------------
+
+    @Slot()
+    def openOutputFolder(self) -> None:
+        if self._outputPath:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(self._outputPath).parent)))
+
+    @Slot()
+    def convertAnother(self) -> None:
+        """Back to the drop screen with no book, keeping the voice and speed."""
+        if self._screen == "converting":
+            return
+        self._stop_preview()
+        self._book = None
+        self._book_path = None
+        self._read_job = None
+        self._chapters.clear()
+        self._set_cover(None)
+        for name, value in (
+            ("bookLoaded", False), ("loading", False), ("bookTitle", ""), ("bookAuthors", ""),
+            ("outputPath", ""), ("audioLength", ""), ("doneSummary", ""), ("warnings", []),
+            ("errorMessage", ""),
+        ):  # fmt: skip
+            self._update(name, value)
+        self._show("drop")
+
+    # --- Shutting down ---------------------------------------------------------------------
+
+    def shutdown(self) -> None:
+        """Cancel any running job, stop the engine and join the worker thread."""
+        if self._shut_down:
+            return
+        self._shut_down = True
+        self._worker.stop()
+        if self._control is not None:
+            self._control.cancel()
+        self._stop_preview()
+        self._shutdownRequested.emit()
+        self._thread.wait()
+        if self._preview_cache is not None:
+            shutil.rmtree(self._preview_cache, ignore_errors=True)
+            self._preview_cache = None
+
+    @property
+    def worker_thread(self) -> QThread:
+        """The worker's thread (for tests and shutdown checks)."""
+        return self._thread
+
+    # --- Worker results --------------------------------------------------------------------
+
+    @Slot(int, object)
+    def _on_book_read(self, job: int, book: Book) -> None:
+        if job != self._read_job:
+            return
+        self._read_job = None
+        self._book = book
+        self._book_path = self._read_path
+        self._chapters.set_book(book, skip_front_matter=self._skipFrontMatter)
+        self._update("bookTitle", book.title)
+        self._update("bookAuthors", ", ".join(book.authors))
+        self._set_cover(book.cover.data if book.cover else None)
+        self._update("bookLoaded", True)
+        self._update("loading", False)
+        self._show("chapters")
+
+    @Slot(int, str)
+    def _on_preview_ready(self, job: int, path: str) -> None:
+        if job != self._preview_job:
+            return
+        self._preview_job = None
+        if self._previewPlaying:
+            self._play(Path(path))
+
+    @Slot(int, str)
+    def _on_stage(self, job: int, stage: str) -> None:
+        if job == self._convert_job:
+            self._update("stage", stage)
+
+    @Slot(int, str)
+    def _on_download_progress(self, job: int, label: str) -> None:
+        if job == self._convert_job:
+            self._update("downloadLabel", label)
+
+    @Slot(int, object)
+    def _on_progress(self, job: int, update: ConvertUpdate) -> None:
+        if job != self._convert_job:
+            return
+        self._update("stage", update.stage)
+        self._update("chunksTotal", update.chunks_total)
+        self._update("chunksDone", update.chunks_done)
+        self._update("progressLabel", self._progress_text(update.chunks_done, update.chunks_total))
+        if 0 <= update.chapter_index < len(self._chapter_labels):
+            self._update("chapterLabel", self._chapter_labels[update.chapter_index])
+        self._update("nowSpeaking", update.now_speaking)
+        seconds_left = update.seconds_left
+        self._update("timeLeft", UNKNOWN_TIME if seconds_left is None else _clock(seconds_left))
+        if update.speedup is not None:
+            self._update("speedLabel", f"{update.speedup:.1f}\u00d7 REAL TIME")
+            self._measured(update.speedup)
+
+    @Slot(int, object)
+    def _on_converted(self, job: int, result: ConvertResult) -> None:
+        if job != self._convert_job:
+            return
+        self._end_conversion()
+        if result.speedup is not None:
+            self._measured(result.speedup)
+        chapters = f"{result.chapters} CHAPTER{'' if result.chapters == 1 else 'S'}"
+        self._update("outputPath", str(result.output))
+        self._update("audioLength", _length(result.audio_seconds))
+        self._update(
+            "doneSummary",
+            f"OF AUDIO · {chapters} · {megabytes(result.size_bytes)} · "
+            f"MADE IN {_took(result.seconds_taken)}",
+        )
+        self._update("warnings", list(result.warnings))
+        self._update("chunksDone", self._chunksTotal)
+        self._show("done")
+
+    @Slot(int, str)
+    def _on_failed(self, job: int, message: str) -> None:
+        if job == self._read_job:
+            self._read_job = None
+            self._update("loading", False)
+        elif job == self._preview_job:
+            self._preview_job = None
+            self._update("previewPlaying", False)
+        elif job == self._convert_job:
+            self._end_conversion()
+            self._show("voice")
+        else:
+            return  # a job the window no longer waits for
+        self._update("errorMessage", message)
+
+    # --- Helpers ---------------------------------------------------------------------------
+
+    def _update(self, name: str, value: object) -> None:
+        """Set the property ``name`` and emit ``<name>Changed`` if its value changed."""
+        attribute = f"_{name}"
+        if getattr(self, attribute) != value:
+            setattr(self, attribute, value)
+            getattr(self, f"{name}Changed").emit()
+
+    def _show(self, screen: str) -> None:
+        if screen != "voice":
+            self._stop_preview()
+        self._update("screen", screen)
+
+    @Slot()
+    def _update_theme(self) -> None:
+        theme = self._effective_theme()
+        if theme != self._theme:
+            self._theme = theme
+            self.themeChanged.emit()
+            self.coverSourceChanged.emit()
+            self.artSourceChanged.emit()
+
+    def _effective_theme(self) -> str:
+        if self._themeSetting in ("dark", "light"):
+            return self._themeSetting
+        scheme = QGuiApplication.styleHints().colorScheme()
+        return "light" if scheme == Qt.ColorScheme.Light else "dark"
+
+    @Slot()
+    def _on_selection_changed(self) -> None:
+        self.selectionSummaryChanged.emit()
+        self._update("previewText", self._first_sentence())
+
+    def _first_sentence(self) -> str:
+        """The first sentence of the first selected chapter that has any text."""
+        sections = self._chapters.sections
+        rows = self._chapters.selected_rows() or range(len(sections))
+        for row in rows:
+            for paragraph in sections[row].chapter.paragraphs:
+                for sentence in split_sentences(paragraph):
+                    if any(character.isalnum() for character in sentence):
+                        return sentence
+        return ""
+
+    def _set_cover(self, data: bytes | None) -> None:
+        self._cover_count += 1
+        self._has_cover = data is not None
+        if self._cover_sink is not None:
+            self._cover_sink(data)
+        self.coverSourceChanged.emit()
+
+    def _voice_ids(self) -> set[str]:
+        return {voice["id"] for group in self._voiceGroups for voice in group["voices"]}
+
+    @staticmethod
+    def _valid_speed(value: object) -> float:
+        try:
+            speed = float(cast(Any, value))
+        except (TypeError, ValueError):
+            speed = 1.0
+        speed = min(MAX_SPEED, max(MIN_SPEED, speed))
+        return round(round(speed / SPEED_STEP) * SPEED_STEP, 2)
+
+    @staticmethod
+    def _progress_text(done: int, total: int) -> str:
+        percent = 100 * done // total if total else 0
+        return f"{done:,} / {total:,} PIECES · {percent}%"
+
+    def _reset_progress(self) -> None:
+        for name, value in (
+            ("stage", "starting"), ("downloadLabel", ""), ("chunksDone", 0), ("chunksTotal", 0),
+            ("timeLeft", UNKNOWN_TIME), ("progressLabel", self._progress_text(0, 0)),
+            ("speedLabel", ""), ("nowSpeaking", ""), ("paused", False), ("outputPath", ""),
+            ("audioLength", ""), ("doneSummary", ""), ("warnings", []),
+        ):  # fmt: skip
+            self._update(name, value)
+
+    def _end_conversion(self) -> None:
+        self._convert_job = None
+        self._control = None
+        self._update("paused", False)
+
+    def _measured(self, speedup: float) -> None:
+        self._speedup = speedup
+        self._update("hardwareLabel", f"CPU · ABOUT {speedup:.1f}\u00d7 REAL TIME")
+        self.selectionSummaryChanged.emit()
+
+    # --- Preview playback ------------------------------------------------------------------
+
+    def _play(self, wav: Path) -> None:
+        assert self._player is not None
+        process = QProcess(self)
+        process.finished.connect(self._on_playback_finished)
+        process.errorOccurred.connect(self._on_playback_error)
+        self._playback = process
+        process.start(self._player, [str(wav)])
+
+    @Slot()
+    def _on_playback_finished(self) -> None:
+        if self.sender() is self._playback:
+            self._playback = None
+            self._update("previewPlaying", False)
+
+    @Slot(QProcess.ProcessError)
+    def _on_playback_error(self, error: QProcess.ProcessError) -> None:
+        if self.sender() is self._playback and error == QProcess.ProcessError.FailedToStart:
+            self._playback = None
+            self._update("previewPlaying", False)
+            self._update("errorMessage", f"Couldn't play the preview with {self._player}.")
+
+    def _stop_preview(self) -> None:
+        self._preview_job = None
+        playback, self._playback = self._playback, None
+        if playback is not None and playback.state() != QProcess.ProcessState.NotRunning:
+            playback.kill()
+            playback.waitForFinished(1000)
+        self._update("previewPlaying", False)
