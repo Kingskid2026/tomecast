@@ -1,6 +1,8 @@
 import array
 import math
 import subprocess
+import threading
+import time
 import wave
 from pathlib import Path
 
@@ -10,7 +12,14 @@ import pytest
 from tomecast.audio import write_silence
 from tomecast.book import Book, Chapter, Cover
 from tomecast.chunking import normalize_whitespace
-from tomecast.convert import MissingAudioError, audio_problem, convert_book
+from tomecast.convert import (
+    ConversionCancelled,
+    ConversionControl,
+    ConversionProgress,
+    MissingAudioError,
+    audio_problem,
+    convert_book,
+)
 
 SAMPLE_RATE = 24000
 CHARS_PER_SECOND = 15.0
@@ -133,7 +142,8 @@ def test_progress_is_reported_for_every_chunk(tmp_path: Path) -> None:
         progress=lambda p: seen.append((p.chunks_done, p.chunks_total)),
     )
     total = seen[0][1]
-    assert seen == [(i, total) for i in range(1, total + 1)]
+    # once at the start, after every chunk, and once more for packaging
+    assert seen == [(i, total) for i in range(total + 1)] + [(total, total)]
 
 
 def test_silent_audio_stops_the_conversion(tmp_path: Path) -> None:
@@ -239,4 +249,55 @@ def test_a_damaged_cover_is_dropped_with_a_warning(tmp_path: Path) -> None:
     result = convert_book(book, FakeEngine(), tmp_path / "b.m4b", workdir=tmp_path / "w")
 
     assert result.warnings == ("The book's cover image is damaged, so the audiobook has no cover.",)
+    assert (tmp_path / "b.m4b").is_file()
+
+
+def test_progress_reports_the_text_being_spoken_and_audio_made(tmp_path: Path) -> None:
+    seen: list[ConversionProgress] = []
+    convert_book(
+        _book(), FakeEngine(), tmp_path / "b.m4b", workdir=tmp_path / "w", progress=seen.append
+    )
+
+    assert seen[0].chunks_done == 0
+    assert seen[0].now_speaking == "Chapter One"  # the first chunk, about to be voiced
+    assert seen[1].now_speaking == "It was a dark night."
+    assert [p.audio_seconds for p in seen] == sorted(p.audio_seconds for p in seen)
+    assert seen[-2].audio_seconds > 0
+    assert seen[-1].stage == "packaging"
+    assert seen[-1].now_speaking == ""
+
+
+def test_a_conversion_can_be_cancelled_and_then_resumed(tmp_path: Path) -> None:
+    control = ConversionControl()
+    engine = FakeEngine()
+
+    def cancel_after_two(p: ConversionProgress) -> None:
+        if p.chunks_done == 2:
+            control.cancel()
+
+    with pytest.raises(ConversionCancelled):
+        convert_book(_book(), engine, tmp_path / "b.m4b", workdir=tmp_path / "w",
+                     progress=cancel_after_two, control=control)  # fmt: skip
+    assert len(engine.texts) == 2
+    assert not (tmp_path / "b.m4b").exists()
+
+    result = convert_book(_book(), FakeEngine(), tmp_path / "b.m4b", workdir=tmp_path / "w")
+    assert result.reused_chunks == 2
+
+
+def test_a_paused_conversion_waits_until_resumed(tmp_path: Path) -> None:
+    control = ConversionControl()
+    control.pause()
+    engine = FakeEngine()
+    worker = threading.Thread(
+        target=convert_book,
+        args=(_book(), engine, tmp_path / "b.m4b"),
+        kwargs={"workdir": tmp_path / "w", "control": control},
+    )
+    worker.start()
+    time.sleep(0.3)
+    assert engine.texts == []  # nothing voiced while paused
+    control.resume()
+    worker.join(timeout=30)
+    assert not worker.is_alive()
     assert (tmp_path / "b.m4b").is_file()

@@ -283,6 +283,8 @@ class _ProgressPrinter:
         self._shown = False
 
     def update(self, progress: ConversionProgress) -> None:
+        if progress.chunks_done == 0 or progress.stage == "packaging":
+            return
         percent = 100 * progress.chunks_done // max(1, progress.chunks_total)
         elapsed = time.monotonic() - self._started
         remaining = elapsed / progress.chunks_done * (progress.chunks_total - progress.chunks_done)

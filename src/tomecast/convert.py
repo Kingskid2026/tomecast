@@ -13,11 +13,12 @@ the checks is reused, and anything else is voiced again.
 from __future__ import annotations
 
 import hashlib
+import threading
 import wave
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 
 from tomecast.audio import peak_level, wav_info, write_silence
 from tomecast.book import Book
@@ -70,14 +71,62 @@ class MissingAudioError(RuntimeError):
     """Raised when a chunk still has no usable audio after retrying."""
 
 
+class ConversionCancelled(Exception):
+    """Raised inside :func:`convert_book` when its :class:`ConversionControl` is cancelled.
+
+    Everything voiced so far stays in the work folder, so the conversion can be resumed.
+    """
+
+
+class ConversionControl:
+    """Pause, resume and cancel a running conversion from another thread (the window).
+
+    :func:`convert_book` checks it before each chunk: while paused it waits, and once
+    cancelled it raises :class:`ConversionCancelled`. A chunk already being voiced finishes.
+    """
+
+    def __init__(self) -> None:
+        self._running = threading.Event()
+        self._running.set()
+        self._cancelled = threading.Event()
+
+    @property
+    def paused(self) -> bool:
+        return not self._running.is_set()
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancelled.is_set()
+
+    def pause(self) -> None:
+        self._running.clear()
+
+    def resume(self) -> None:
+        self._running.set()
+
+    def cancel(self) -> None:
+        self._cancelled.set()
+        self._running.set()  # wake a paused conversion so it can stop
+
+    def checkpoint(self) -> None:
+        """Wait while paused; raise :class:`ConversionCancelled` once cancelled."""
+        self._running.wait()
+        if self._cancelled.is_set():
+            raise ConversionCancelled
+
+
 @dataclass(frozen=True, slots=True)
 class ConversionProgress:
-    """Passed to the progress callback after each chunk is voiced."""
+    """Passed to the progress callback: once at the start, after every chunk, and once
+    more when packaging begins."""
 
     chunks_done: int
     chunks_total: int
     chapter_index: int
     chapter_count: int
+    now_speaking: str = ""  # the text being voiced next ("" once all of it is voiced)
+    audio_seconds: float = 0.0  # length of the audio made so far
+    stage: Literal["voicing", "packaging"] = "voicing"
 
 
 ProgressCallback = Callable[[ConversionProgress], None]
@@ -107,12 +156,14 @@ def convert_book(
     *,
     workdir: Path,
     progress: ProgressCallback | None = None,
+    control: ConversionControl | None = None,
     retries: int = 1,
 ) -> ConversionResult:
     """Voice ``book`` with ``engine`` and write an M4B audiobook to ``output``.
 
     Chunk audio is written to ``workdir``. Running again with the same ``workdir`` after an
-    interruption reuses the chunks that were already voiced.
+    interruption reuses the chunks that were already voiced. ``control`` lets another thread
+    pause, resume or cancel the conversion between chunks.
     """
     warnings: list[str] = []
     cover = book.cover
@@ -125,14 +176,31 @@ def convert_book(
     chunk_dir = workdir / "chunks"
     chunk_dir.mkdir(parents=True, exist_ok=True)
 
+    queue = [chunk for chunks in plan for chunk in chunks]
+    chapter_count = len(book.chapters)
+
+    def report(done: int, chapter_index: int, seconds: float, stage: str = "voicing") -> None:
+        if progress:
+            upcoming = queue[done].text if done < total else ""
+            progress(
+                ConversionProgress(
+                    done, total, chapter_index, chapter_count, upcoming, seconds,
+                    "packaging" if stage == "packaging" else "voicing",
+                )
+            )  # fmt: skip
+
     chapters: list[ChapterAudio] = []
     done = reused = 0
+    audio_seconds = 0.0
+    report(0, next((i for i, chunks in enumerate(plan) if chunks), 0), 0.0)
     for chapter_index, (chapter, chunks) in enumerate(zip(book.chapters, plan, strict=True)):
         if not chunks:
             continue
         segments: list[Path] = []
         gaps: list[float] = []
         for position, chunk in enumerate(chunks):
+            if control:
+                control.checkpoint()
             wav = chunk_dir / _chunk_file_name(chunk)
             if _is_reusable(wav, chunk):
                 reused += 1
@@ -146,9 +214,11 @@ def convert_book(
             is_last = position == len(chunks) - 1
             gaps.append(_gap_after(chunk, is_title=bool(chapter.title), is_last=is_last))
             done += 1
-            if progress:
-                progress(ConversionProgress(done, total, chapter_index, len(book.chapters)))
+            audio_seconds += wav_info(wav).seconds
+            report(done, chapter_index, audio_seconds)
         chapters.append(ChapterAudio(chapter.title, tuple(segments), tuple(gaps)))
+
+    report(done, max(0, chapter_count - 1), audio_seconds, stage="packaging")
 
     info = AudiobookInfo(
         title=book.title,
