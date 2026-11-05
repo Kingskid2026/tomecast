@@ -4,14 +4,12 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import fcntl
-import hashlib
 import shutil
 import signal
 import sys
 import time
 import wave
-from collections.abc import Iterator, Sequence
+from collections.abc import Sequence
 from pathlib import Path
 from typing import TextIO
 
@@ -27,10 +25,10 @@ from tomecast.downloads import (
     is_installed,
 )
 from tomecast.engines.audiocpp import (
-    AUDIOCPP_VERSION,
-    DEFAULT_SEED,
     DEFAULT_VOICE,
     MAX_CHARS,
+    MAX_SPEED,
+    MIN_SPEED,
     REQUIRED_ASSETS,
     VOICES,
     EngineError,
@@ -39,6 +37,7 @@ from tomecast.engines.audiocpp import (
 )
 from tomecast.packaging import PackagingError
 from tomecast.readers.epub import InvalidEbookError, read_epub
+from tomecast.workdirs import WorkFolderBusy, exclusive, work_folder
 
 
 class CliError(Exception):
@@ -46,7 +45,6 @@ class CliError(Exception):
 
 
 # Unfinished conversions are kept so they can be resumed; after this long they're removed.
-STALE_WORK_DAYS = 14
 
 
 def _speed(value: str) -> float:
@@ -54,8 +52,8 @@ def _speed(value: str) -> float:
         speed = float(value)
     except ValueError:
         raise argparse.ArgumentTypeError(f"{value!r} isn't a number") from None
-    if not 0.5 <= speed <= 2.0:
-        raise argparse.ArgumentTypeError("must be between 0.5 and 2.0")
+    if not MIN_SPEED <= speed <= MAX_SPEED:
+        raise argparse.ArgumentTypeError(f"must be between {MIN_SPEED} and {MAX_SPEED}")
     return speed
 
 
@@ -82,7 +80,10 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Kokoro voice (default: {DEFAULT_VOICE}; see `tomecast voices`)",
     )  # fmt: skip
     convert.add_argument(
-        "--speed", type=_speed, default=1.0, help="speaking speed, 0.5 to 2.0 (default: 1.0)"
+        "--speed",
+        type=_speed,
+        default=1.0,
+        help=f"speaking speed, {MIN_SPEED} to {MAX_SPEED} (default: 1.0)",
     )
     convert.add_argument(
         "-y", "--yes", action="store_true", help="download the voice engine without asking"
@@ -90,6 +91,20 @@ def build_parser() -> argparse.ArgumentParser:
     convert.add_argument("-f", "--force", action="store_true", help="overwrite the output file")
 
     commands.add_parser("voices", help="list the available voices")
+
+    gui = commands.add_parser(
+        "gui",
+        help="open the desktop window",
+        description="Open the Tomecast desktop window, optionally with a book already loaded.",
+    )
+    gui.add_argument("book", nargs="?", type=Path, help="a book to open in the window")
+
+    entry = commands.add_parser(
+        "desktop-entry",
+        help="add or remove Tomecast in your app launcher",
+        description="Add Tomecast to (or remove it from) your app launcher and EPUB 'Open with'.",
+    )
+    entry.add_argument("action", choices=("install", "uninstall"), help="what to do")
     return parser
 
 
@@ -104,6 +119,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _convert(args)
         if args.command == "voices":
             return _voices()
+        if args.command == "gui":
+            return _gui(args)
+        if args.command == "desktop-entry":
+            return _desktop_entry(args)
     except CliError as error:
         print(f"tomecast: error: {error}", file=sys.stderr)
         return 1
@@ -126,6 +145,32 @@ def _voices() -> int:
         names = [v for v in VOICES if v.startswith(code)]
         print(f"{language}: {', '.join(names)}")
     print(f"\nDefault: {DEFAULT_VOICE}. Use one with `tomecast convert BOOK --voice NAME`.")
+    return 0
+
+
+def _gui(args: argparse.Namespace) -> int:
+    book: Path | None = args.book
+    try:
+        # Imported here so the other commands never load Qt.
+        from tomecast.gui import run
+
+        return run([str(book)] if book else [])
+    except ImportError as error:
+        raise CliError(
+            f"the desktop window can't start: {error}. The window needs the graphics libraries "
+            "every Linux desktop has (libEGL, libxkbcommon, fontconfig). On a machine without "
+            "a desktop, use 'tomecast convert' instead."
+        ) from error
+
+
+def _desktop_entry(args: argparse.Namespace) -> int:
+    from tomecast import desktop
+
+    try:
+        messages = desktop.install() if args.action == "install" else desktop.uninstall()
+    except (OSError, desktop.ForeignEntryError) as error:
+        raise CliError(str(error)) from error
+    print("\n".join(messages))
     return 0
 
 
@@ -152,7 +197,7 @@ def _convert(args: argparse.Namespace) -> int:
     root = data_dir()
     try:
         _install(REQUIRED_ASSETS, root, assume_yes=args.yes)
-        workdir = _work_folder(root, book_path, args.voice, args.speed)
+        workdir = work_folder(root, book_path, args.voice, args.speed)
     except OSError as error:
         raise CliError(str(error)) from error
 
@@ -163,7 +208,11 @@ def _convert(args: argparse.Namespace) -> int:
     )
     progress = _ProgressPrinter(sys.stderr)
     started = time.monotonic()
-    with _exclusive(workdir):
+    with contextlib.ExitStack() as stack:
+        try:
+            stack.enter_context(exclusive(workdir))
+        except WorkFolderBusy as error:
+            raise CliError(str(error)) from None
         try:
             with KokoroServer(root, voice=args.voice, speed=args.speed) as engine:
                 result = convert_book(
@@ -197,42 +246,6 @@ def _convert(args: argparse.Namespace) -> int:
 
 def _interrupt(signum: int, frame: object) -> None:
     raise KeyboardInterrupt
-
-
-def _work_folder(root: Path, book: Path, voice: str, speed: float) -> Path:
-    """The folder for this book's chunk audio: the same book and settings resume in it."""
-    cache = root / "cache"
-    cache.mkdir(parents=True, exist_ok=True)
-    cutoff = time.time() - STALE_WORK_DAYS * 86400
-    for old in cache.glob("convert-*"):
-        if old.is_dir() and old.stat().st_mtime < cutoff:
-            shutil.rmtree(old, ignore_errors=True)
-    digest = hashlib.sha256()
-    with book.open("rb") as f:
-        while block := f.read(1024 * 1024):
-            digest.update(block)
-    # Anything that changes how the audio sounds goes in the key, so a resumed book never
-    # mixes two voices, speeds or model versions.
-    settings = [voice, str(speed), f"seed={DEFAULT_SEED}", f"audiocpp-{AUDIOCPP_VERSION}"]
-    settings += [asset.sha256 for asset in REQUIRED_ASSETS]
-    digest.update("|".join(settings).encode())
-    folder = cache / f"convert-{digest.hexdigest()[:16]}"
-    folder.mkdir(exist_ok=True)
-    folder.touch()  # counts as recently used
-    return folder
-
-
-@contextlib.contextmanager
-def _exclusive(workdir: Path) -> Iterator[None]:
-    """Hold a lock on ``workdir`` so two runs can't convert the same book at once."""
-    with (workdir / ".lock").open("w") as handle:
-        try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise CliError(
-                "this book is already being converted with the same settings (in another terminal?)"
-            ) from None
-        yield
 
 
 def _saved_note(workdir: Path) -> str:
@@ -283,6 +296,8 @@ class _ProgressPrinter:
         self._shown = False
 
     def update(self, progress: ConversionProgress) -> None:
+        if progress.chunks_done == 0 or progress.stage == "packaging":
+            return
         percent = 100 * progress.chunks_done // max(1, progress.chunks_total)
         elapsed = time.monotonic() - self._started
         remaining = elapsed / progress.chunks_done * (progress.chunks_total - progress.chunks_done)

@@ -43,7 +43,7 @@ book file
   → Packager (ffmpeg)                 → M4B with chapters + cover + title/author, or MP3 per chapter
 ```
 
-The app is written in **Python 3.11+**, which has the best ebook and PDF libraries and holds everything together. The heavy model work runs in fast C++ engines (audio.cpp for voices, llama.cpp for the AI add-ons).
+The app is written in **Python 3.12+** (uv downloads it if the system's Python is older), which has the best ebook and PDF libraries and holds everything together. The heavy model work runs in fast C++ engines (audio.cpp for voices, llama.cpp for the AI add-ons).
 
 ## Core guarantee: every sentence gets spoken
 
@@ -144,8 +144,16 @@ Both sit behind one small interface (`voices()`, `languages()`, `synthesize(chun
   - Each chunk's file name includes a hash of its exact text, and a file only gets its final name once its audio has passed the checks. So stopping (Ctrl-C, `kill`, a crash, a reboot) loses at most the chunk in progress, and changed text is always voiced again.
   - Running the same command again picks up where it stopped. The folder is deleted after success, and unused ones after 14 days.
   - A lock stops two runs of the same book from colliding.
+  - Chunk IDs use each chapter's index in the *whole* book, however few chapters are being voiced. So the command line (all chapters) and the window (the ticked ones) reuse each other's chunks, and changing the ticks voices only what is new.
+  - Cancel and Pause work between chunks and once more just before packaging. Packaging itself can't be stopped: once it starts, cancelling is refused.
   - The engine process is stopped with Tomecast, even if Tomecast is killed.
 - **Pause** in the desktop window will use the same mechanism.
+- **Speaking speed (0.5× to 3.0×):**
+  - Kokoro's own `speed` is linear up to about 1.5 and then saturates. Measured on one sentence (audio.cpp 0.9.4): 1.5 gave 1.55× faster, 2.0 only 1.87×, 2.5 2.06× and 3.0 only 2.12×.
+  - So a requested speed is split in one place, `split_speed()` in `engines/audiocpp.py`: `voice_speed = min(speed, 1.5)` goes to the voice, and `tempo = speed / voice_speed` (at most 2.0) is left over.
+  - The packager applies `tempo` as a pitch-preserving ffmpeg `atempo` filter inside the single encode, and divides every chapter mark by it. The preview gets the same stretch.
+  - The "too little audio" check in `audio_problem` allows proportionally shorter audio at the voice's speed, and is unchanged at 1.0 and below.
+  - The work folder's key includes the speed, so chunks voiced at one speed are never reused at another.
 - **Preview:** play the first paragraph of any chapter, or any typed text, in the chosen voice and speed before converting.
 
 ### 7. Packager

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import array
+import itertools
 import math
 import re
 import struct
@@ -14,10 +15,12 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from fractions import Fraction
 from pathlib import Path
+from typing import Any
 
 import imageio_ffmpeg  # type: ignore[import-untyped]
 import pytest
 
+from tomecast import packaging
 from tomecast.book import Cover
 from tomecast.packaging import (
     AudiobookInfo,
@@ -226,13 +229,16 @@ def package(
     *,
     bitrate: str = "64k",
     ffmpeg: str | None = None,
+    tempo: float = 1.0,
 ) -> Run:
     """Package ``chapters`` into ``tmp_path/out/book.m4b``, using ``tmp_path/work``."""
     output = tmp_path / "out" / "book.m4b"
     workdir = tmp_path / "work"
     output.parent.mkdir(exist_ok=True)
-    packaged = write_m4b(chapters, info, output, workdir=workdir, bitrate=bitrate, ffmpeg=ffmpeg)
-    return Run(output, workdir, packaged)
+    packaged = write_m4b(
+        chapters, info, output, workdir=workdir, bitrate=bitrate, ffmpeg=ffmpeg, tempo=tempo
+    )
+    return Run(output, workdir, packaged.chapters)
 
 
 @pytest.fixture(scope="module")
@@ -251,6 +257,62 @@ def test_returns_chapter_times_from_exact_frame_counts(three_chapter_book: Run) 
     assert [c.title for c in chapters] == [title for title, _, _ in THREE_CHAPTERS_EXPECTED]
     assert [c.start_seconds for c in chapters] == pytest.approx([0.0, 1.6, 2.9], abs=1e-9)
     assert [c.end_seconds for c in chapters] == pytest.approx([1.6, 2.9, 5.15], abs=1e-9)
+
+
+# --- Tempo (the time-stretch for speeds the voice can't reach) -----------------------------
+
+
+@pytest.fixture(scope="module")
+def stretched_book(tmp_path_factory: pytest.TempPathFactory) -> Run:
+    tmp_path = tmp_path_factory.mktemp("stretched")
+    return package(tmp_path, three_chapters(tmp_path / "segments"), tempo=2.0)
+
+
+def test_tempo_halves_the_duration_and_keeps_every_chapter(
+    three_chapter_book: Run, stretched_book: Run
+) -> None:
+    normal = probe(three_chapter_book.output).duration
+    fast = probe(stretched_book.output).duration
+    assert fast == pytest.approx(normal / 2, rel=0.01)
+    assert len(read_metadata(stretched_book.output).chapters) == 3
+
+
+def test_tempo_moves_the_chapter_marks_and_the_returned_times(
+    three_chapter_book: Run, stretched_book: Run
+) -> None:
+    returned = stretched_book.chapters
+    assert [c.title for c in returned] == [t for t, _, _ in THREE_CHAPTERS_EXPECTED]
+    assert [c.start_seconds for c in returned] == pytest.approx([0.0, 0.8, 1.45], abs=1e-9)
+    assert [c.end_seconds for c in returned] == pytest.approx([0.8, 1.45, 2.575], abs=1e-9)
+    marks = read_metadata(stretched_book.output).chapters
+    assert [m[1] for m in marks] == pytest.approx([0.0, 0.8, 1.45], abs=TOLERANCE)
+    assert marks[-1][2] == pytest.approx(probe(stretched_book.output).duration, abs=TOLERANCE)
+
+
+def test_tempo_changes_the_speed_but_not_the_pitch(tmp_path: Path) -> None:
+    tone = chapter(tmp_path / "s", "Tone", [(2.0, 0.0)], frequency=440)
+    run = package(tmp_path, [tone], tempo=2.0)
+    samples = decode(run.output)
+    # Count rising zero crossings in the middle second: 440 Hz stays 440 Hz.
+    middle = samples[RATE // 4 : RATE // 4 + RATE // 2]
+    crossings = sum(1 for a, b in itertools.pairwise(middle) if a < 0 <= b)
+    assert crossings / 0.5 == pytest.approx(440, rel=0.03)
+
+
+@pytest.mark.parametrize("tempo", [0.4, 2.5, 0.0, float("nan")])
+def test_tempo_outside_the_atempo_range_is_refused(tmp_path: Path, tempo: float) -> None:
+    with pytest.raises(PackagingError, match="tempo"):
+        package(tmp_path, three_chapters(tmp_path / "s"), tempo=tempo)
+    assert not (tmp_path / "out" / "book.m4b").exists()
+
+
+def test_stretch_wav_speeds_a_wav_up(tmp_path: Path) -> None:
+    source = write_tone(tmp_path / "in.wav", 2.0)
+    packaging.stretch_wav(source, tmp_path / "out.wav", 2.0)
+    with wave.open(str(tmp_path / "out.wav"), "rb") as wav:
+        assert wav.getnframes() / wav.getframerate() == pytest.approx(1.0, rel=0.02)
+    with pytest.raises(PackagingError, match="tempo"):
+        packaging.stretch_wav(source, tmp_path / "x.wav", 3.0)
 
 
 def test_chapter_markers_have_the_right_titles_and_times(three_chapter_book: Run) -> None:
@@ -315,6 +377,78 @@ def test_replaces_an_existing_output(tmp_path: Path) -> None:
     run = package(tmp_path, [chapter(tmp_path, "Only", [(0.3, 0.1)])])
 
     assert len(probe(run.output).audio) == 1
+
+
+def test_no_overwrite_uses_the_wanted_name_when_it_is_free(tmp_path: Path) -> None:
+    output = tmp_path / "out" / "book.m4b"
+    output.parent.mkdir()
+    book = write_m4b(
+        [chapter(tmp_path, "Only", [(0.3, 0.1)])], INFO, output, workdir=tmp_path / "w",
+        overwrite=False,
+    )  # fmt: skip
+    assert book.output == output
+    assert [p.name for p in output.parent.iterdir()] == ["book.m4b"]
+
+
+def test_no_overwrite_moves_to_the_next_free_name_and_keeps_the_other_file(
+    tmp_path: Path,
+) -> None:
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "book.m4b").write_bytes(b"mine")
+    (out / "book (2).m4b").write_bytes(b"also mine")
+    book = write_m4b(
+        [chapter(tmp_path, "Only", [(0.3, 0.1)])], INFO, out / "book.m4b",
+        workdir=tmp_path / "w", overwrite=False,
+    )  # fmt: skip
+    assert book.output == out / "book (3).m4b"
+    assert (out / "book.m4b").read_bytes() == b"mine"
+    assert (out / "book (2).m4b").read_bytes() == b"also mine"
+    assert len(probe(book.output).audio) == 1
+    assert sorted(p.name for p in out.iterdir()) == ["book (2).m4b", "book (3).m4b", "book.m4b"]
+
+
+def test_no_overwrite_survives_a_file_appearing_while_encoding(tmp_path: Path) -> None:
+    """The name was free when the encode started, but taken by the time it finished."""
+    out = tmp_path / "out"
+    out.mkdir()
+    target = out / "book.m4b"
+    chapters = [chapter(tmp_path, "Only", [(0.3, 0.1)])]
+
+    real = packaging._encode
+
+    def encode_then_someone_saves(*args: Any, **kwargs: Any) -> None:
+        real(*args, **kwargs)
+        target.write_bytes(b"saved by someone else meanwhile")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(packaging, "_encode", encode_then_someone_saves)
+        book = write_m4b(chapters, INFO, target, workdir=tmp_path / "w", overwrite=False)
+
+    assert book.output == out / "book (2).m4b"
+    assert target.read_bytes() == b"saved by someone else meanwhile"
+    assert len(probe(book.output).audio) == 1
+
+
+def test_no_overwrite_without_hard_links_still_never_replaces(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "book.m4b").write_bytes(b"mine")
+
+    def no_links(src: object, dst: object) -> None:
+        raise PermissionError("hard links aren't supported here")
+
+    monkeypatch.setattr("os.link", no_links)
+    book = write_m4b(
+        [chapter(tmp_path, "Only", [(0.3, 0.1)])], INFO, out / "book.m4b",
+        workdir=tmp_path / "w", overwrite=False,
+    )  # fmt: skip
+    assert book.output == out / "book (2).m4b"
+    assert (out / "book.m4b").read_bytes() == b"mine"
+    assert len(probe(book.output).audio) == 1
+    assert sorted(p.name for p in out.iterdir()) == ["book (2).m4b", "book.m4b"]
 
 
 # --- Covers and titles --------------------------------------------------------------------

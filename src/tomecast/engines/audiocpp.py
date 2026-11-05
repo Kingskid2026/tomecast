@@ -191,6 +191,26 @@ def default_threads() -> int:
     return max(1, min(8, (logical or 2) // 2))
 
 
+MIN_SPEED, MAX_SPEED = 0.5, 3.0
+# Kokoro's own ``speed`` is linear up to about 1.5 and then saturates: measured on one
+# sentence, 2.0 only made it 1.87x faster and 3.0 only 2.12x. So the voice never goes past
+# this, and the rest of a faster request is a pitch-preserving time-stretch of the audiobook.
+VOICE_SPEED_LIMIT = 1.5
+
+
+def split_speed(speed: float) -> tuple[float, float]:
+    """Split a requested speed into ``(voice_speed, tempo)``, where
+    ``voice_speed * tempo == speed``. The one place this is decided."""
+    voice_speed = min(speed, VOICE_SPEED_LIMIT)
+    return voice_speed, speed / voice_speed
+
+
+def _checked_speed(speed: float) -> float:
+    if not MIN_SPEED <= speed <= MAX_SPEED:
+        raise EngineError(f"speed must be between {MIN_SPEED} and {MAX_SPEED}")
+    return speed
+
+
 class KokoroServer:
     """A running audio.cpp server with Kokoro loaded. Use it as a context manager."""
 
@@ -208,10 +228,8 @@ class KokoroServer:
     ) -> None:
         if voice not in VOICES:
             raise EngineError(f"unknown voice {voice!r}; choose one of: {', '.join(VOICES)}")
-        if not 0.5 <= speed <= 2.0:
-            raise EngineError("speed must be between 0.5 and 2.0")
         self.voice = voice
-        self.speed = speed
+        self._speed = _checked_speed(speed)
         self.seed = seed
         self._root = root
         self._threads = threads or default_threads()
@@ -222,6 +240,26 @@ class KokoroServer:
         self._tempdir: tempfile.TemporaryDirectory[str] | None = None
         self._base_url = ""
         self._consecutive_restarts = 0
+
+    @property
+    def speed(self) -> float:
+        """The speed the listener asked for, from MIN_SPEED to MAX_SPEED."""
+        return self._speed
+
+    @speed.setter
+    def speed(self, value: float) -> None:
+        self._speed = _checked_speed(value)
+
+    @property
+    def voice_speed(self) -> float:
+        """The speed the voice itself speaks at: ``speed``, capped at VOICE_SPEED_LIMIT."""
+        return split_speed(self._speed)[0]
+
+    @property
+    def tempo(self) -> float:
+        """The time-stretch left over after the voice: ``speed / voice_speed``. The M4B is
+        stretched by this much when it is encoded."""
+        return split_speed(self._speed)[1]
 
     @property
     def label(self) -> str:
@@ -369,7 +407,7 @@ class KokoroServer:
                 "model": "kokoro",
                 "input": text,
                 "voice": self.voice,
-                "speed": self.speed,
+                "speed": self.voice_speed,
                 "response_format": "wav",
                 "options": {"seed": self.seed},
             }
@@ -413,7 +451,7 @@ class KokoroServer:
                     "task": "tts",
                     "mode": "offline",
                     "default_voice_preset": {"voice_id": self.voice},
-                    "default_request_options": {"speed": self.speed},
+                    "default_request_options": {"speed": self.voice_speed},
                 }
             ],
         }

@@ -13,11 +13,12 @@ the checks is reused, and anything else is voiced again.
 from __future__ import annotations
 
 import hashlib
+import threading
 import wave
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 
 from tomecast.audio import peak_level, wav_info, write_silence
 from tomecast.book import Book
@@ -70,14 +71,92 @@ class MissingAudioError(RuntimeError):
     """Raised when a chunk still has no usable audio after retrying."""
 
 
+class ConversionCancelled(Exception):
+    """Raised inside :func:`convert_book` when its :class:`ConversionControl` is cancelled.
+
+    Everything voiced so far stays in the work folder, so the conversion can be resumed.
+    """
+
+
+class ConversionControl:
+    """Pause, resume and cancel a running conversion from another thread (the window).
+
+    :func:`convert_book` checks it before each chunk and once more just before packaging:
+    while paused it waits, and once cancelled it raises :class:`ConversionCancelled`. A chunk
+    already being voiced finishes. Packaging itself can't be stopped: once it has begun
+    (:meth:`commit`), :meth:`cancel` and :meth:`pause` do nothing and say so.
+    """
+
+    def __init__(self) -> None:
+        self._running = threading.Event()
+        self._running.set()
+        self._cancelled = threading.Event()
+        self._lock = threading.Lock()
+        self._committed = False
+
+    @property
+    def paused(self) -> bool:
+        return not self._running.is_set()
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancelled.is_set()
+
+    @property
+    def committed(self) -> bool:
+        """True once packaging has begun, which can no longer be paused or cancelled."""
+        return self._committed
+
+    def pause(self) -> bool:
+        """Pause before the next chunk. Returns False (doing nothing) once packaging began."""
+        with self._lock:
+            if self._committed:
+                return False
+            self._running.clear()
+            return True
+
+    def resume(self) -> None:
+        self._running.set()
+
+    def cancel(self) -> bool:
+        """Stop the conversion. Returns False (doing nothing) once packaging began, because
+        the audiobook is then written regardless."""
+        with self._lock:
+            if self._committed:
+                return False
+            self._cancelled.set()
+            self._running.set()  # wake a paused conversion so it can stop
+            return True
+
+    def commit(self) -> None:
+        """Called by :func:`convert_book` right after its last checkpoint, as packaging
+        begins: from here on the book is written, so cancelling is refused rather than
+        reported as a stop that never happened. Raises if cancelled in the meantime."""
+        with self._lock:
+            if self._cancelled.is_set():
+                raise ConversionCancelled
+            self._committed = True
+
+    def checkpoint(self) -> None:
+        """Wait while paused; raise :class:`ConversionCancelled` once cancelled."""
+        self._running.wait()
+        if self._cancelled.is_set():
+            raise ConversionCancelled
+
+
 @dataclass(frozen=True, slots=True)
 class ConversionProgress:
-    """Passed to the progress callback after each chunk is voiced."""
+    """Passed to the progress callback: once at the start, after every chunk, and once
+    more when packaging begins. ``chapter_index`` counts the chapters being voiced (the
+    selected ones), not the whole book."""
 
     chunks_done: int
     chunks_total: int
     chapter_index: int
     chapter_count: int
+    now_speaking: str = ""  # the text being voiced next ("" once all of it is voiced)
+    audio_seconds: float = 0.0  # length of the audio made so far
+    stage: Literal["voicing", "packaging"] = "voicing"
 
 
 ProgressCallback = Callable[[ConversionProgress], None]
@@ -90,13 +169,31 @@ class ConversionResult:
     chapters: list[PackagedChapter]
     reused_chunks: int
     warnings: tuple[str, ...]
+    output: Path  # where the audiobook was written (not ``output`` if that name was taken)
 
 
-def plan_chunks(book: Book, max_chars: int) -> list[list[Chunk]]:
-    """Chunk every chapter of ``book`` (title first), one list per chapter."""
+def select_chapters(book: Book, chapters: Sequence[int] | None) -> list[int]:
+    """The indices into ``book.chapters`` to voice, in book order (``None`` means all)."""
+    if chapters is None:
+        return list(range(len(book.chapters)))
+    bad = [i for i in chapters if not 0 <= i < len(book.chapters)]
+    if bad:
+        raise ValueError(f"no such chapter index {bad[0]} (the book has {len(book.chapters)})")
+    return sorted(set(chapters))
+
+
+def plan_chunks(
+    book: Book, max_chars: int, chapters: Sequence[int] | None = None
+) -> list[list[Chunk]]:
+    """Chunk the chapters of ``book`` (title first), one list per chapter.
+
+    ``chapters`` picks which ones, by index into ``book.chapters`` (``None``: all). Chunk
+    IDs always carry the chapter's index in the *whole* book, so the same chapter has the
+    same chunk IDs (and so reusable audio) however the others are ticked.
+    """
     return [
-        chunk_paragraphs(index, chapter.spoken_paragraphs(), max_chars)
-        for index, chapter in enumerate(book.chapters)
+        chunk_paragraphs(index, book.chapters[index].spoken_paragraphs(), max_chars)
+        for index in select_chapters(book, chapters)
     ]
 
 
@@ -107,12 +204,25 @@ def convert_book(
     *,
     workdir: Path,
     progress: ProgressCallback | None = None,
+    control: ConversionControl | None = None,
     retries: int = 1,
+    chapters: Sequence[int] | None = None,
+    overwrite: bool = True,
 ) -> ConversionResult:
     """Voice ``book`` with ``engine`` and write an M4B audiobook to ``output``.
 
     Chunk audio is written to ``workdir``. Running again with the same ``workdir`` after an
-    interruption reuses the chunks that were already voiced.
+    interruption reuses the chunks that were already voiced. ``control`` lets another thread
+    pause, resume or cancel the conversion between chunks (and just before packaging).
+
+    ``chapters`` are the indices into ``book.chapters`` to voice (``None``: all). Chunk IDs
+    keep each chapter's index in the whole book, so a run with some chapters unticked reuses
+    the audio of a run with all of them, and the audiobook holds only the chosen chapters,
+    in book order.
+
+    ``overwrite=False`` never replaces an existing file: if ``output`` is taken, even by a
+    file that appeared while voicing, the book is written to "name (2).m4b" and so on. The
+    path used is in the result.
     """
     warnings: list[str] = []
     cover = book.cover
@@ -120,24 +230,44 @@ def convert_book(
         warnings.append("The book's cover image is damaged, so the audiobook has no cover.")
         cover = None
 
-    plan = plan_chunks(book, engine.max_chars)
+    voice_speed = getattr(engine, "voice_speed", 1.0)  # test fakes may not have one
+    selected = select_chapters(book, chapters)
+    plan = plan_chunks(book, engine.max_chars, selected)
     total = sum(len(chunks) for chunks in plan)
     chunk_dir = workdir / "chunks"
     chunk_dir.mkdir(parents=True, exist_ok=True)
 
-    chapters: list[ChapterAudio] = []
+    queue = [chunk for chunks in plan for chunk in chunks]
+    chapter_count = len(selected)
+
+    def report(done: int, chapter_index: int, seconds: float, stage: str = "voicing") -> None:
+        if progress:
+            upcoming = queue[done].text if done < total else ""
+            progress(
+                ConversionProgress(
+                    done, total, chapter_index, chapter_count, upcoming, seconds,
+                    "packaging" if stage == "packaging" else "voicing",
+                )
+            )  # fmt: skip
+
+    audio: list[ChapterAudio] = []
     done = reused = 0
-    for chapter_index, (chapter, chunks) in enumerate(zip(book.chapters, plan, strict=True)):
+    audio_seconds = 0.0
+    report(0, next((i for i, chunks in enumerate(plan) if chunks), 0), 0.0)
+    for chapter_index, (book_index, chunks) in enumerate(zip(selected, plan, strict=True)):
+        chapter = book.chapters[book_index]
         if not chunks:
             continue
         segments: list[Path] = []
         gaps: list[float] = []
         for position, chunk in enumerate(chunks):
+            if control:
+                control.checkpoint()
             wav = chunk_dir / _chunk_file_name(chunk)
-            if _is_reusable(wav, chunk):
+            if _is_reusable(wav, chunk, voice_speed):
                 reused += 1
             elif chunk.speakable:
-                _voice_chunk(engine, chunk, wav, retries)
+                _voice_chunk(engine, chunk, wav, retries, voice_speed)
             else:
                 partial = wav.with_name(wav.name + ".partial")
                 write_silence(partial, SCENE_BREAK_SECONDS, engine.sample_rate)
@@ -146,9 +276,16 @@ def convert_book(
             is_last = position == len(chunks) - 1
             gaps.append(_gap_after(chunk, is_title=bool(chapter.title), is_last=is_last))
             done += 1
-            if progress:
-                progress(ConversionProgress(done, total, chapter_index, len(book.chapters)))
-        chapters.append(ChapterAudio(chapter.title, tuple(segments), tuple(gaps)))
+            audio_seconds += wav_info(wav).seconds
+            report(done, chapter_index, audio_seconds)
+        audio.append(ChapterAudio(chapter.title, tuple(segments), tuple(gaps)))
+
+    # The last chance to stop: once packaging starts the book is written, so a cancel that
+    # comes later is refused (see ConversionControl.commit) instead of being reported as a stop.
+    if control:
+        control.checkpoint()
+        control.commit()
+    report(done, max(0, chapter_count - 1), audio_seconds, stage="packaging")
 
     info = AudiobookInfo(
         title=book.title,
@@ -157,8 +294,9 @@ def convert_book(
         language=book.language,
         cover=cover,
     )
-    packaged = write_m4b(chapters, info, output, workdir=workdir)
-    return ConversionResult(packaged, reused, tuple(warnings))
+    tempo = getattr(engine, "tempo", 1.0)
+    packaged = write_m4b(audio, info, output, workdir=workdir, overwrite=overwrite, tempo=tempo)
+    return ConversionResult(packaged.chapters, reused, tuple(warnings), packaged.output)
 
 
 def _chunk_file_name(chunk: Chunk) -> str:
@@ -167,13 +305,13 @@ def _chunk_file_name(chunk: Chunk) -> str:
     return f"{chunk.id}-{digest}.wav"
 
 
-def _is_reusable(wav: Path, chunk: Chunk) -> bool:
+def _is_reusable(wav: Path, chunk: Chunk, speed: float = 1.0) -> bool:
     """True if a previous run already made good audio for exactly this chunk."""
     if not wav.is_file():
         return False
     if not chunk.speakable:
         return True
-    return not audio_problem(wav, chunk.text)
+    return not audio_problem(wav, chunk.text, speed)
 
 
 def _gap_after(chunk: Chunk, *, is_title: bool, is_last: bool) -> float:
@@ -184,7 +322,9 @@ def _gap_after(chunk: Chunk, *, is_title: bool, is_last: bool) -> float:
     return GAP_AFTER[chunk.boundary]
 
 
-def _voice_chunk(engine: VoiceEngine, chunk: Chunk, wav: Path, retries: int) -> None:
+def _voice_chunk(
+    engine: VoiceEngine, chunk: Chunk, wav: Path, retries: int, speed: float = 1.0
+) -> None:
     """Voice ``chunk`` into ``wav``. The file only appears once its audio passed the checks."""
     partial = wav.with_name(wav.name + ".partial")
     problem = ""
@@ -195,7 +335,7 @@ def _voice_chunk(engine: VoiceEngine, chunk: Chunk, wav: Path, retries: int) -> 
         except RuntimeError as error:
             problem = str(error)
             continue
-        problem = audio_problem(partial, chunk.text)
+        problem = audio_problem(partial, chunk.text, speed)
         if not problem:
             partial.replace(wav)
             return
@@ -203,8 +343,12 @@ def _voice_chunk(engine: VoiceEngine, chunk: Chunk, wav: Path, retries: int) -> 
     raise MissingAudioError(f"no usable audio for {chunk.id} ({chunk.text[:80]!r}): {problem}")
 
 
-def audio_problem(wav: Path, text: str) -> str:
-    """Describe what's wrong with ``wav`` as audio for ``text``, or return "" if it's fine."""
+def audio_problem(wav: Path, text: str, speed: float = 1.0) -> str:
+    """Describe what's wrong with ``wav`` as audio for ``text``, or return "" if it's fine.
+
+    ``speed`` is how fast the voice was asked to speak: faster narration is allowed to be
+    proportionally shorter. Slower than 1.0 gets no extra allowance, so the check never
+    weakens below its strength at normal speed."""
     if not wav.is_file():
         return "the engine wrote no file"
     try:
@@ -215,7 +359,7 @@ def audio_problem(wav: Path, text: str) -> str:
         return "expected mono 16-bit audio"
     if info.frames == 0:
         return "the audio is empty"
-    shortest = len(text) / MAX_CHARS_PER_SECOND
+    shortest = len(text) / MAX_CHARS_PER_SECOND / max(1.0, speed)
     if info.seconds < shortest:
         return f"only {info.seconds:.2f}s of audio for {len(text)} characters (text was cut off?)"
     if peak_level(wav) < SILENCE_LEVEL:

@@ -2,6 +2,7 @@ import array
 import fcntl
 import math
 import wave
+from collections.abc import Sequence
 from pathlib import Path
 from types import TracebackType
 
@@ -11,6 +12,7 @@ from epub_factory import NavPoint, Page, build_epub
 from tomecast import __version__, cli
 from tomecast.downloads import Asset
 from tomecast.engines.audiocpp import EngineError
+from tomecast.workdirs import work_folder
 
 
 class FakeKokoro:
@@ -172,7 +174,7 @@ def test_voices_lists_every_language(capsys: pytest.CaptureFixture[str]) -> None
     assert "Default: af_heart" in out
 
 
-@pytest.mark.parametrize("speed", ["3", "0.1", "fast"])
+@pytest.mark.parametrize("speed", ["3.5", "0.1", "fast"])
 def test_a_bad_speed_is_rejected_before_anything_happens(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], speed: str
 ) -> None:
@@ -202,10 +204,53 @@ def test_the_same_book_cant_be_converted_twice_at_once(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     book = _epub(tmp_path)
-    workdir = cli._work_folder(tmp_path / "data", book, "af_heart", 1.0)
+    workdir = work_folder(tmp_path / "data", book, "af_heart", 1.0)
     with (workdir / ".lock").open("w") as handle:
         fcntl.flock(handle, fcntl.LOCK_EX)  # another run is busy with this book
 
         assert cli.main(["convert", str(book)]) == 1
 
     assert "already being converted" in capsys.readouterr().err
+
+
+def test_gui_passes_the_book_to_the_window(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    seen: list[list[str]] = []
+
+    def fake_run(argv: Sequence[str] | None = None) -> int:
+        seen.append(list(argv or []))
+        return 0
+
+    monkeypatch.setattr("tomecast.gui.run", fake_run)
+    assert cli.main(["gui"]) == 0
+    assert cli.main(["gui", str(tmp_path / "book.epub")]) == 0
+    assert seen == [[], [str(tmp_path / "book.epub")]]
+
+
+def test_gui_that_cannot_start_reports_an_error(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def broken(argv: Sequence[str] | None = None) -> int:
+        raise ImportError("libGL.so.1: cannot open shared object file")
+
+    monkeypatch.setattr("tomecast.gui.run", broken)
+    assert cli.main(["gui"]) == 1
+    err = capsys.readouterr().err
+    assert err.startswith("tomecast: error: the desktop window can't start")
+    assert "libGL" in err
+
+
+def test_desktop_entry_install_and_uninstall(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    monkeypatch.setenv("PATH", str(tmp_path / "none"))
+    assert cli.main(["desktop-entry", "install"]) == 0
+    assert (tmp_path / "applications" / "tomecast.desktop").is_file()
+    assert "app launcher" in capsys.readouterr().out
+    assert cli.main(["desktop-entry", "uninstall"]) == 0
+    assert not (tmp_path / "applications" / "tomecast.desktop").exists()
+
+
+def test_desktop_entry_needs_an_action() -> None:
+    with pytest.raises(SystemExit):
+        cli.main(["desktop-entry"])

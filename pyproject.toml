@@ -6,7 +6,10 @@ readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [{ name = "Ambrose Sigler" }]
-requires-python = ">=3.11"
+# 3.12+: PySide6 6.12 drops a reference to None in some void methods (QImage.fill,
+# setDevicePixelRatio...). That's harmless where None is immortal (3.12+, PEP 683) but
+# crashes 3.11. uv fetches a newer Python automatically where the system's is older.
+requires-python = ">=3.12"
 keywords = ["audiobook", "text-to-speech", "tts", "epub", "ebook", "linux", "kokoro", "local-ai"]
 classifiers = [
     "Development Status :: 1 - Planning",
@@ -15,7 +18,6 @@ classifiers = [
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
@@ -25,6 +27,7 @@ classifiers = [
 dependencies = [
     "imageio-ffmpeg>=0.8.1",
     "lxml>=6.1.3",
+    "pyside6-essentials>=6.12.0",
 ]
 
 [project.urls]
@@ -44,13 +47,14 @@ build-backend = "uv_build"
 dev = [
     "mypy>=2.4.1",
     "pytest>=9.2.0",
+    "pytest-qt>=4.5.0",
     "ruff>=0.17.3",
     "types-lxml>=2026.2.16",
 ]
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py312"
 
 [tool.ruff.lint]
 select = [
@@ -70,7 +74,7 @@ select = [
 
 [tool.mypy]
 strict = true
-python_version = "3.11"
+python_version = "3.12"
 files = ["src", "tests"]
 
 [tool.pytest.ini_options]

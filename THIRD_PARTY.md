@@ -31,3 +31,14 @@ This list reflects the current design ([docs/architecture.md](docs/architecture.
 | FFmpeg (via imageio-ffmpeg) | Building M4B/MP3 files; runs as a separate program | LGPL/GPL | [imageio-ffmpeg](https://github.com/imageio/imageio-ffmpeg) |
 | eSpeak NG 1.52 (from the espeakng-loader wheel) | Turning text into sounds for Kokoro, needed for every sentence. Downloaded as a runtime file and used by audio.cpp, not imported by Tomecast | GPL-3.0-or-later | [espeak-ng](https://github.com/espeak-ng/espeak-ng), [espeakng-loader](https://pypi.org/project/espeakng-loader/) |
 | uv | Installing Tomecast | Apache 2.0 or MIT | [astral-sh/uv](https://github.com/astral-sh/uv) |
+| Qt 6 / PySide6-Essentials | The desktop window | LGPL-3.0 (installed from PyPI as a separate library, not modified) | [PySide6-Essentials](https://pypi.org/project/PySide6-Essentials/), [qt.io](https://www.qt.io/licensing/open-source-lgpl-obligations) |
+
+## Bundled with the app
+
+These ship inside the Tomecast package itself (`src/tomecast/gui/`).
+
+| Item | Used for | License | Source |
+|---|---|---|---|
+| Doto (font) | Big numerals and timers | SIL Open Font License 1.1 | See `src/tomecast/gui/fonts/README.md` |
+| IBM Plex Sans, IBM Plex Mono (fonts) | Interface text, labels and data | SIL Open Font License 1.1 | See `src/tomecast/gui/fonts/README.md` |
+| Luca della Robbia, *Cantoria* (1431–38), photograph | Drop screen art, shown as dots | Public domain | See `src/tomecast/gui/assets/CREDITS.md` |
