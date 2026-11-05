@@ -1,4 +1,4 @@
-// Chapters: the cover and summary, the skip switch, and a spec table of sections
+// Chapters: the cover and summary, the skip switches, and a spec table of sections
 // (Chapters.dc.html). Narrow windows drop the word count and the meter from the rows.
 import QtQuick
 import QtQuick.Layouts
@@ -113,18 +113,57 @@ ScreenPage {
             }
         }
 
-        // The switch and the table.
+        // The switches and the table.
         ColumnLayout {
             Layout.alignment: Qt.AlignTop
             Layout.fillWidth: true
             Layout.minimumWidth: 0
             spacing: 20
 
-            CheckRow {
-                objectName: "skipFrontMatterSwitch"
-                text: "Skip front matter"
-                checked: Backend.skipFrontMatter
-                onClicked: Backend.setSkipFrontMatter(!Backend.skipFrontMatter)
+            // The mockup's switches wrap with gaps of 10 px between rows and 24 px between
+            // switches. A Flow has one spacing, so each switch sits in a slot 14 px wider.
+            Flow {
+                id: switches
+                readonly property int extraGap: 14
+
+                objectName: "skipSwitches"
+                Layout.fillWidth: true
+                spacing: 10
+
+                Item {
+                    // Only books with pages (PDF) have page numbers.
+                    visible: Backend.bookHasPages
+                    implicitWidth: skipPageNumbers.implicitWidth + switches.extraGap
+                    implicitHeight: skipPageNumbers.implicitHeight
+
+                    CheckRow {
+                        id: skipPageNumbers
+                        objectName: "skipPageNumbersSwitch"
+                        text: "Skip page numbers"
+                        checked: Backend.skipPageNumbers
+                        onClicked: Backend.setSkipPageNumbers(!Backend.skipPageNumbers)
+                    }
+                }
+
+                Item {
+                    implicitWidth: skipFrontMatter.implicitWidth + switches.extraGap
+                    implicitHeight: skipFrontMatter.implicitHeight
+
+                    CheckRow {
+                        id: skipFrontMatter
+                        objectName: "skipFrontMatterSwitch"
+                        text: "Skip front matter"
+                        checked: Backend.skipFrontMatter
+                        onClicked: Backend.setSkipFrontMatter(!Backend.skipFrontMatter)
+                    }
+                }
+
+                CheckRow {
+                    objectName: "footnotesAtEndSwitch"
+                    text: "Read footnotes at chapter end"
+                    checked: Backend.footnotesAtEnd
+                    onClicked: Backend.setFootnotesAtEnd(!Backend.footnotesAtEnd)
+                }
             }
 
             ColumnLayout {
