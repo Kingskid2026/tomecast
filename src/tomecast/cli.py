@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import os
+import platform
+import re
 import shutil
 import signal
 import sys
@@ -23,18 +26,25 @@ from tomecast.downloads import (
     data_dir,
     ensure,
     is_installed,
+    local_path,
 )
 from tomecast.engines.audiocpp import (
+    AUDIOCPP_CPU,
+    AUDIOCPP_VULKAN,
     DEFAULT_VOICE,
+    ESPEAK_NG,
+    KOKORO_Q8,
     MAX_CHARS,
     MAX_SPEED,
     MIN_SPEED,
-    REQUIRED_ASSETS,
     VOICES,
+    AutoKokoro,
     EngineError,
-    KokoroServer,
     check_system,
+    glibc_version,
+    required_assets,
 )
+from tomecast.hardware import list_devices, vulkan_possible
 from tomecast.packaging import PackagingError
 from tomecast.readers.epub import InvalidEbookError, read_epub
 from tomecast.workdirs import WorkFolderBusy, exclusive, work_folder
@@ -89,8 +99,19 @@ def build_parser() -> argparse.ArgumentParser:
         "-y", "--yes", action="store_true", help="download the voice engine without asking"
     )
     convert.add_argument("-f", "--force", action="store_true", help="overwrite the output file")
+    convert.add_argument(
+        "--gpu", action=argparse.BooleanOptionalAction, default=None,
+        help="use the graphics card through the driver already installed "
+        "(default: on when one is found); --no-gpu uses the CPU",
+    )  # fmt: skip
 
     commands.add_parser("voices", help="list the available voices")
+
+    commands.add_parser(
+        "doctor",
+        help="print what Tomecast sees on this computer (for bug reports)",
+        description="Print the system, graphics and installed-file details a bug report needs.",
+    )
 
     gui = commands.add_parser(
         "gui",
@@ -119,6 +140,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _convert(args)
         if args.command == "voices":
             return _voices()
+        if args.command == "doctor":
+            return _doctor()
         if args.command == "gui":
             return _gui(args)
         if args.command == "desktop-entry":
@@ -194,10 +217,11 @@ def _convert(args: argparse.Namespace) -> int:
     if not book.chapters:
         raise CliError(f"no readable text found in {book_path.name}")
 
+    use_gpu = _wants_gpu(args.gpu)
     root = data_dir()
     try:
-        _install(REQUIRED_ASSETS, root, assume_yes=args.yes)
-        workdir = work_folder(root, book_path, args.voice, args.speed)
+        _install(required_assets(use_gpu), root, assume_yes=args.yes)
+        workdir = work_folder(root, book_path, args.voice, args.speed, use_gpu=use_gpu)
     except OSError as error:
         raise CliError(str(error)) from error
 
@@ -214,7 +238,10 @@ def _convert(args: argparse.Namespace) -> int:
         except WorkFolderBusy as error:
             raise CliError(str(error)) from None
         try:
-            with KokoroServer(root, voice=args.voice, speed=args.speed) as engine:
+            with AutoKokoro(root, voice=args.voice, speed=args.speed, use_gpu=use_gpu) as engine:
+                print(_hardware_line(engine, args.gpu))
+                if engine.warning:
+                    print(f"Note: {engine.warning}")
                 result = convert_book(
                     book, engine, output, workdir=workdir, progress=progress.update
                 )
@@ -242,6 +269,73 @@ def _convert(args: argparse.Namespace) -> int:
         f"made in {_duration(time.monotonic() - started)})."
     )
     return 0
+
+
+NO_VULKAN_NOTE = (
+    "No usable Vulkan graphics driver was found, so Tomecast will use the CPU. To use the "
+    "graphics card, install your distro's Vulkan loader (vulkan-icd-loader, libvulkan1 or "
+    "vulkan-loader); Tomecast never installs drivers."
+)
+
+
+def _wants_gpu(requested: bool | None) -> bool:
+    """``--gpu`` / ``--no-gpu``, else on when a Vulkan driver and graphics device are there."""
+    possible = vulkan_possible()
+    if requested and not possible:
+        print(f"Note: {NO_VULKAN_NOTE}")
+        return False
+    return possible if requested is None else requested
+
+
+def _hardware_line(engine: AutoKokoro, requested: bool | None) -> str:
+    if engine.gpu_description:
+        return f"Using the graphics card: {engine.gpu_description}."
+    if not engine.use_gpu:
+        why = "turned off with --no-gpu" if requested is False else "no graphics card found"
+        return f"Using the CPU ({why})."
+    return "Using the CPU."
+
+
+def _doctor() -> int:
+    """Print what a bug report needs: system, graphics and installed files."""
+    root = data_dir()
+    print(f"Tomecast {__version__}")
+    print(f"Distro: {_distro()}")
+    glibc = glibc_version()
+    print(f"glibc: {f'{glibc[0]}.{glibc[1]}' if glibc else 'not found'}")
+    threads = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count()
+    print(f"CPU threads: {threads}")
+    print(f"Python: {platform.python_version()}")
+    print(f"Vulkan possible: {'yes' if vulkan_possible() else 'no'}")
+    vulkan = local_path(AUDIOCPP_VULKAN, root)
+    if is_installed(AUDIOCPP_VULKAN, root):
+        devices = list_devices(vulkan / "audiocpp_server")
+        if devices:
+            print("Vulkan devices:")
+            for device in devices:
+                free = (
+                    f"{device.free_bytes / 2**30:.1f} of {device.total_bytes / 2**30:.1f} GiB free"
+                )
+                print(f"  {device.index}: {device.description} ({device.kind}, {free})")
+        else:
+            print("Vulkan devices: none found")
+    else:
+        print("Vulkan devices: not checked (the graphics-card engine isn't installed yet)")
+    print(f"Data folder: {root}")
+    print("Installed:")
+    for asset in (AUDIOCPP_CPU, AUDIOCPP_VULKAN, ESPEAK_NG, KOKORO_Q8):
+        state = "yes" if is_installed(asset, root) else "no"
+        print(f"  {asset.name}: {state}")
+    return 0
+
+
+def _distro() -> str:
+    try:
+        text = Path("/etc/os-release").read_text(errors="replace")
+    except OSError:
+        return "unknown"
+    match = re.search(r'^PRETTY_NAME=(?:"([^"]*)"|(\S*))\s*$', text, re.MULTILINE)
+    return (match.group(1) or match.group(2)) if match else "unknown"
 
 
 def _interrupt(signum: int, frame: object) -> None:

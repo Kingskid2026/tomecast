@@ -65,9 +65,11 @@ class Engines:
         self.release = threading.Event()
         self.fail_from: int | None = None  # synthesize fails from the Nth call on
         self.start_error: str | None = None
+        self.gpu: str = "NVIDIA RTX PRO 1000 Blackwell Generation Laptop GPU"  # a use_gpu run
+        self.gpu_warning: str | None = None  # set: a use_gpu run fell back to the CPU
 
-    def __call__(self, root: Path, voice: str, speed: float) -> FakeEngine:
-        engine = FakeEngine(self, voice, speed)
+    def __call__(self, root: Path, voice: str, speed: float, use_gpu: bool = False) -> FakeEngine:
+        engine = FakeEngine(self, voice, speed, use_gpu)
         self.made.append(engine)
         return engine
 
@@ -77,10 +79,14 @@ class FakeEngine:
     max_chars = 60
     sample_rate = SAMPLE_RATE
 
-    def __init__(self, engines: Engines, voice: str, speed: float) -> None:
+    def __init__(self, engines: Engines, voice: str, speed: float, use_gpu: bool = False) -> None:
         self._engines = engines
         self.voice = voice
         self.speed = speed
+        self.use_gpu = use_gpu
+        self.device_label = "CPU"
+        self.gpu_description = ""
+        self.warning: str | None = None
         self.started = False
         self.closed = False
         self.thread_id: int | None = None  # the OS thread that started it
@@ -97,6 +103,10 @@ class FakeEngine:
         self.thread_id = threading.get_ident()
         if self._engines.start_error:
             raise EngineError(self._engines.start_error)
+        if self.use_gpu and self._engines.gpu_warning:
+            self.warning = self._engines.gpu_warning
+        elif self.use_gpu and self._engines.gpu:
+            self.gpu_description = self._engines.gpu
         self.started = True
 
     def close(self) -> None:
@@ -188,9 +198,13 @@ def make_backend(
         assets: tuple[Asset, ...] = (),
         player: str | None = None,
         system_check: Callable[[], None] = lambda: None,
+        gpu: bool = False,  # pretend a graphics driver is installed
+        scan: str = "",  # the card the start-up scan finds
     ) -> Backend:
         backend = Backend(
             engine_factory=engines if engines is not None else Engines(),
+            gpu_check=lambda: gpu,
+            device_scanner=lambda root: scan,
             assets=assets,
             data_root=tmp_path / "data",
             player=player,
@@ -1324,3 +1338,212 @@ def test_no_assets_means_no_note(qtbot: QtBot, make_backend: MakeBackend, tmp_pa
     _open(qtbot, backend, _short_book(tmp_path))
     backend.goTo("voice")
     assert backend.downloadNote == ""
+
+
+# --- The graphics card -----------------------------------------------------------------------
+
+NVIDIA = "NVIDIA RTX PRO 1000 Blackwell Generation Laptop GPU"
+
+
+def test_no_graphics_driver_means_no_gpu_row(make_backend: MakeBackend) -> None:
+    backend = make_backend(gpu=False)
+    assert backend.gpuAvailable is False
+    assert backend.useGpu is True  # the saved choice defaults to on, it just isn't offered
+    assert backend.gpuName == ""
+    assert backend.hardwareLabel.startswith("CPU · ")
+
+
+def test_the_graphics_card_is_on_by_default_and_named_once_found(
+    qtbot: QtBot, make_backend: MakeBackend
+) -> None:
+    backend = make_backend(gpu=True, scan=NVIDIA)
+    assert backend.gpuAvailable is True
+    assert backend.useGpu is True
+    names: list[str] = []
+    backend.gpuNameChanged.connect(lambda: names.append(backend.gpuName))
+
+    qtbot.waitUntil(lambda: backend.gpuName != "")
+
+    assert backend.gpuName == NVIDIA
+    assert names == [NVIDIA]
+    assert backend.hardwareLabel == "NVIDIA RTX PRO 1000"
+
+
+def test_the_start_up_scan_only_runs_when_a_driver_is_there(
+    qtbot: QtBot, make_backend: MakeBackend
+) -> None:
+    backend = make_backend(gpu=False, scan=NVIDIA)
+    qtbot.wait(100)
+    assert backend.gpuName == ""
+
+
+def test_the_graphics_card_choice_is_saved(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    backend = make_backend(gpu=True)
+    changes: list[bool] = []
+    backend.useGpuChanged.connect(lambda: changes.append(backend.useGpu))
+
+    backend.setUseGpu(False)
+    backend.setUseGpu(False)  # no change, no signal
+
+    assert backend.useGpu is False
+    assert changes == [False]
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    assert settings.value("useGpu") in (False, "false")
+    assert make_backend(gpu=True).useGpu is False  # the next window remembers
+
+
+def test_turning_the_card_off_shows_the_cpu_label(qtbot: QtBot, make_backend: MakeBackend) -> None:
+    backend = make_backend(gpu=True, scan=NVIDIA)
+    qtbot.waitUntil(lambda: backend.hardwareLabel == "NVIDIA RTX PRO 1000")
+
+    backend.setUseGpu(False)
+    assert re.fullmatch(r"CPU · \d+ THREADS?", backend.hardwareLabel)
+    backend.setUseGpu(True)
+    assert backend.hardwareLabel == "NVIDIA RTX PRO 1000"
+
+
+def test_the_download_note_follows_the_engine_the_choice_needs(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    backend = make_backend(gpu=True, assets=None)
+    _open(qtbot, backend, _short_book(tmp_path))
+
+    backend.goTo("voice")  # nothing installed: Vulkan build + eSpeak + Kokoro
+    assert backend.downloadNote == "STARTING DOWNLOADS THE VOICE ONCE · 317 MB"
+    backend.setUseGpu(False)  # CPU build + eSpeak + Kokoro
+    assert backend.downloadNote == "STARTING DOWNLOADS THE VOICE ONCE · 264 MB"
+    backend.setUseGpu(True)
+    assert backend.downloadNote == "STARTING DOWNLOADS THE VOICE ONCE · 317 MB"
+
+
+def test_without_a_driver_the_cpu_engine_is_what_gets_downloaded(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    backend = make_backend(gpu=False, assets=None)
+    _open(qtbot, backend, _short_book(tmp_path))
+    backend.goTo("voice")
+    assert backend.downloadNote == "STARTING DOWNLOADS THE VOICE ONCE · 264 MB"
+
+
+def test_a_conversion_on_the_card_reports_its_name_and_speed(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    engines = Engines()
+    backend = make_backend(engines, gpu=True)
+    _open(qtbot, backend, _short_book(tmp_path))
+
+    _convert(qtbot, backend)
+
+    assert backend.errorMessage == ""
+    assert [engine.use_gpu for engine in engines.made] == [True]
+    assert backend.gpuName == NVIDIA
+    assert re.fullmatch(r"NVIDIA RTX PRO 1000 · ABOUT [\d,]+\.\d× REAL TIME", backend.hardwareLabel)
+    assert backend.warnings == []
+
+
+def test_a_conversion_with_the_card_off_uses_the_cpu(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    engines = Engines()
+    backend = make_backend(engines, gpu=True)
+    backend.setUseGpu(False)
+    _open(qtbot, backend, _short_book(tmp_path))
+
+    _convert(qtbot, backend)
+
+    assert [engine.use_gpu for engine in engines.made] == [False]
+    assert re.fullmatch(r"CPU · ABOUT [\d,]+\.\d× REAL TIME", backend.hardwareLabel)
+
+
+def test_without_a_driver_the_engine_is_never_asked_for_the_card(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    engines = Engines()
+    backend = make_backend(engines, gpu=False)
+    _open(qtbot, backend, _short_book(tmp_path))
+
+    _convert(qtbot, backend)
+
+    assert [engine.use_gpu for engine in engines.made] == [False]
+
+
+def test_a_card_that_did_not_work_is_a_warning_and_the_cpu_label(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    engines = Engines()
+    engines.gpu_warning = "The graphics card didn't work, so Tomecast used the CPU."
+    backend = make_backend(engines, gpu=True, scan=NVIDIA)
+    qtbot.waitUntil(lambda: backend.gpuName != "")
+    _open(qtbot, backend, _short_book(tmp_path))
+
+    _convert(qtbot, backend)
+
+    assert backend.screen == "done"
+    assert backend.warnings == ["The graphics card didn't work, so Tomecast used the CPU."]
+    assert backend.gpuName == ""
+    assert re.fullmatch(r"CPU · ABOUT [\d,]+\.\d× REAL TIME", backend.hardwareLabel)
+
+
+def test_switching_hardware_forgets_the_speed_measured_on_the_other(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    backend = make_backend(gpu=True)
+    _open(qtbot, backend, _short_book(tmp_path))
+    _convert(qtbot, backend)
+    assert "REAL TIME" in backend.hardwareLabel
+
+    backend.setUseGpu(False)
+
+    assert re.fullmatch(r"CPU · \d+ THREADS?", backend.hardwareLabel)
+    backend.setUseGpu(True)
+    assert backend.hardwareLabel == "NVIDIA RTX PRO 1000"
+
+
+def test_the_work_folder_keeps_graphics_card_and_cpu_audio_apart(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    engines = Engines()
+    engines.fail_from = 3
+    backend = make_backend(engines, gpu=True)
+    _open(qtbot, backend, _short_book(tmp_path))
+    _convert(qtbot, backend)  # fails part way on the card: the work is kept
+    assert backend.screen == "voice"
+    kept = list((tmp_path / "data" / "cache").glob("convert-*"))
+    assert len(kept) == 1
+
+    engines.fail_from = None
+    backend.setUseGpu(False)
+    backend.startConversion()
+    qtbot.waitUntil(lambda: backend.screen != "converting", timeout=CONVERSION_TIMEOUT)
+
+    assert backend.screen == "done"
+    assert backend._book is not None
+    # Nothing was reused: after the card's attempts (the failed piece is retried once), the
+    # CPU run voiced every piece from the beginning.
+    cpu_run = engines.texts[4:]
+    assert len(cpu_run) == _speakable_chunks(backend._book)
+    assert cpu_run[0] == "Chapter 1: The Night"
+    leftovers = list((tmp_path / "data" / "cache").glob("convert-*"))
+    assert leftovers == kept  # the card's unfinished folder is still its own
+
+
+def test_the_preview_follows_the_hardware_choice(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    engines = Engines()
+    backend = make_backend(engines, gpu=True, player="true")
+    _open(qtbot, backend, _short_book(tmp_path))
+    backend.goTo("voice")
+
+    backend.togglePreview()
+    qtbot.waitUntil(lambda: len(engines.made) == 1)
+    qtbot.waitUntil(lambda: backend.gpuName != "")
+    backend.setUseGpu(False)
+    backend.setSpeed(1.2)
+    backend.togglePreview()
+    qtbot.waitUntil(lambda: len(engines.made) == 2)
+
+    assert [engine.use_gpu for engine in engines.made] == [True, False]
+    assert engines.made[0].closed

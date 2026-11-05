@@ -26,10 +26,12 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from types import TracebackType
+from typing import Literal
 
 from tomecast.audio import concatenate_wavs
 from tomecast.chunking import split_long
 from tomecast.downloads import Asset, local_path
+from tomecast.hardware import list_devices, pick_device, short_name
 
 AUDIOCPP_VERSION = "0.9.4"
 MIN_GLIBC = (2, 43)
@@ -43,6 +45,21 @@ AUDIOCPP_CPU = Asset(
     sha256="13529ee5366daeb13546190ba25e8118f46bece9c8811e7eb113c41bd121a41a",
     size=64_040_913,
     path=f"engines/audiocpp-{AUDIOCPP_VERSION}-cpu",
+    archive="tar.gz",
+)
+
+# The same audio.cpp, built with Vulkan. It also contains the CPU backend, so a machine that
+# uses the graphics card downloads only this one. It talks to the graphics driver the system
+# already has (NVIDIA's own, or Mesa for AMD and Intel); Tomecast never manages drivers.
+AUDIOCPP_VULKAN = Asset(
+    name=f"audio.cpp {AUDIOCPP_VERSION} voice engine (graphics card)",
+    url=(
+        "https://github.com/0xShug0/audio.cpp/releases/download/"
+        f"v{AUDIOCPP_VERSION}/audio-v{AUDIOCPP_VERSION}-bin-ubuntu-x64-vulkan.tar.gz"
+    ),
+    sha256="e5d8af8eb6500d87eb2ef94c1bc52be7dfc63b26012ff9abf0adce6f1f960208",
+    size=116_975_365,
+    path=f"engines/audiocpp-{AUDIOCPP_VERSION}-vulkan",
     archive="tar.gz",
 )
 
@@ -70,7 +87,16 @@ KOKORO_Q8 = Asset(
     path="models/kokoro-82m-q8_0.gguf",
 )
 
-REQUIRED_ASSETS = (AUDIOCPP_CPU, ESPEAK_NG, KOKORO_Q8)
+
+def engine_asset(use_gpu: bool) -> Asset:
+    """The engine build a run needs: the Vulkan one to use the graphics card, else the CPU one."""
+    return AUDIOCPP_VULKAN if use_gpu else AUDIOCPP_CPU
+
+
+def required_assets(use_gpu: bool) -> tuple[Asset, ...]:
+    """Everything a run needs installed: the engine build, eSpeak and the Kokoro model."""
+    return (engine_asset(use_gpu), ESPEAK_NG, KOKORO_Q8)
+
 
 # Kokoro's built-in voices. The first letter is the language, the second the voice's gender.
 VOICES = (
@@ -143,6 +169,10 @@ _PHONEME_LIMIT_MESSAGE = "exceeds 510"
 
 class EngineError(RuntimeError):
     """Raised when the voice engine can't start or can't voice a piece of text."""
+
+
+class GpuUnavailable(EngineError):
+    """The engine was asked to use the graphics card and couldn't (or used the CPU instead)."""
 
 
 class _ConnectionLost(EngineError):
@@ -225,6 +255,8 @@ class KokoroServer:
         startup_timeout: float = 120.0,
         request_timeout: float = 300.0,
         executable: Path | None = None,
+        backend: Literal["cpu", "vulkan"] = "cpu",
+        device: int | None = None,
     ) -> None:
         if voice not in VOICES:
             raise EngineError(f"unknown voice {voice!r}; choose one of: {', '.join(VOICES)}")
@@ -235,7 +267,12 @@ class KokoroServer:
         self._threads = threads or default_threads()
         self._startup_timeout = startup_timeout
         self._request_timeout = request_timeout
-        self._executable = executable or local_path(AUDIOCPP_CPU, root) / "audiocpp_server"
+        self.backend = backend
+        self.device = device
+        self._executable = executable or (
+            local_path(engine_asset(backend == "vulkan"), root) / "audiocpp_server"
+        )
+        self._reported_backend = ""
         self._process: subprocess.Popen[bytes] | None = None
         self._tempdir: tempfile.TemporaryDirectory[str] | None = None
         self._base_url = ""
@@ -293,6 +330,14 @@ class KokoroServer:
         self._tempdir = tempfile.TemporaryDirectory(prefix="tomecast-audiocpp-")
         try:
             self._launch()
+        except GpuUnavailable:
+            self.close()
+            raise
+        except EngineError as error:
+            self.close()
+            if self.backend == "vulkan":
+                raise GpuUnavailable(str(error)) from error
+            raise
         except BaseException:  # including Ctrl-C while the model loads
             self.close()
             raise
@@ -383,6 +428,11 @@ class KokoroServer:
                     f"the voice engine stopped while starting:\n{_tail(self._log_path)}"
                 )
             if self._healthy():
+                if self.backend == "vulkan" and self._reported_backend != "vulkan":
+                    raise GpuUnavailable(
+                        f"the voice engine reported the {self._reported_backend or 'unknown'} "
+                        "backend, not the graphics card"
+                    )
                 return
             time.sleep(0.2)
         raise EngineError(
@@ -433,13 +483,21 @@ class KokoroServer:
                 payload = json.loads(response.read())
         except (OSError, http.client.HTTPException, ValueError):
             return False
-        return isinstance(payload, dict) and payload.get("status") == "ok"
+        if not isinstance(payload, dict) or payload.get("status") != "ok":
+            return False
+        self._reported_backend = str(payload.get("backend", ""))
+        return True
 
     def _server_config(self, port: int) -> dict[str, object]:
         return {
             "host": "127.0.0.1",
             "port": port,
-            "backend": "cpu",  # the server defaults to CUDA
+            "backend": self.backend,  # the server defaults to CUDA, so always say
+            **(
+                {"device": self.device}
+                if self.backend == "vulkan" and self.device is not None
+                else {}
+            ),
             "threads": self._threads,
             "lazy_load": False,
             "ui": False,
@@ -513,3 +571,57 @@ def _tail(path: Path, lines: int = 20) -> str:
         return "\n".join(path.read_text(errors="replace").splitlines()[-lines:])
     except OSError:
         return "(no log)"
+
+
+CPU_FALLBACK_NOTE = "The graphics card didn't work, so Tomecast used the CPU."
+NO_DEVICE_NOTE = "No usable graphics card was found, so Tomecast used the CPU."
+
+
+class AutoKokoro(KokoroServer):
+    """Kokoro that picks its own hardware: the graphics card if it can, else the CPU.
+
+    This is the one place the choice and the fallback live; the command line and the window
+    both use it. With ``use_gpu`` it runs the Vulkan build, asks it which devices the installed
+    drivers expose, and starts on the best one. If there is none, or the engine won't start on
+    it (or reports another backend), it starts again on the CPU with the same build and sets
+    :attr:`warning`. After :meth:`start`, :attr:`device_label` says what is in use ("CPU" or
+    the card's name) and :attr:`gpu_description` is the card's full description (or ``""``).
+    """
+
+    def __init__(self, root: Path, *, use_gpu: bool = True, **kwargs: object) -> None:
+        self.use_gpu = use_gpu
+        self.warning: str | None = None
+        self.device_label = "CPU"
+        self.gpu_description = ""
+        super().__init__(root, backend="vulkan" if use_gpu else "cpu", **kwargs)  # type: ignore[arg-type]
+
+    def __enter__(self) -> AutoKokoro:
+        self.start()
+        return self
+
+    def start(self) -> None:
+        if self._process is not None:
+            return
+        self.warning = None
+        self.device_label, self.gpu_description = "CPU", ""
+        if not self.use_gpu:
+            super().start()
+            return
+        device = pick_device(list_devices(self._executable))
+        if device is None:
+            self._use_cpu(NO_DEVICE_NOTE)
+            return
+        self.backend, self.device = "vulkan", device.index
+        try:
+            super().start()
+        except GpuUnavailable:
+            self._use_cpu(CPU_FALLBACK_NOTE)
+            return
+        self.device_label = short_name(device.description)
+        self.gpu_description = device.description
+
+    def _use_cpu(self, note: str) -> None:
+        """Run on the CPU backend of the same build, and say why."""
+        self.backend, self.device = "cpu", None
+        super().start()
+        self.warning = note

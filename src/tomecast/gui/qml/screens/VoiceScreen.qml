@@ -283,6 +283,31 @@ ScreenPage {
                 SpeedControl {
                     Layout.fillWidth: true
                 }
+
+                // Only when a graphics driver is there to use.
+                ColumnLayout {
+                    objectName: "gpuChoice"
+                    Layout.fillWidth: true
+                    visible: Backend.gpuAvailable
+                    spacing: 6
+
+                    CheckRow {
+                        objectName: "useGpuSwitch"
+                        text: "Use graphics card"
+                        checked: Backend.useGpu
+                        onClicked: Backend.setUseGpu(!Backend.useGpu)
+                    }
+
+                    MonoLabel {
+                        objectName: "gpuNote"
+                        Layout.fillWidth: true
+                        text: Backend.useGpu
+                              ? "FASTER · USES THE DRIVER ALREADY INSTALLED"
+                              : "USING THE CPU · THE GRAPHICS CARD IS USUALLY SEVERAL TIMES FASTER"
+                        size: 11
+                        wrapMode: Text.Wrap
+                    }
+                }
             }
         }
     }

@@ -1,9 +1,10 @@
 """Work folders for resumable conversions, shared by the terminal command and the window.
 
 Each conversion keeps its chunk audio in ``<data folder>/cache/convert-<key>/``. The key is a
-hash of the book file, the voice, the speed, the seed, and the engine and model versions, so
-the same book with the same settings resumes in the same folder, and a resumed book never mixes
-two voices or models. Folders left unused for :data:`STALE_WORK_DAYS` are removed.
+hash of the book file, the voice, the speed, the seed, and the engine build (CPU or graphics
+card) and model versions, so the same book with the same settings resumes in the same folder,
+and a resumed book never mixes two voices, models or engine builds.
+Folders left unused for :data:`STALE_WORK_DAYS` are removed.
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ import time
 from collections.abc import Iterator
 from pathlib import Path
 
-from tomecast.engines.audiocpp import AUDIOCPP_VERSION, DEFAULT_SEED, REQUIRED_ASSETS
+from tomecast.engines.audiocpp import AUDIOCPP_VERSION, DEFAULT_SEED, required_assets
 
 # Unfinished conversions are kept so they can be resumed; after this long they're removed.
 STALE_WORK_DAYS = 14
@@ -26,7 +27,9 @@ class WorkFolderBusy(RuntimeError):
     """Raised when another run is already converting the same book with the same settings."""
 
 
-def work_folder(root: Path, book_path: Path, voice: str, speed: float) -> Path:
+def work_folder(
+    root: Path, book_path: Path, voice: str, speed: float, *, use_gpu: bool = False
+) -> Path:
     """The folder for this book's chunk audio: the same book and settings resume in it.
 
     Also removes work folders that haven't been used for :data:`STALE_WORK_DAYS`.
@@ -44,7 +47,7 @@ def work_folder(root: Path, book_path: Path, voice: str, speed: float) -> Path:
     # Anything that changes how the audio sounds goes in the key, so a resumed book never
     # mixes two voices, speeds or model versions.
     settings = [voice, str(speed), f"seed={DEFAULT_SEED}", f"audiocpp-{AUDIOCPP_VERSION}"]
-    settings += [asset.sha256 for asset in REQUIRED_ASSETS]
+    settings += [asset.sha256 for asset in required_assets(use_gpu)]
     digest.update("|".join(settings).encode())
     folder = cache / f"convert-{digest.hexdigest()[:16]}"
     folder.mkdir(exist_ok=True)

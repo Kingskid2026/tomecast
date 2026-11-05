@@ -137,6 +137,16 @@ Both sit behind one small interface (`voices()`, `languages()`, `synthesize(chun
 
 - The **"Use graphics card"** switch is always visible, with the measured speedup next to it ("about 4× faster on your machine").
 
+**What is built so far (Kokoro on the graphics card, issue #8).** The full scan above is still to come; today's version is deliberately small and never touches drivers:
+
+- `tomecast.hardware.vulkan_possible()` is a cheap check with no download: `libvulkan.so.1` can be loaded and a graphics device node exists (`/dev/dri/renderD*` or `/dev/nvidia0`). The window shows the "Use graphics card" row only when it is true, and `tomecast convert` defaults to the card only then.
+- Which devices exist is asked of audio.cpp itself: `audiocpp_server --backend vulkan --list-devices --json` (the last stdout line that parses as JSON; `list_devices()` never raises, a failure means no devices). `pick_device()` takes the discrete `gpu` with the most free memory, else an `igpu` with at least 2 GB free, else nothing.
+- **One engine build per choice.** Using the card needs only the Vulkan build (`AUDIOCPP_VULKAN`, 117 MB), which also contains the CPU backend. Not using it needs only the CPU build. So the required files are `required_assets(use_gpu)`: that build, eSpeak and Kokoro.
+- **Fallback.** `AutoKokoro` (used by both the command line and the window) starts the Vulkan build on the picked device and checks that `/health` reports the `vulkan` backend. If no device is found, the server won't start, or it reports another backend, it raises `GpuUnavailable` internally and starts again with `"backend": "cpu"` on the same binary, with the warning "The graphics card didn't work, so Tomecast used the CPU." (or "No usable graphics card was found…"). The warning is shown as a note on the command line and on the done screen.
+- **Resuming.** The work-folder key includes which engine build is used, so card and CPU audio never mix in one book.
+- `tomecast doctor` prints the distro, glibc, CPU threads, `vulkan_possible()`, the Vulkan devices (once the Vulkan build is installed) and which engines and models are installed, for bug reports.
+- Measured on the maintainer's laptop (Gift of the Magi, 13 min of audio, whole run including start-up and packaging): 41 s on the NVIDIA RTX PRO 1000 (about 19× real time) and 2 min 51 s on the CPU (about 4.6×).
+
 ### 6. Pause & resume, preview
 - **Resume (built):**
   - Each conversion keeps its chunk audio in `~/.local/share/tomecast/cache/convert-<key>/`.
