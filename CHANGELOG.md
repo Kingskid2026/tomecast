@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.1.1](https://github.com/Kingskid2026/tomecast/compare/v0.1.0...v0.1.1) (2026-11-05)
+
+
+### Features
+
+* read DOCX, FB2, TXT and HTML books ([#31](https://github.com/Kingskid2026/tomecast/issues/31)) ([058d162](https://github.com/Kingskid2026/tomecast/commit/058d162bd2b20c9139efb73a607f9dd954b6eb39))
+
+
+### Bug Fixes
+
+* start the voice engine on a fresh port if its port was taken ([#33](https://github.com/Kingskid2026/tomecast/issues/33)) ([63c7ae4](https://github.com/Kingskid2026/tomecast/commit/63c7ae4fbfffcc862dc7f40f9c12f23005760de2))
+* the installer always finds the newest release ([#29](https://github.com/Kingskid2026/tomecast/issues/29)) ([3439509](https://github.com/Kingskid2026/tomecast/commit/34395098ad33102ab9e9f3ba53243d034b623ac8))
+* the window quits cleanly on SIGTERM and Ctrl-C ([#30](https://github.com/Kingskid2026/tomecast/issues/30)) ([a9300c3](https://github.com/Kingskid2026/tomecast/commit/a9300c350644b9de7c5513474cfc9bb66b6cddff))
+
 ## [0.1.0](https://github.com/Kingskid2026/tomecast/compare/v0.0.2...v0.1.0) (2026-11-05)
 
 
