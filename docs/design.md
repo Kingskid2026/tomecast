@@ -44,7 +44,7 @@ All three are open-licensed (SIL OFL) and get bundled with the app.
 
 - **The sentence grid** (the living element): one dot per chunk of text. Dim means waiting, text colour means voiced, accent means being spoken now. A chunk that fails its audio check blinks once while it's redone. Drawn as one custom item, so thousands of dots stay cheap.
 - **A live caption** of the sentence being voiced, in Plex Mono.
-- **Every dot is round:** the numerals, the art and covers, the sentence grid, the meters and the waveform all use circles, so they read as one family.
+- **Every dot is round, and every dot outside the art is the same size (5 px):** the sentence grid, the chapter-length and speed meters (the chosen speed shows in the accent colour, never as a bigger dot), the waveform, and Doto's numerals (67 px, since its dots are 0.075 em). Only the halftone art and covers vary their dot sizes.
 - **No index tags:** no bracketed numbers like `[ 03 ]` on screens, rows or headers. Chapters are listed by title.
 - **Dot meters** for amounts, like speed as an 11-dot meter.
 - **A round play/pause** for the voice preview, with a row of dots as its waveform.
@@ -71,7 +71,7 @@ When the image ships with the app, add it to `THIRD_PARTY.md` too.
 
 - **Qt Quick (QML)** through PySide6, with our own components on the Basic Controls style. Plain widget stylesheets can't do the dots.
 - **Native window decorations.** Custom title bars break on tiling window managers and Wayland.
-- **Resizes well.** Tomecast often sits in a small window in a corner of the screen. The same design reflows down to about 400 px wide: art and cover stack above the text, chapter rows drop the word count and length dots, the sentence grid takes as many columns as fit, and the big numbers and padding shrink. A separate compact 400 × 600 version is on the mockup canvas as an idea for a future mobile app; it is not the desktop layout.
+- **Resizes well.** Tomecast often sits in a small window in a corner of the screen. The same design reflows down to about 400 px wide: art and cover stack above the text, chapter rows drop the word count and length dots, the sentence grid takes as many columns as fit, and the padding shrinks. The big numbers keep their size, so their dots stay 5 px. A separate compact 400 × 600 version is on the mockup canvas as an idea for a future mobile app; it is not the desktop layout.
 - **Theme:** read the desktop setting (`QStyleHints.colorScheme()`, Qt 6.5+) and offer a manual override, because some setups (Hyprland and Omarchy, for example) may not report it.
 - **Reduced motion:** respect GNOME's and KDE's animation settings, plus an in-app switch.
 - **Light on resources while converting:** redraw only on progress events, never a continuous shader, since the voice engine needs the CPU. Animate state changes at 150–400 ms.
