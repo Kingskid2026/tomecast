@@ -59,7 +59,7 @@ from tomecast.gui.worker import (
     scan_gpu,
 )
 from tomecast.hardware import short_name, vulkan_possible
-from tomecast.readers import FORMATS
+from tomecast.readers import FORMATS, SUFFIXES
 
 SCREENS = ("drop", "chapters", "voice", "converting", "done")
 THEME_SETTINGS = ("system", "dark", "light")
@@ -68,10 +68,8 @@ PLAYERS = ("pw-play", "paplay", "aplay")  # the first one found plays previews
 
 FORMATS_LABEL = " · ".join(FORMATS)  # only what Tomecast can read today
 # Formats the window lists but can't read yet.
-COMING_SOON = {
-    ".pdf": "PDF", ".docx": "DOCX", ".fb2": "FB2", ".html": "HTML", ".htm": "HTML",
-    ".xhtml": "HTML", ".txt": "TXT",
-}  # fmt: skip
+COMING_SOON = {".pdf": "PDF"}
+_FORMAT_LIST = f"{', '.join(FORMATS[:-1])} and {FORMATS[-1]}"
 STOPPED_MESSAGE = "Stopped. Start again to continue where you left off."
 UNKNOWN_TIME = "--:--:--"
 DOWNLOAD_NOTE = "STARTING DOWNLOADS THE VOICE ONCE · {mb} MB"
@@ -536,12 +534,14 @@ class Backend(QObject):
             name = COMING_SOON[suffix]
             self._update(
                 "errorMessage",
-                f"{name} support is coming soon. For now, Tomecast reads EPUB books.",
+                f"{name} support is coming soon. For now, Tomecast reads {_FORMAT_LIST} books.",
             )
             return
-        if suffix != ".epub":
+        if suffix not in SUFFIXES:
             kind = f"{suffix} files" if suffix else "files without an extension"
-            self._update("errorMessage", f"Tomecast can't read {kind}. Choose an EPUB book.")
+            self._update(
+                "errorMessage", f"Tomecast can't read {kind}. It reads {_FORMAT_LIST} books."
+            )
             return
         if not path.is_file():
             self._update("errorMessage", f"Couldn't find {path.name}.")

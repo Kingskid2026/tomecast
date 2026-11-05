@@ -27,6 +27,7 @@ This list reflects the current design ([docs/architecture.md](docs/architecture.
 | audio.cpp | Running the voice models. Both official builds are used, CPU and Vulkan (the Vulkan one for graphics cards, through the installed driver; same source and license, downloaded only when the graphics card is used) | Apache 2.0 | [0xShug0/audio.cpp](https://github.com/0xShug0/audio.cpp) |
 | llama.cpp | Running the text and OCR models | MIT | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) |
 | ONNX Runtime | Running Docling Heron | MIT | [microsoft/onnxruntime](https://github.com/microsoft/onnxruntime) |
+| python-docx | Reading DOCX documents (it also installs typing-extensions, PSF-2.0) | MIT | [python-openxml/python-docx](https://github.com/python-openxml/python-docx) |
 | pypdfium2 / PDFium | Reading PDFs | Apache 2.0 or BSD-3-Clause / BSD-3-Clause | [pypdfium2](https://github.com/pypdfium2-team/pypdfium2) |
 | FFmpeg (via imageio-ffmpeg) | Building M4B/MP3 files; runs as a separate program | LGPL/GPL | [imageio-ffmpeg](https://github.com/imageio/imageio-ffmpeg) |
 | eSpeak NG 1.52 (from the espeakng-loader wheel) | Turning text into sounds for Kokoro, needed for every sentence. Downloaded as a runtime file and used by audio.cpp, not imported by Tomecast | GPL-3.0-or-later | [espeak-ng](https://github.com/espeak-ng/espeak-ng), [espeakng-loader](https://pypi.org/project/espeakng-loader/) |

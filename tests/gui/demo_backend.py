@@ -292,7 +292,7 @@ class DemoBackend(QObject):
             "bookAuthors": ", ".join(data["authors"]),
             "coverSource": "",
             "artSource": "",
-            "formatsLabel": "EPUB",
+            "formatsLabel": "EPUB · DOCX · FB2 · HTML · TXT",
             "skipFrontMatter": True,
             "selectionSummary": {},
             "voiceGroups": self._voice_groups(),

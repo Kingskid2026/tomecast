@@ -31,6 +31,7 @@ from tomecast.gui.worker import TimedControl, preview_file
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # for epub_factory
 from epub_factory import NavPoint, Page, build_epub, tiny_png
+from format_factory import book_in_format
 
 SAMPLE_RATE = 24000
 CHARS_PER_SECOND = 15.0
@@ -266,7 +267,7 @@ def test_opening_a_book_lists_its_chapters(
     assert backend.bookAuthors == "Test Author"
     assert backend.coverSource.startswith("image://dots/cover/dark?")
     assert backend.artSource == "image://dots/cantoria/dark"
-    assert backend.formatsLabel == "EPUB"  # only formats with a reader today
+    assert backend.formatsLabel == "EPUB · DOCX · FB2 · HTML · TXT"  # formats with a reader
     rows = _rows(backend.chapters)
     assert all("number" not in row for row in rows)  # no index tags: rows are listed by title
     assert [row["title"] for row in rows] == [
@@ -459,14 +460,24 @@ def test_changing_the_speed_updates_the_estimates(
 @pytest.mark.parametrize(
     ("name", "message"),
     [
-        ("book.pdf", "PDF support is coming soon. For now, Tomecast reads EPUB books."),
-        ("book.docx", "DOCX support is coming soon. For now, Tomecast reads EPUB books."),
-        ("book.TXT", "TXT support is coming soon. For now, Tomecast reads EPUB books."),
-        ("book.xyz", "Tomecast can't read .xyz files. Choose an EPUB book."),
+        (
+            "book.pdf",
+            "PDF support is coming soon. For now, Tomecast reads EPUB, DOCX, FB2, HTML and TXT "
+            "books.",
+        ),
+        (
+            "book.xyz",
+            "Tomecast can't read .xyz files. It reads EPUB, DOCX, FB2, HTML and TXT books.",
+        ),
+        (
+            "book",
+            "Tomecast can't read files without an extension. It reads EPUB, DOCX, FB2, HTML and "
+            "TXT books.",
+        ),
         ("missing.epub", "Couldn't find missing.epub."),
     ],
 )
-def test_books_that_cant_be_read_yet_explain_why(
+def test_books_that_cant_be_read_explain_why(
     make_backend: MakeBackend, tmp_path: Path, name: str, message: str
 ) -> None:
     backend = make_backend()
@@ -494,6 +505,45 @@ def test_a_broken_epub_shows_the_readers_error(
 
     assert backend.errorMessage == "broken.epub isn't an EPUB: it's not a zip file."
     assert backend.loading is False
+    assert backend.screen == "drop"
+
+
+@pytest.mark.parametrize("name", ["book.docx", "book.fb2", "book.txt", "book.html", "book.htm"])
+def test_every_readable_format_opens_in_the_window(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path, name: str
+) -> None:
+    path = book_in_format(tmp_path, name)
+    backend = make_backend()
+
+    _open(qtbot, backend, path)
+
+    assert backend.bookLoaded is True
+    assert [row["title"] for row in _rows(backend.chapters)] == ["Chapter 1", "Chapter 2"]
+
+
+def test_a_book_in_a_format_the_reader_recognizes_opens_whatever_its_name(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    backend = make_backend()
+    renamed = tmp_path / "short.txt"  # an EPUB, whatever its extension says
+    renamed.write_bytes(_short_book(tmp_path).read_bytes())
+
+    _open(qtbot, backend, renamed)
+
+    assert backend.bookTitle == "Short Book"
+
+
+def test_a_binary_file_named_txt_shows_the_readers_error(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    path = tmp_path / "picture.txt"
+    path.write_bytes(bytes(range(256)) * 20)
+    backend = make_backend()
+
+    backend.openBook(_url(path))
+    qtbot.waitUntil(lambda: bool(backend.errorMessage))
+
+    assert backend.errorMessage == "picture.txt isn't a text file: it looks like binary data."
     assert backend.screen == "drop"
 
 
