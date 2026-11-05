@@ -9,8 +9,8 @@
 #   2. Uses uv to install Tomecast from PyPI. uv downloads a suitable Python if needed.
 #   3. Runs `tomecast --version` to check that it worked, and makes sure the `tomecast`
 #      command will be on your PATH in new terminals.
-#   4. Adds Tomecast to your app launcher (Super+Space) and to the "Open with" menu for EPUB
-#      files, by writing two small files under ~/.local/share.
+#   4. Adds Tomecast to your app launcher (GNOME, KDE, Hyprland launchers and others) and to
+#      the "Open with" menu for EPUB files, by writing two small files under ~/.local/share.
 #
 # Tomecast downloads its voice engines and models later, on first launch, after asking.
 set -eu
@@ -62,7 +62,7 @@ say "done! $("$BIN_DIR/tomecast" --version) is installed."
 
 # Add Tomecast to the app launcher and the EPUB "Open with" menu. Optional: never fails the install.
 if "$BIN_DIR/tomecast" desktop-entry install >/dev/null 2>&1; then
-    say "added Tomecast to your app launcher: press Super+Space and type 'tomecast'."
+    say "added Tomecast to your app launcher: open it and search for 'Tomecast'."
 else
     say "couldn't add Tomecast to your app launcher. Try 'tomecast desktop-entry install' later."
 fi
