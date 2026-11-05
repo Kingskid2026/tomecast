@@ -88,8 +88,8 @@ build_vulkan_tools() {
     cmake --install "$work/build-loader"
     cmake -S "$vsrc/shaderc" -B "$work/build-shaderc" -DCMAKE_BUILD_TYPE=Release \
         -DSHADERC_SKIP_TESTS=ON -DSHADERC_SKIP_EXAMPLES=ON -DSHADERC_SKIP_COPYRIGHT_CHECK=ON \
-        -DSHADERC_SKIP_INSTALL=ON -DSPIRV_SKIP_TESTS=ON -DSPIRV_SKIP_EXECUTABLES=ON \
-        -DSPIRV_WERROR=OFF -DENABLE_GLSLANG_BINARIES=OFF
+        -DSPIRV_SKIP_TESTS=ON -DSPIRV_SKIP_EXECUTABLES=ON -DSPIRV_WERROR=OFF \
+        -DENABLE_GLSLANG_BINARIES=OFF
     cmake --build "$work/build-shaderc" --parallel "$jobs" --target glslc_exe
     install -D -m 0755 "$work/build-shaderc/glslc/glslc" "$prefix/bin/glslc"
     # ggml-vulkan includes <spirv/unified1/spirv.hpp>.
