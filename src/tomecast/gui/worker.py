@@ -121,9 +121,10 @@ class PreviewJob:
 @dataclass(frozen=True, slots=True)
 class ConvertJob:
     job: int
-    book: Book  # only the chapters to convert
+    book: Book  # the whole book, so chunk IDs match a run from the command line
+    chapters: tuple[int, ...]  # indices into book.chapters to convert
     book_path: Path  # the book file, which keys the resume folder
-    output: Path
+    output: Path  # the wanted name; the book may land at "name (2).m4b" if it's taken
     voice: str
     speed: float
     control: TimedControl
@@ -365,9 +366,9 @@ class ConversionWorker(QObject):
             self._close_preview_engine()  # one model in memory at a time
             self._system_check()
             engine = self._engine_factory(self._root, job.voice, job.speed)
-            chunks = [chunk for chapter in plan_chunks(job.book, engine.max_chars)
-                      for chunk in chapter]  # fmt: skip
-            first_chapter = next((chunk.chapter for chunk in chunks), 0)
+            plan = plan_chunks(job.book, engine.max_chars, job.chapters)
+            chunks = [chunk for chapter in plan for chunk in chapter]
+            first_chapter = next((position for position, c in enumerate(plan) if c), 0)
             self.progressed.emit(
                 job.job, ConvertUpdate(0, len(chunks), first_chapter, "", "starting", None, None)
             )
@@ -408,16 +409,17 @@ class ConversionWorker(QObject):
                 self._report(job.job, meter, progress)
 
             result = convert_book(
-                job.book, meter, job.output, workdir=workdir, progress=report, control=control
-            )
+                job.book, meter, job.output, workdir=workdir, progress=report, control=control,
+                chapters=job.chapters, overwrite=False,
+            )  # fmt: skip
             taken = time.monotonic() - started - (control.paused_seconds - paused_before)
         finally:
             engine.close()
         return ConvertResult(
-            output=job.output,
+            output=result.output,  # not job.output if that name was taken meanwhile
             audio_seconds=result.chapters[-1].end_seconds if result.chapters else 0.0,
             chapters=len(result.chapters),
-            size_bytes=job.output.stat().st_size,
+            size_bytes=result.output.stat().st_size,
             seconds_taken=max(0.0, taken),
             warnings=result.warnings,
             speedup=meter.speedup(),

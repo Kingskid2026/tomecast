@@ -209,6 +209,7 @@ class DemoBackend(QObject):
     previewTextChanged = Signal()
     previewPlayingChanged = Signal()
     previewAvailableChanged = Signal()
+    downloadNoteChanged = Signal()
     stageChanged = Signal()
     downloadLabelChanged = Signal()
     chunksDoneChanged = Signal()
@@ -293,6 +294,7 @@ class DemoBackend(QObject):
             "previewText": str(data["ch1_first_sentences"][0]),
             "previewPlaying": False,
             "previewAvailable": True,
+            "downloadNote": "",
             "stage": "voicing",
             "downloadLabel": ("DOWNLOADING ONCE · KOKORO VOICE MODEL (82M, 8-BIT) · 45% OF 190 MB"),
             "chunksDone": chunks_done,
@@ -391,6 +393,9 @@ class DemoBackend(QObject):
 
     def set_speed_label(self, label: str) -> None:
         self._set("speedLabel", label)
+
+    def set_download_note(self, text: str) -> None:
+        self._set("downloadNote", text)
 
     def set_loading(self, on: bool) -> None:
         self._set("loading", on)
@@ -591,6 +596,7 @@ class DemoBackend(QObject):
     previewAvailable = Property(
         bool, lambda self: self._get("previewAvailable"), notify=previewAvailableChanged
     )
+    downloadNote = Property(str, lambda self: self._get("downloadNote"), notify=downloadNoteChanged)
     stage = Property(str, lambda self: self._get("stage"), notify=stageChanged)
     downloadLabel = Property(
         str, lambda self: self._get("downloadLabel"), notify=downloadLabelChanged

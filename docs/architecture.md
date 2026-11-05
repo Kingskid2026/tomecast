@@ -144,6 +144,8 @@ Both sit behind one small interface (`voices()`, `languages()`, `synthesize(chun
   - Each chunk's file name includes a hash of its exact text, and a file only gets its final name once its audio has passed the checks. So stopping (Ctrl-C, `kill`, a crash, a reboot) loses at most the chunk in progress, and changed text is always voiced again.
   - Running the same command again picks up where it stopped. The folder is deleted after success, and unused ones after 14 days.
   - A lock stops two runs of the same book from colliding.
+  - Chunk IDs use each chapter's index in the *whole* book, however few chapters are being voiced. So the command line (all chapters) and the window (the ticked ones) reuse each other's chunks, and changing the ticks voices only what is new.
+  - Cancel and Pause work between chunks and once more just before packaging. Packaging itself can't be stopped: once it starts, cancelling is refused.
   - The engine process is stopped with Tomecast, even if Tomecast is killed.
 - **Pause** in the desktop window will use the same mechanism.
 - **Preview:** play the first paragraph of any chapter, or any typed text, in the chosen voice and speed before converting.

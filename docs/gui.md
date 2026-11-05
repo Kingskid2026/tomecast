@@ -69,10 +69,10 @@ Every property has a `<name>Changed` notify signal. Lists are plain JS arrays of
 | `bookLoaded` | bool | |
 | `loading` | bool | true while a book is being read |
 | `bookTitle`, `bookAuthors` | string | authors joined with ", " |
-| `coverSource` | string | `"image://dots/cover/<theme>?<n>"` (`<n>` changes per book), or `""` without a cover |
+| `coverSource` | string | `"image://dots/cover/<theme>?<n>"` (`<n>` changes per book), or `""` without a cover (a cover whose shape is thinner than 1:4 or wider than 4:1 counts as none) |
 | `artSource` | string | `"image://dots/cantoria/<theme>"` |
 | `formatsLabel` | string | the formats Tomecast can read today, from `tomecast.readers.FORMATS` joined with `" · "` (just `"EPUB"` for now) |
-| `chapters` | ChapterModel | one row per section of the book |
+| `chapters` | ChapterModel | one row per section of the book. A section with no title is called `"Untitled section"` (its accessible name is "Include untitled section") |
 | `skipFrontMatter` | bool | ticks and unticks the rows marked front matter |
 | `selectionSummary` | object | `{sections, words, audio, make}`: ready-to-show uppercase strings, as in the mockup ("12 OF 15 SECTIONS", "26,371 WORDS", "ABOUT 2 H 47 MIN OF AUDIO", "ABOUT 36 MIN TO MAKE HERE") |
 
@@ -97,12 +97,13 @@ Front matter is guessed until the real cleanup lands (issue #4): sections before
 | `previewText` | string | the first sentence of the first selected chapter |
 | `previewPlaying` | bool | |
 | `previewAvailable` | bool | false when no system audio player was found (the button explains) |
+| `downloadNote` | string | what Start will download: `""` when every file in `REQUIRED_ASSETS` is installed, otherwise `"STARTING DOWNLOADS THE VOICE ONCE · 271 MB"` (the sizes of the *missing* assets added up, in MB, rounded up). Recomputed each time the voice screen is shown and once a conversion's downloads have finished. A file already checked against its SHA-256 isn't hashed again until its size or modification time changes. `VoiceScreen.qml` shows it as a muted `MonoLabel` right above Start converting. |
 
 | Slot | Does |
 |---|---|
 | `setVoice(id)`, `setSpeed(value)` | |
 | `togglePreview()` | voice `previewText` with the chosen voice and speed, then play it; again to stop |
-| `startConversion()` | write `<book folder>/<book title>.m4b` (never overwriting: a number is added) and go to `"converting"` |
+| `startConversion()` | write `<book folder>/<book title>.m4b` and go to `"converting"`. It does nothing while `loading` is true (Start is disabled then), because the book being read would replace this one. The job carries the **whole book** plus `chapters`, the indices of the ticked rows (see "Ticked sections and resuming" below). |
 
 ### Converting
 
@@ -120,14 +121,35 @@ Front matter is guessed until the real cleanup lands (issue #4): sections before
 
 | Slot | Does |
 |---|---|
-| `pauseConversion()`, `resumeConversion()` | |
-| `cancelConversion()` | stops after the current sentence; the work is kept, so starting the same book again resumes |
+| `pauseConversion()` | pauses before the next piece. **Only while `stage == "voicing"`**: during the download, the start-up and packaging it does nothing. |
+| `resumeConversion()` | |
+| `cancelConversion()` | stops after the current sentence; the work is kept, so starting the same book again resumes. **Not available while `stage == "packaging"`**: it does nothing then, because the audiobook is written regardless. |
+
+Availability by stage (`ConvertingScreen.qml` disables the buttons to match; a paused conversion can always be resumed):
+
+| `stage` | Pause | Cancel |
+|---|---|---|
+| `downloading`, `starting` | no | yes |
+| `voicing` | yes | yes |
+| `packaging` | no | no |
+
+`convert_book()` calls `control.checkpoint()` after the last piece and right before packaging, so a Cancel that came during the last piece stops there (nothing is written, and "Stopped" is true). It then calls `control.commit()`: from that moment `ConversionControl.cancel()` and `pause()` return `False` and change nothing. The window uses the return value, so a Cancel that races the `"packaging"` stage message is refused instead of reporting "Stopped" while the book is written. Quitting the window during packaging waits for it to finish.
+
+A book that finishes reading while a conversion runs (a drop that started before Start was pressed) is dropped: `_on_book_read` clears `loading` and leaves the converting screen, the book and the conversion alone.
+
+### Ticked sections and resuming
+
+`convert_book(book, engine, output, *, workdir, chapters=None, overwrite=True, ...)` takes the **whole** book and `chapters`, the indices into `book.chapters` to voice (`None`: all). Chunk IDs (`cNNN-…`) always use the chapter's index in the whole book, so the same chapter has the same chunk files whichever sections are ticked, and a run from the command line and a run from the window reuse each other's work. The M4B gets only the chosen chapters, in book order. Progress reports `chapter_index` as the position among the chosen chapters (so it indexes the converting screen's labels), and `chunks_total` counts only their chunks.
+
+### Where the book is written
+
+The window passes `overwrite=False`. `startConversion` picks `<title>.m4b` (or `<title> (2).m4b`…) if the name is free then, and `write_m4b` checks again when it publishes: it hard-links the finished file to the wanted name (which fails if the name exists), and tries `(2)`, `(3)`… if somebody saved a file there meanwhile. The file that was written is `ConversionResult.output`, which becomes `ConvertResult.output` and so `outputPath`. The command line keeps `overwrite=True`: `--force` decides there.
 
 ### Done
 
 | Property | Type | Meaning |
 |---|---|---|
-| `outputPath` | string | the file that was written |
+| `outputPath` | string | the file that was written, taken from `ConversionResult.output` (it may be `<title> (2).m4b` if the name was taken while converting) |
 | `audioLength` | string | `"2:47:00"` |
 | `doneSummary` | string | `"OF AUDIO · 12 CHAPTERS · 79 MB · MADE IN 36 MIN"` |
 | `warnings` | list of string | e.g. a damaged cover was left out |
@@ -161,6 +183,6 @@ One `QQuickPaintedItem`. It repaints only when a property changes and draws in d
 
 ## Testing
 
-- Headless: `QT_QPA_PLATFORM=offscreen` (set in `tests/gui/conftest.py`), using pytest-qt's `qtbot`.
+- Headless: `QT_QPA_PLATFORM=offscreen` (set in `tests/gui/conftest.py`, together with an empty `QT_QPA_PLATFORMTHEME` so the desktop's theme plugin can't leak a colour scheme in; the backend fixture also replaces `system_reduce_motion`, so the real `gsettings` never runs), using pytest-qt's `qtbot`.
 - The backend is tested with a fake engine (`tests/test_convert.py` has the pattern): a whole conversion through the backend, with pause, cancel and resume.
 - `scripts/gui_screenshots.py` renders every screen in both themes to PNG, from a demo backend with Alice in Wonderland's real numbers, so the window can be compared with the mockups without a display.

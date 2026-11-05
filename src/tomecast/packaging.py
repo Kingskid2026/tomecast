@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import contextlib
 import math
+import os
 import re
 import subprocess
 import tempfile
@@ -88,6 +89,14 @@ class PackagedChapter:
 
 
 @dataclass(frozen=True, slots=True)
+class PackagedBook:
+    """The finished audiobook: where it was written, and where its chapters are."""
+
+    output: Path
+    chapters: list[PackagedChapter]
+
+
+@dataclass(frozen=True, slots=True)
 class _Segment:
     path: Path
     frames: int
@@ -112,8 +121,10 @@ def write_m4b(
     workdir: Path,
     bitrate: str = "64k",
     ffmpeg: str | None = None,
-) -> list[PackagedChapter]:
-    """Encode ``chapters`` into an M4B audiobook at ``output`` and return its chapter list.
+    overwrite: bool = True,
+) -> PackagedBook:
+    """Encode ``chapters`` into an M4B audiobook at ``output`` and return where it ended up
+    and its chapter list.
 
     The audio is encoded once, as mono AAC at ``bitrate``, with one chapter marker per
     chapter, iTunes-style tags from ``info`` (title, album, artist, album artist, composer
@@ -125,6 +136,11 @@ def write_m4b(
     folder inside ``workdir``, which is removed afterwards. The audiobook is written to a
     temporary file next to ``output`` and renamed over it only on success, so if this raises,
     ``output`` is untouched.
+
+    With ``overwrite=False`` an existing file is never replaced, even if it appears while
+    the audiobook is being encoded: the finished file is published with a hard link, which
+    fails if the name is taken, and the next free name ("Title (2).m4b", "Title (3).m4b"...)
+    is used instead. The returned ``output`` is the name actually used.
 
     ``ffmpeg`` is the ffmpeg executable to use. It defaults to the one bundled with
     imageio-ffmpeg.
@@ -164,14 +180,50 @@ def write_m4b(
                 output=partial,
             )
             _encode(command, planned, log_path=scratch_dir / "ffmpeg.log")
-        partial.replace(output)
+        if overwrite:
+            partial.replace(output)
+        else:
+            output = _publish_without_overwriting(partial, output)
     finally:
         partial.unlink(missing_ok=True)  # only still there if something failed
 
-    return [
-        PackagedChapter(c.title, c.start_frame / sample_rate, c.end_frame / sample_rate)
-        for c in planned
-    ]
+    return PackagedBook(
+        output,
+        [
+            PackagedChapter(c.title, c.start_frame / sample_rate, c.end_frame / sample_rate)
+            for c in planned
+        ],
+    )
+
+
+def _publish_without_overwriting(partial: Path, target: Path) -> Path:
+    """Give ``partial`` its final name: ``target``, or the first free "<stem> (N)<suffix>".
+
+    ``os.link`` fails if the name exists (it does not follow symlinks either), so claiming a
+    name is atomic and a file that appears at any moment is never replaced. On a file system
+    without hard links, the name is claimed with an exclusive create and the audiobook is
+    then renamed over that empty placeholder.
+    """
+    number = 1
+    candidate = target
+    while True:
+        try:
+            os.link(partial, candidate)
+        except FileExistsError:
+            number += 1
+            candidate = target.with_name(f"{target.stem} ({number}){target.suffix}")
+            continue
+        except OSError:  # no hard links here (FAT, some network shares)
+            try:
+                os.close(os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666))
+            except FileExistsError:
+                number += 1
+                candidate = target.with_name(f"{target.stem} ({number}){target.suffix}")
+                continue
+            partial.replace(candidate)
+        else:
+            partial.unlink(missing_ok=True)
+        return candidate
 
 
 def _plan(chapters: Sequence[ChapterAudio]) -> tuple[int, list[_PlannedChapter]]:

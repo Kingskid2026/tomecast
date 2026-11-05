@@ -11,6 +11,9 @@ ScreenPage {
     id: page
 
     readonly property bool downloading: Backend.stage === "downloading"
+    // Pause works between pieces, so only while voicing. Packaging can't be stopped at all.
+    readonly property bool canPause: Backend.stage === "voicing"
+    readonly property bool canCancel: Backend.stage !== "packaging"
     readonly property string voiceName: Backend.voiceLabel.split(" · ")[0]
     readonly property string coverDescription: "Cover of " + Backend.bookTitle + ", shown as dots"
     readonly property string pauseText: Backend.paused ? "Resume converting" : "Pause converting"
@@ -180,6 +183,7 @@ ScreenPage {
                 objectName: "pauseButton"
                 glyph: Backend.paused ? "play" : "pause"
                 text: page.pauseText
+                enabled: page.canPause || Backend.paused
                 onClicked: page.togglePause()
             }
 
@@ -187,7 +191,9 @@ ScreenPage {
                 objectName: "pauseNote"
                 Layout.fillWidth: true
                 text: Backend.paused ? "Paused. Everything voiced so far is kept."
-                                     : "Pause any time. Everything voiced so far is kept."
+                      : page.canPause ? "Pause any time. Everything voiced so far is kept."
+                      : Backend.stage === "packaging" ? "Putting the audiobook together. This can't be paused or cancelled."
+                      : "You can pause once the voicing starts."
                 color: Theme.muted
                 font.family: Theme.sans
                 font.pixelSize: 14
@@ -199,6 +205,7 @@ ScreenPage {
         PillButton {
             objectName: "cancelButton"
             text: "Cancel"
+            enabled: page.canCancel
             onClicked: Backend.cancelConversion()
         }
     }

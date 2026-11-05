@@ -11,7 +11,7 @@ import pytest
 
 from tomecast.audio import write_silence
 from tomecast.book import Book, Chapter, Cover
-from tomecast.chunking import normalize_whitespace
+from tomecast.chunking import normalize_whitespace, verify_coverage
 from tomecast.convert import (
     ConversionCancelled,
     ConversionControl,
@@ -19,6 +19,7 @@ from tomecast.convert import (
     MissingAudioError,
     audio_problem,
     convert_book,
+    plan_chunks,
 )
 
 SAMPLE_RATE = 24000
@@ -301,3 +302,211 @@ def test_a_paused_conversion_waits_until_resumed(tmp_path: Path) -> None:
     worker.join(timeout=30)
     assert not worker.is_alive()
     assert (tmp_path / "b.m4b").is_file()
+
+
+# --- Cancelling at the last moment ---------------------------------------------------------
+
+
+def test_cancelling_during_the_last_piece_stops_before_packaging(tmp_path: Path) -> None:
+    control = ConversionControl()
+    seen: list[ConversionProgress] = []
+
+    def cancel_on_the_last_piece(p: ConversionProgress) -> None:
+        seen.append(p)
+        if p.stage == "voicing" and p.chunks_done == p.chunks_total:
+            control.cancel()
+
+    with pytest.raises(ConversionCancelled):
+        convert_book(_book(), FakeEngine(), tmp_path / "b.m4b", workdir=tmp_path / "w",
+                     progress=cancel_on_the_last_piece, control=control)  # fmt: skip
+
+    assert not (tmp_path / "b.m4b").exists()  # nothing was written, so "Stopped" is true
+    assert not list(tmp_path.glob(".*"))
+    assert all(p.stage == "voicing" for p in seen)  # packaging never started
+
+    # Everything was voiced and kept: starting again reuses all of it.
+    again = convert_book(_book(), FakeEngine(), tmp_path / "b.m4b", workdir=tmp_path / "w")
+    assert again.reused_chunks == seen[-1].chunks_total
+
+
+def test_a_pause_on_the_last_piece_holds_before_packaging(tmp_path: Path) -> None:
+    control = ConversionControl()
+    stages: list[str] = []
+
+    def pause_on_the_last_piece(p: ConversionProgress) -> None:
+        stages.append(p.stage)
+        if p.stage == "voicing" and p.chunks_done == p.chunks_total:
+            control.pause()
+
+    worker = threading.Thread(
+        target=convert_book,
+        args=(_book(), FakeEngine(), tmp_path / "b.m4b"),
+        kwargs={"workdir": tmp_path / "w", "control": control, "progress": pause_on_the_last_piece},
+    )
+    worker.start()
+    time.sleep(0.5)
+    assert "packaging" not in stages and not (tmp_path / "b.m4b").exists()
+    control.resume()
+    worker.join(timeout=30)
+    assert (tmp_path / "b.m4b").is_file()
+
+
+def test_cancel_and_pause_do_nothing_once_packaging_has_begun(tmp_path: Path) -> None:
+    control = ConversionControl()
+    answers: list[tuple[bool, bool]] = []
+
+    def try_to_stop(p: ConversionProgress) -> None:
+        if p.stage == "packaging":
+            answers.append((control.cancel(), control.pause()))
+
+    convert_book(_book(), FakeEngine(), tmp_path / "b.m4b", workdir=tmp_path / "w",
+                 progress=try_to_stop, control=control)  # fmt: skip
+
+    assert answers == [(False, False)]  # refused, so nobody is told "Stopped"
+    assert control.committed and not control.cancelled and not control.paused
+    assert (tmp_path / "b.m4b").is_file()
+
+
+# --- Never overwriting ----------------------------------------------------------------------
+
+
+def test_overwrite_false_gives_way_to_a_file_that_appears_meanwhile(tmp_path: Path) -> None:
+    target = tmp_path / "b.m4b"
+
+    def someone_saves_a_file(p: ConversionProgress) -> None:
+        if p.stage == "packaging":
+            target.write_bytes(b"not ours")
+
+    result = convert_book(_book(), FakeEngine(), target, workdir=tmp_path / "w",
+                          progress=someone_saves_a_file, overwrite=False)  # fmt: skip
+
+    assert result.output == tmp_path / "b (2).m4b"
+    assert target.read_bytes() == b"not ours"
+    assert _chapter_titles(result.output) == ["Chapter One", "Chapter Two"]
+
+
+def test_overwrite_is_the_default_and_the_result_names_the_file(tmp_path: Path) -> None:
+    target = tmp_path / "b.m4b"
+    target.write_bytes(b"old")
+
+    result = convert_book(_book(), FakeEngine(), target, workdir=tmp_path / "w")
+
+    assert result.output == target
+    assert _chapter_titles(target) == ["Chapter One", "Chapter Two"]
+
+
+# --- Choosing chapters ----------------------------------------------------------------------
+
+
+def _four_chapters() -> Book:
+    return Book(
+        title="Four",
+        authors=("Ada Writer",),
+        language="en",
+        chapters=(
+            Chapter("Contents", ("Part one. Part two. Part three.",)),
+            Chapter("Preface", ("Why this book exists. It is short.",)),
+            Chapter("The Start", ("It began. Then it went on, and on, and on past the limit.",
+                                  "A second paragraph for the start.")),
+            Chapter("The End", ("It ended. Everyone went home, tired but glad.",)),
+        ),
+    )  # fmt: skip
+
+
+def _source_text(book: Book, indices: list[int]) -> str:
+    return "".join(
+        "".join(p.split()) for i in indices for p in book.chapters[i].spoken_paragraphs()
+    )
+
+
+def test_a_window_style_run_reuses_the_chunks_of_a_full_run(tmp_path: Path) -> None:
+    book = _four_chapters()
+    workdir = tmp_path / "w"
+    convert_book(book, FakeEngine(), tmp_path / "full.m4b", workdir=workdir)
+    files_after_full = sorted(p.name for p in (workdir / "chunks").iterdir())
+
+    engine = FakeEngine()
+    result = convert_book(book, engine, tmp_path / "some.m4b", workdir=workdir, chapters=[2, 3])
+
+    assert engine.texts == []  # nothing voiced again: the IDs match the full run's
+    assert result.reused_chunks == sum(
+        len(chunks) for chunks in plan_chunks(book, FakeEngine.max_chars, [2, 3])
+    )
+    assert sorted(p.name for p in (workdir / "chunks").iterdir()) == files_after_full
+
+
+def test_a_full_run_reuses_the_chunks_of_a_window_style_run(tmp_path: Path) -> None:
+    book = _four_chapters()
+    workdir = tmp_path / "w"
+    first = FakeEngine()
+    convert_book(book, first, tmp_path / "some.m4b", workdir=workdir, chapters=[2, 3])
+    second = FakeEngine()
+    convert_book(book, second, tmp_path / "full.m4b", workdir=workdir)
+
+    assert "".join("".join(t.split()) for t in first.texts + second.texts) == _source_text(
+        book, [2, 3, 0, 1]
+    )  # the later chapters once, then only the earlier ones: nothing voiced twice
+    assert not set(first.texts) & set(second.texts)
+
+
+def test_changing_the_ticks_voices_only_what_is_new(tmp_path: Path) -> None:
+    book = _four_chapters()
+    workdir = tmp_path / "w"
+    convert_book(book, FakeEngine(), tmp_path / "a.m4b", workdir=workdir, chapters=[1, 2, 3])
+
+    engine = FakeEngine()
+    convert_book(book, engine, tmp_path / "b.m4b", workdir=workdir, chapters=[0, 2, 3])
+
+    assert "".join("".join(t.split()) for t in engine.texts) == _source_text(book, [0])
+
+
+@pytest.mark.parametrize("selection", [[0], [2, 3], [1, 3], [3, 1, 3], [0, 1, 2, 3]])
+def test_every_sentence_of_every_selected_chapter_is_voiced(
+    tmp_path: Path, selection: list[int]
+) -> None:
+    book = _four_chapters()
+    engine = FakeEngine()
+    output = tmp_path / "b.m4b"
+
+    result = convert_book(book, engine, output, workdir=tmp_path / "w", chapters=selection)
+
+    chosen = sorted(set(selection))
+    assert "".join("".join(t.split()) for t in engine.texts) == _source_text(book, chosen)
+    for chunks, index in zip(plan_chunks(book, engine.max_chars, selection), chosen, strict=True):
+        verify_coverage(book.chapters[index].spoken_paragraphs(), chunks)
+        assert {chunk.chapter for chunk in chunks} == {index}  # IDs keep the book's numbering
+    titles = [book.chapters[i].title for i in chosen]
+    assert [c.title for c in result.chapters] == titles  # unselected chapters have no marker
+    assert _chapter_titles(output) == titles  # …in the file, in book order
+
+
+def test_unselected_chapters_make_no_audio(tmp_path: Path) -> None:
+    book = _four_chapters()
+    workdir = tmp_path / "w"
+    engine = FakeEngine()
+
+    convert_book(book, engine, tmp_path / "b.m4b", workdir=workdir, chapters=[2])
+
+    names = [p.name for p in (workdir / "chunks").iterdir()]
+    assert names and all(name.startswith("c002-") for name in names)
+    skipped = {"Contents", "Preface", "The End"}
+    assert not skipped & {t for t in engine.texts}
+
+
+def test_progress_counts_only_the_selected_chapters(tmp_path: Path) -> None:
+    seen: list[ConversionProgress] = []
+    book = _four_chapters()
+
+    convert_book(book, FakeEngine(), tmp_path / "b.m4b", workdir=tmp_path / "w",
+                 progress=seen.append, chapters=[1, 3])  # fmt: skip
+
+    expected = sum(len(c) for c in plan_chunks(book, FakeEngine.max_chars, [1, 3]))
+    assert seen[0].chunks_total == expected == seen[-1].chunks_done
+    assert {p.chapter_count for p in seen} == {2}
+    assert {p.chapter_index for p in seen} == {0, 1}  # positions among the chosen, not the book's
+
+
+def test_a_chapter_that_isnt_in_the_book_is_refused(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="no such chapter index 9"):
+        convert_book(_four_chapters(), FakeEngine(), tmp_path / "b.m4b", workdir=tmp_path / "w",
+                     chapters=[1, 9])  # fmt: skip

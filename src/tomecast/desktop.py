@@ -23,6 +23,10 @@ MARKER = "Name=Tomecast"
 _ICON_SOURCE = Path(__file__).parent / "gui" / "icons" / ICON_NAME
 
 
+class ForeignEntryError(RuntimeError):
+    """``tomecast.desktop`` exists and belongs to something else."""
+
+
 @dataclass(frozen=True)
 class Locations:
     """Where the launcher files go."""
@@ -54,8 +58,11 @@ def quote_exec(path: str) -> str:
     """Quote a program path for an ``Exec=`` line, per the Desktop Entry specification."""
     if not any(c in path for c in " \t\n\"'\\><~|&;$*?#()`"):
         return path.replace("%", "%%")
-    escaped = path.replace("\\", "\\\\").replace('"', '\\"').replace("`", "\\`")
-    escaped = escaped.replace("$", "\\$").replace("%", "%%")
+    # Two layers, in this order. First the quoting layer: inside double quotes, a backslash
+    # must precede ", `, $ and \. Then the string layer: every backslash in the file is
+    # written doubled. (So one literal backslash in the path ends up as four.)
+    quoted = "".join("\\" + c if c in '"`$\\' else c for c in path)
+    escaped = quoted.replace("\\", "\\\\").replace("%", "%%")
     return f'"{escaped}"'
 
 
@@ -70,7 +77,7 @@ def desktop_entry_text(executable: str) -> str:
         "GenericName=Audiobook maker",
         "Comment=Turn ebooks into audiobooks on this computer",
         f"Exec={program} gui %f",
-        f"TryExec={executable}",
+        f"TryExec={executable.replace(chr(92), chr(92) * 2)}",
         "Icon=tomecast",
         "Terminal=false",
         "Categories=AudioVideo;Audio;Office;",
@@ -91,6 +98,11 @@ def find_executable() -> str:
 def install() -> list[str]:
     """Write the entry and icon, refresh launcher caches, and describe what was done."""
     where = locations()
+    if where.entry.exists() and not is_ours(where.entry):
+        raise ForeignEntryError(
+            f"{where.entry} already exists and wasn't created by Tomecast, so it was left "
+            "alone. Move or remove it, then run this again."
+        )
     executable = find_executable()
     where.entry.parent.mkdir(parents=True, exist_ok=True)
     where.icon.parent.mkdir(parents=True, exist_ok=True)

@@ -15,7 +15,7 @@ from __future__ import annotations
 import hashlib
 import threading
 import wave
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Protocol
@@ -81,14 +81,18 @@ class ConversionCancelled(Exception):
 class ConversionControl:
     """Pause, resume and cancel a running conversion from another thread (the window).
 
-    :func:`convert_book` checks it before each chunk: while paused it waits, and once
-    cancelled it raises :class:`ConversionCancelled`. A chunk already being voiced finishes.
+    :func:`convert_book` checks it before each chunk and once more just before packaging:
+    while paused it waits, and once cancelled it raises :class:`ConversionCancelled`. A chunk
+    already being voiced finishes. Packaging itself can't be stopped: once it has begun
+    (:meth:`commit`), :meth:`cancel` and :meth:`pause` do nothing and say so.
     """
 
     def __init__(self) -> None:
         self._running = threading.Event()
         self._running.set()
         self._cancelled = threading.Event()
+        self._lock = threading.Lock()
+        self._committed = False
 
     @property
     def paused(self) -> bool:
@@ -98,15 +102,40 @@ class ConversionControl:
     def cancelled(self) -> bool:
         return self._cancelled.is_set()
 
-    def pause(self) -> None:
-        self._running.clear()
+    @property
+    def committed(self) -> bool:
+        """True once packaging has begun, which can no longer be paused or cancelled."""
+        return self._committed
+
+    def pause(self) -> bool:
+        """Pause before the next chunk. Returns False (doing nothing) once packaging began."""
+        with self._lock:
+            if self._committed:
+                return False
+            self._running.clear()
+            return True
 
     def resume(self) -> None:
         self._running.set()
 
-    def cancel(self) -> None:
-        self._cancelled.set()
-        self._running.set()  # wake a paused conversion so it can stop
+    def cancel(self) -> bool:
+        """Stop the conversion. Returns False (doing nothing) once packaging began, because
+        the audiobook is then written regardless."""
+        with self._lock:
+            if self._committed:
+                return False
+            self._cancelled.set()
+            self._running.set()  # wake a paused conversion so it can stop
+            return True
+
+    def commit(self) -> None:
+        """Called by :func:`convert_book` right after its last checkpoint, as packaging
+        begins: from here on the book is written, so cancelling is refused rather than
+        reported as a stop that never happened. Raises if cancelled in the meantime."""
+        with self._lock:
+            if self._cancelled.is_set():
+                raise ConversionCancelled
+            self._committed = True
 
     def checkpoint(self) -> None:
         """Wait while paused; raise :class:`ConversionCancelled` once cancelled."""
@@ -118,7 +147,8 @@ class ConversionControl:
 @dataclass(frozen=True, slots=True)
 class ConversionProgress:
     """Passed to the progress callback: once at the start, after every chunk, and once
-    more when packaging begins."""
+    more when packaging begins. ``chapter_index`` counts the chapters being voiced (the
+    selected ones), not the whole book."""
 
     chunks_done: int
     chunks_total: int
@@ -139,13 +169,31 @@ class ConversionResult:
     chapters: list[PackagedChapter]
     reused_chunks: int
     warnings: tuple[str, ...]
+    output: Path  # where the audiobook was written (not ``output`` if that name was taken)
 
 
-def plan_chunks(book: Book, max_chars: int) -> list[list[Chunk]]:
-    """Chunk every chapter of ``book`` (title first), one list per chapter."""
+def select_chapters(book: Book, chapters: Sequence[int] | None) -> list[int]:
+    """The indices into ``book.chapters`` to voice, in book order (``None`` means all)."""
+    if chapters is None:
+        return list(range(len(book.chapters)))
+    bad = [i for i in chapters if not 0 <= i < len(book.chapters)]
+    if bad:
+        raise ValueError(f"no such chapter index {bad[0]} (the book has {len(book.chapters)})")
+    return sorted(set(chapters))
+
+
+def plan_chunks(
+    book: Book, max_chars: int, chapters: Sequence[int] | None = None
+) -> list[list[Chunk]]:
+    """Chunk the chapters of ``book`` (title first), one list per chapter.
+
+    ``chapters`` picks which ones, by index into ``book.chapters`` (``None``: all). Chunk
+    IDs always carry the chapter's index in the *whole* book, so the same chapter has the
+    same chunk IDs (and so reusable audio) however the others are ticked.
+    """
     return [
-        chunk_paragraphs(index, chapter.spoken_paragraphs(), max_chars)
-        for index, chapter in enumerate(book.chapters)
+        chunk_paragraphs(index, book.chapters[index].spoken_paragraphs(), max_chars)
+        for index in select_chapters(book, chapters)
     ]
 
 
@@ -158,12 +206,23 @@ def convert_book(
     progress: ProgressCallback | None = None,
     control: ConversionControl | None = None,
     retries: int = 1,
+    chapters: Sequence[int] | None = None,
+    overwrite: bool = True,
 ) -> ConversionResult:
     """Voice ``book`` with ``engine`` and write an M4B audiobook to ``output``.
 
     Chunk audio is written to ``workdir``. Running again with the same ``workdir`` after an
     interruption reuses the chunks that were already voiced. ``control`` lets another thread
-    pause, resume or cancel the conversion between chunks.
+    pause, resume or cancel the conversion between chunks (and just before packaging).
+
+    ``chapters`` are the indices into ``book.chapters`` to voice (``None``: all). Chunk IDs
+    keep each chapter's index in the whole book, so a run with some chapters unticked reuses
+    the audio of a run with all of them, and the audiobook holds only the chosen chapters,
+    in book order.
+
+    ``overwrite=False`` never replaces an existing file: if ``output`` is taken, even by a
+    file that appeared while voicing, the book is written to "name (2).m4b" and so on. The
+    path used is in the result.
     """
     warnings: list[str] = []
     cover = book.cover
@@ -171,13 +230,14 @@ def convert_book(
         warnings.append("The book's cover image is damaged, so the audiobook has no cover.")
         cover = None
 
-    plan = plan_chunks(book, engine.max_chars)
+    selected = select_chapters(book, chapters)
+    plan = plan_chunks(book, engine.max_chars, selected)
     total = sum(len(chunks) for chunks in plan)
     chunk_dir = workdir / "chunks"
     chunk_dir.mkdir(parents=True, exist_ok=True)
 
     queue = [chunk for chunks in plan for chunk in chunks]
-    chapter_count = len(book.chapters)
+    chapter_count = len(selected)
 
     def report(done: int, chapter_index: int, seconds: float, stage: str = "voicing") -> None:
         if progress:
@@ -189,11 +249,12 @@ def convert_book(
                 )
             )  # fmt: skip
 
-    chapters: list[ChapterAudio] = []
+    audio: list[ChapterAudio] = []
     done = reused = 0
     audio_seconds = 0.0
     report(0, next((i for i, chunks in enumerate(plan) if chunks), 0), 0.0)
-    for chapter_index, (chapter, chunks) in enumerate(zip(book.chapters, plan, strict=True)):
+    for chapter_index, (book_index, chunks) in enumerate(zip(selected, plan, strict=True)):
+        chapter = book.chapters[book_index]
         if not chunks:
             continue
         segments: list[Path] = []
@@ -216,8 +277,13 @@ def convert_book(
             done += 1
             audio_seconds += wav_info(wav).seconds
             report(done, chapter_index, audio_seconds)
-        chapters.append(ChapterAudio(chapter.title, tuple(segments), tuple(gaps)))
+        audio.append(ChapterAudio(chapter.title, tuple(segments), tuple(gaps)))
 
+    # The last chance to stop: once packaging starts the book is written, so a cancel that
+    # comes later is refused (see ConversionControl.commit) instead of being reported as a stop.
+    if control:
+        control.checkpoint()
+        control.commit()
     report(done, max(0, chapter_count - 1), audio_seconds, stage="packaging")
 
     info = AudiobookInfo(
@@ -227,8 +293,8 @@ def convert_book(
         language=book.language,
         cover=cover,
     )
-    packaged = write_m4b(chapters, info, output, workdir=workdir)
-    return ConversionResult(packaged, reused, tuple(warnings))
+    packaged = write_m4b(audio, info, output, workdir=workdir, overwrite=overwrite)
+    return ConversionResult(packaged.chapters, reused, tuple(warnings), packaged.output)
 
 
 def _chunk_file_name(chunk: Chunk) -> str:

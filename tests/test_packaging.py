@@ -14,10 +14,12 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from fractions import Fraction
 from pathlib import Path
+from typing import Any
 
 import imageio_ffmpeg  # type: ignore[import-untyped]
 import pytest
 
+from tomecast import packaging
 from tomecast.book import Cover
 from tomecast.packaging import (
     AudiobookInfo,
@@ -232,7 +234,7 @@ def package(
     workdir = tmp_path / "work"
     output.parent.mkdir(exist_ok=True)
     packaged = write_m4b(chapters, info, output, workdir=workdir, bitrate=bitrate, ffmpeg=ffmpeg)
-    return Run(output, workdir, packaged)
+    return Run(output, workdir, packaged.chapters)
 
 
 @pytest.fixture(scope="module")
@@ -315,6 +317,78 @@ def test_replaces_an_existing_output(tmp_path: Path) -> None:
     run = package(tmp_path, [chapter(tmp_path, "Only", [(0.3, 0.1)])])
 
     assert len(probe(run.output).audio) == 1
+
+
+def test_no_overwrite_uses_the_wanted_name_when_it_is_free(tmp_path: Path) -> None:
+    output = tmp_path / "out" / "book.m4b"
+    output.parent.mkdir()
+    book = write_m4b(
+        [chapter(tmp_path, "Only", [(0.3, 0.1)])], INFO, output, workdir=tmp_path / "w",
+        overwrite=False,
+    )  # fmt: skip
+    assert book.output == output
+    assert [p.name for p in output.parent.iterdir()] == ["book.m4b"]
+
+
+def test_no_overwrite_moves_to_the_next_free_name_and_keeps_the_other_file(
+    tmp_path: Path,
+) -> None:
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "book.m4b").write_bytes(b"mine")
+    (out / "book (2).m4b").write_bytes(b"also mine")
+    book = write_m4b(
+        [chapter(tmp_path, "Only", [(0.3, 0.1)])], INFO, out / "book.m4b",
+        workdir=tmp_path / "w", overwrite=False,
+    )  # fmt: skip
+    assert book.output == out / "book (3).m4b"
+    assert (out / "book.m4b").read_bytes() == b"mine"
+    assert (out / "book (2).m4b").read_bytes() == b"also mine"
+    assert len(probe(book.output).audio) == 1
+    assert sorted(p.name for p in out.iterdir()) == ["book (2).m4b", "book (3).m4b", "book.m4b"]
+
+
+def test_no_overwrite_survives_a_file_appearing_while_encoding(tmp_path: Path) -> None:
+    """The name was free when the encode started, but taken by the time it finished."""
+    out = tmp_path / "out"
+    out.mkdir()
+    target = out / "book.m4b"
+    chapters = [chapter(tmp_path, "Only", [(0.3, 0.1)])]
+
+    real = packaging._encode
+
+    def encode_then_someone_saves(*args: Any, **kwargs: Any) -> None:
+        real(*args, **kwargs)
+        target.write_bytes(b"saved by someone else meanwhile")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(packaging, "_encode", encode_then_someone_saves)
+        book = write_m4b(chapters, INFO, target, workdir=tmp_path / "w", overwrite=False)
+
+    assert book.output == out / "book (2).m4b"
+    assert target.read_bytes() == b"saved by someone else meanwhile"
+    assert len(probe(book.output).audio) == 1
+
+
+def test_no_overwrite_without_hard_links_still_never_replaces(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "book.m4b").write_bytes(b"mine")
+
+    def no_links(src: object, dst: object) -> None:
+        raise PermissionError("hard links aren't supported here")
+
+    monkeypatch.setattr("os.link", no_links)
+    book = write_m4b(
+        [chapter(tmp_path, "Only", [(0.3, 0.1)])], INFO, out / "book.m4b",
+        workdir=tmp_path / "w", overwrite=False,
+    )  # fmt: skip
+    assert book.output == out / "book (2).m4b"
+    assert (out / "book.m4b").read_bytes() == b"mine"
+    assert len(probe(book.output).audio) == 1
+    assert sorted(p.name for p in out.iterdir()) == ["book (2).m4b", "book.m4b"]
 
 
 # --- Covers and titles --------------------------------------------------------------------

@@ -53,6 +53,9 @@ MIN_DEVICE_CELL = 4.5
 """Dots are never closer than this many *screen* pixels. Any closer and a dot is too few pixels
 to look round, so on a 1x screen the dots spread out a little instead of turning into specks."""
 
+MAX_ASPECT = 4
+"""The tallest an image is drawn, as a multiple of its width."""
+
 _IDENTITY = bytes(range(256))
 _CUTOFF_PERCENT = 2.0
 _SAMPLES_PER_CELL = 2
@@ -194,7 +197,9 @@ def render_dots(
         blank = QImage(1, 1, QImage.Format.Format_ARGB32)
         blank.fill(Qt.GlobalColor.transparent)
         return blank
-    height = max(1, round(width * source.height() / source.width()))
+    # A second guard (the cover provider already refuses extreme shapes): never draw taller
+    # than 4x the width, however thin the source is.
+    height = min(max(1, round(width * source.height() / source.width())), width * MAX_ASPECT)
     cell = effective_cell(cell, device_pixel_ratio)
 
     # Two samples per dot: sampling between them averages the whole cell under each dot.

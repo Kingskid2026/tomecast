@@ -23,7 +23,7 @@ from PySide6.QtCore import (
     QUrl,
     qInstallMessageHandler,
 )
-from PySide6.QtGui import QColor, QFontDatabase, QGuiApplication
+from PySide6.QtGui import QAccessible, QColor, QFontDatabase, QGuiApplication
 from PySide6.QtQml import QQmlApplicationEngine, QQmlError
 from PySide6.QtQuick import QQuickItem, QQuickWindow
 from PySide6.QtTest import QTest
@@ -617,7 +617,7 @@ def test_backend_property_list_matches_the_contract(backend: DemoBackend) -> Non
         "bookLoaded", "loading", "bookTitle", "bookAuthors", "coverSource", "artSource",
         "formatsLabel", "chapters", "skipFrontMatter", "selectionSummary",
         "voiceGroups", "voice", "voiceLabel", "speed", "previewText", "previewPlaying",
-        "previewAvailable", "stage", "downloadLabel", "chunksDone", "chunksTotal",
+        "previewAvailable", "downloadNote", "stage", "downloadLabel", "chunksDone", "chunksTotal",
         "chapterLabel", "timeLeft", "progressLabel", "speedLabel", "nowSpeaking", "paused",
         "outputPath", "audioLength", "doneSummary", "warnings",
     }  # fmt: skip
@@ -695,4 +695,110 @@ def test_drop_screen_while_a_book_is_read(app_window: Window, messages: Messages
     app_window.settle()
     assert app_window.text("dropTitle") == "READING THE BOOK…"
     assert app_window.get("chooseBookButton").property("enabled") is False
+    assert_clean(messages)
+
+
+# --- Pause and cancel by stage, Start while loading, the download note --------------------------
+
+
+def test_pause_is_only_for_voicing_and_cancel_not_for_packaging(
+    app_window: Window, messages: Messages
+) -> None:
+    app_window.show("converting")
+    pause, cancel = app_window.get("pauseButton"), app_window.get("cancelButton")
+    states = {}
+    for stage in ("downloading", "starting", "voicing", "packaging"):
+        app_window.backend.set_stage(stage)
+        app_window.settle()
+        states[stage] = (pause.property("enabled"), cancel.property("enabled"))
+    assert states == {
+        "downloading": (False, True),
+        "starting": (False, True),
+        "voicing": (True, True),
+        "packaging": (False, False),
+    }
+    assert "can't be paused or cancelled" in app_window.text("pauseNote")
+    assert_clean(messages)
+
+
+def test_clicking_a_disabled_pause_or_cancel_does_nothing(
+    app_window: Window, messages: Messages
+) -> None:
+    app_window.show("converting")
+    app_window.backend.set_stage("packaging")
+    app_window.settle()
+    app_window.backend.calls.clear()
+    app_window.click("pauseButton")
+    app_window.click("cancelButton")
+    assert app_window.backend.calls == []
+    assert app_window.backend.property("screen") == "converting"
+    assert_clean(messages)
+
+
+def test_a_paused_conversion_can_always_be_resumed(app_window: Window, messages: Messages) -> None:
+    app_window.show("converting")
+    app_window.click("pauseButton")
+    assert app_window.backend.property("paused") is True
+    assert app_window.get("pauseButton").property("enabled") is True
+    assert_clean(messages)
+
+
+def test_start_is_disabled_while_a_book_is_being_read(
+    app_window: Window, messages: Messages
+) -> None:
+    app_window.show("voice")
+    start = app_window.get("startConvertingButton")
+    assert start.property("enabled") is True
+    app_window.backend.set_loading(True)
+    app_window.settle()
+    assert start.property("enabled") is False
+    app_window.backend.set_loading(False)
+    app_window.settle()
+    assert start.property("enabled") is True
+    assert_clean(messages)
+
+
+def test_voice_screen_shows_what_start_will_download(
+    app_window: Window, messages: Messages
+) -> None:
+    app_window.show("voice")
+    note = app_window.get("downloadNote")
+    assert not note.isVisible()  # everything is installed: no note
+    app_window.backend.set_download_note("STARTING DOWNLOADS THE VOICE ONCE · 271 MB")
+    app_window.settle()
+    assert note.isVisible()
+    assert app_window.text("downloadNote") == "STARTING DOWNLOADS THE VOICE ONCE · 271 MB"
+    start = app_window.get("startConvertingButton")
+    # Right above Start converting, not somewhere else on the page.
+    assert note.mapToScene(QPointF(0, 0)).y() + note.height() <= start.mapToScene(QPointF(0, 0)).y()
+    app_window.backend.set_download_note("")
+    app_window.settle()
+    assert not note.isVisible()
+    assert_clean(messages)
+
+
+@pytest.mark.parametrize("width", [1200, 560, 400])
+def test_the_download_note_fits_at_every_width(
+    app_window: Window, messages: Messages, width: int
+) -> None:
+    app_window.window.resize(width, 700)
+    app_window.backend.set_download_note("STARTING DOWNLOADS THE VOICE ONCE · 271 MB")
+    page = app_window.show("voice")
+    app_window.settle()
+    assert page.property("contentWidth") == width  # nothing scrolls sideways
+    assert sticks_out(page, width) == []
+    assert_clean(messages)
+
+
+def test_an_untitled_section_has_a_readable_name(app_window: Window, messages: Messages) -> None:
+    model = app_window.backend.chapter_model
+    model.sections[3].title = "Untitled section"
+    model.dataChanged.emit(model.index(3), model.index(3))
+    app_window.show("chapters")
+    assert app_window.text("chapterTitle") != ""  # the rows still render
+    row = app_window.get("chapterRow3")
+    QAccessible.setActive(True)
+    interface = QAccessible.queryAccessibleInterface(row)
+    assert interface is not None
+    assert interface.text(QAccessible.Text.Name) == "Include untitled section"
     assert_clean(messages)

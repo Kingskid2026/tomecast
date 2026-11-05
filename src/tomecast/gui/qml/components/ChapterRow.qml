@@ -32,7 +32,7 @@ T.AbstractButton {
     focusPolicy: Qt.StrongFocus
     hoverEnabled: true
     Accessible.role: Accessible.CheckBox
-    Accessible.name: "Include " + title
+    Accessible.name: "Include " + (title === "Untitled section" ? "untitled section" : title)
     Accessible.description: wordsLabel + " words, " + minutesLabel
     Accessible.checkable: true
     Accessible.checked: selected

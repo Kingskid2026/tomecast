@@ -15,6 +15,7 @@ ART_PATH = Path(__file__).resolve().parent / "assets" / "cantoria.jpg"
 DEFAULT_WIDTH = 240
 _NAMES = ("cover", "cantoria")
 _THEMES = ("dark", "light")
+MAX_COVER_ASPECT = 4  # covers taller than 1:4 or wider than 4:1 count as no cover
 
 
 def _screen_scale() -> float:
@@ -31,6 +32,12 @@ def _transparent() -> QImage:
     return image
 
 
+def _reasonable_shape(image: QImage) -> bool:
+    """False for a sliver of an image (a 1x4000 'cover'), which would render enormous."""
+    width, height = image.width(), image.height()
+    return width * MAX_COVER_ASPECT >= height and height * MAX_COVER_ASPECT >= width
+
+
 class DotImageProvider(QQuickImageProvider):
     """Image provider for ``cover/<theme>`` and ``cantoria/<theme>`` (ignores a ``?n`` suffix)."""
 
@@ -44,6 +51,8 @@ class DotImageProvider(QQuickImageProvider):
     def set_cover(self, data: bytes | None) -> None:
         """Remember the book cover (image file bytes), or forget it with ``None``."""
         image = QImage.fromData(data) if data else QImage()
+        if image.isNull() or not _reasonable_shape(image):
+            image = QImage()
         with self._lock:
             self._cover = None if image.isNull() else image
             self._cache = {k: v for k, v in self._cache.items() if k[0] != "cover"}
@@ -66,11 +75,14 @@ class DotImageProvider(QQuickImageProvider):
             if cached is not None:
                 return cached
             source = self._source(name)
-            if source is None:
-                return _transparent()
-            image = render_dots(source, width, dark=theme == "dark", device_pixel_ratio=dpr)
-            self._cache[key] = image
-            return image
+        if source is None:
+            return _transparent()
+        # Render outside the lock, so a slow render never blocks set_cover on the GUI thread.
+        image = render_dots(source, width, dark=theme == "dark", device_pixel_ratio=dpr)
+        with self._lock:
+            if self._source(name) is source:  # not replaced while rendering
+                self._cache[key] = image
+        return image
 
     def _source(self, name: str) -> QImage | None:
         # Called with the lock held.

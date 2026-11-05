@@ -7,8 +7,8 @@ Slow work (reading a book, voicing a preview, converting) runs on the
 
 from __future__ import annotations
 
-import dataclasses
 import itertools
+import math
 import os
 import re
 import shutil
@@ -33,7 +33,7 @@ from PySide6.QtGui import QDesktopServices, QGuiApplication
 
 from tomecast.book import Book
 from tomecast.chunking import split_sentences
-from tomecast.downloads import Asset, data_dir
+from tomecast.downloads import Asset, data_dir, is_installed
 from tomecast.engines.audiocpp import (
     DEFAULT_VOICE,
     REQUIRED_ASSETS,
@@ -70,6 +70,7 @@ COMING_SOON = {
 }  # fmt: skip
 STOPPED_MESSAGE = "Stopped. Start again to continue where you left off."
 UNKNOWN_TIME = "--:--:--"
+DOWNLOAD_NOTE = "STARTING DOWNLOADS THE VOICE ONCE · {mb} MB"
 
 # Voice menu groups, and the order of voices in each (as in the maintainer's mockup).
 VOICE_GROUPS = (
@@ -227,6 +228,7 @@ class Backend(QObject):
     previewPlayingChanged = Signal()
     previewAvailableChanged = Signal()
 
+    downloadNoteChanged = Signal()
     stageChanged = Signal()
     downloadLabelChanged = Signal()
     chunksDoneChanged = Signal()
@@ -279,6 +281,8 @@ class Backend(QObject):
         self._playback: QProcess | None = None
         self._preview_cache: Path | None = None
         self._shut_down = False
+        self._assets = tuple(assets)
+        self._verified: dict[Path, tuple[int, int]] = {}  # file -> (size, mtime_ns) once hashed
 
         # App
         self._screen = "drop"
@@ -304,6 +308,7 @@ class Backend(QObject):
         self._speed = self._valid_speed(self._settings.value("speed", 1.0))
         self._previewText = ""
         self._previewPlaying = False
+        self._downloadNote = ""
         # Converting
         self._stage = "starting"
         self._downloadLabel = ""
@@ -401,6 +406,7 @@ class Backend(QObject):
     speed: float = _field(float, "speed", speedChanged)
     previewText: str = _field(str, "previewText", previewTextChanged)
     previewPlaying: bool = _field(bool, "previewPlaying", previewPlayingChanged)
+    downloadNote: str = _field(str, "downloadNote", downloadNoteChanged)
 
     def _get_preview_available(self) -> bool:
         return self._player is not None
@@ -552,7 +558,12 @@ class Backend(QObject):
     @Slot()
     def startConversion(self) -> None:
         """Write ``<book folder>/<book title>.m4b`` (never overwriting) on the worker."""
-        if self._screen == "converting" or self._book is None or self._book_path is None:
+        if (
+            self._screen == "converting"
+            or self._loading  # a book is being read: the result would replace this one
+            or self._book is None
+            or self._book_path is None
+        ):
             return
         rows = self._chapters.selected_rows()
         if not rows:
@@ -568,7 +579,9 @@ class Backend(QObject):
             return
         self._stop_preview()
         sections = self._chapters.sections
-        book = dataclasses.replace(self._book, chapters=tuple(sections[r].chapter for r in rows))
+        # The whole book plus the ticked indices, so chunk IDs (and the resume folder) are the
+        # same whichever sections are ticked, and match a run from the command line.
+        book = self._book
         output = unique_output(folder, self._book.title or self._book_path.stem)
         self._chapter_labels = [sections[r].label for r in rows]
         self._control = TimedControl()
@@ -579,8 +592,8 @@ class Backend(QObject):
         self._show("converting")
         self._jobRequested.emit(
             ConvertJob(
-                self._convert_job, book, self._book_path, output, self._voice, self._speed,
-                self._control,
+                self._convert_job, book, tuple(rows), self._book_path, output, self._voice,
+                self._speed, self._control,
             )
         )  # fmt: skip
 
@@ -588,8 +601,11 @@ class Backend(QObject):
 
     @Slot()
     def pauseConversion(self) -> None:
-        if self._control is not None:
-            self._control.pause()
+        """Pause before the next piece. Only while voicing: downloading and packaging can't
+        be paused."""
+        if self._control is None or self._stage != "voicing":
+            return
+        if self._control.pause():
             self._update("paused", True)
 
     @Slot()
@@ -600,10 +616,12 @@ class Backend(QObject):
 
     @Slot()
     def cancelConversion(self) -> None:
-        """Stop after the current sentence. The work is kept, so starting again resumes."""
-        if self._control is None:
+        """Stop after the current sentence. The work is kept, so starting again resumes.
+        Once packaging has begun the book is written regardless, so this does nothing."""
+        if self._control is None or self._stage == "packaging":
             return
-        self._control.cancel()
+        if not self._control.cancel():  # packaging began a moment ago
+            return
         self._end_conversion()
         self._update("errorMessage", STOPPED_MESSAGE)
         self._show("voice")
@@ -663,6 +681,11 @@ class Backend(QObject):
         if job != self._read_job:
             return
         self._read_job = None
+        if self._screen == "converting":
+            # A book finished reading while another is being converted. Drop it: showing
+            # it would strand the conversion that is running.
+            self._update("loading", False)
+            return
         self._book = book
         self._book_path = self._read_path
         self._chapters.set_book(book, skip_front_matter=self._skipFrontMatter)
@@ -685,6 +708,8 @@ class Backend(QObject):
     def _on_stage(self, job: int, stage: str) -> None:
         if job == self._convert_job:
             self._update("stage", stage)
+            if stage != "downloading":
+                self._refresh_download_note()  # the downloads (if any) just finished
 
     @Slot(int, str)
     def _on_download_progress(self, job: int, label: str) -> None:
@@ -716,7 +741,7 @@ class Backend(QObject):
         if result.speedup is not None:
             self._measured(result.speedup)
         chapters = f"{result.chapters} CHAPTER{'' if result.chapters == 1 else 'S'}"
-        self._update("outputPath", str(result.output))
+        self._update("outputPath", str(result.output))  # the name actually used
         self._update("audioLength", _length(result.audio_seconds))
         self._update(
             "doneSummary",
@@ -754,7 +779,38 @@ class Backend(QObject):
     def _show(self, screen: str) -> None:
         if screen != "voice":
             self._stop_preview()
+        else:
+            self._refresh_download_note()
         self._update("screen", screen)
+
+    def _refresh_download_note(self) -> None:
+        """Say what Start will download: nothing when every required file is installed."""
+        missing = [a for a in self._assets if not self._installed(a)]
+        if not missing:
+            self._update("downloadNote", "")
+            return
+        mb = math.ceil(sum(asset.size for asset in missing) / 1_000_000)
+        self._update("downloadNote", DOWNLOAD_NOTE.format(mb=f"{mb:,}"))
+
+    def _installed(self, asset: Asset) -> bool:
+        """``is_installed``, but a plain file that was already hashed isn't hashed again until
+        its size or modification time changes (the voice model is large)."""
+        path = self._data_root / asset.path
+        try:
+            stat = path.stat()
+        except OSError:
+            self._verified.pop(path, None)
+            return is_installed(asset, self._data_root)
+        if asset.archive:
+            return is_installed(asset, self._data_root)  # reads one small marker file
+        stamp = (stat.st_size, stat.st_mtime_ns)
+        if self._verified.get(path) == stamp:
+            return True
+        if is_installed(asset, self._data_root):
+            self._verified[path] = stamp
+            return True
+        self._verified.pop(path, None)
+        return False
 
     @Slot()
     def _update_theme(self) -> None:

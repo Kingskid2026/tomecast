@@ -6,6 +6,7 @@ import array
 import hashlib
 import json
 import math
+import os
 import re
 import shutil
 import sys
@@ -160,9 +161,17 @@ MakeBackend = Callable[..., Backend]
 
 
 @pytest.fixture
-def make_backend(qtbot: QtBot, tmp_path: Path) -> Iterator[MakeBackend]:
+def make_backend(
+    qtbot: QtBot, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[MakeBackend]:
     """Build Backends with a fake engine, no downloads, a temp data folder and settings file."""
     made: list[Backend] = []
+    # Never run the real `gsettings` (it would read the developer's desktop settings).
+    monkeypatch.setattr(
+        backend_module,
+        "system_reduce_motion",
+        lambda: os.environ.get("TOMECAST_REDUCE_MOTION") == "1",
+    )
 
     def make(
         engines: Engines | None = None,
@@ -841,3 +850,411 @@ def test_shutdown_cancels_a_running_conversion_and_joins_the_thread(
     assert len(engines.texts) == 2
     assert not list(tmp_path.glob("*.m4b"))
     backend.shutdown()  # a second call does nothing
+
+
+# --- Untitled sections ------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("title", ["", "   ", "\n"])
+def test_a_section_without_a_title_is_called_untitled(title: str) -> None:
+    assert display_title(title) == "Untitled section"
+    model = ChapterModel()
+    book = Book("B", (), None, (Chapter(title, ("Some words here.",)), Chapter("Named", ("x",))))
+    model.set_book(book, skip_front_matter=False)
+    assert [row["title"] for row in _rows(model)] == ["Untitled section", "Named"]
+    assert model.sections[0].label == "UNTITLED SECTION"  # the converting screen's label
+
+
+# --- Pause and cancel by stage -----------------------------------------------------------------
+
+
+class SlowPackaging:
+    """Wraps ``convert.write_m4b`` so a test can act while the audiobook is being packaged."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from tomecast.packaging import write_m4b as real
+
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.before: Callable[[], None] | None = None  # runs just before packaging
+
+        def slow(*args: object, **kwargs: object) -> object:
+            if self.before is not None:
+                self.before()
+            self.entered.set()
+            self.release.wait(timeout=10)
+            return real(*args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr("tomecast.convert.write_m4b", slow)
+
+
+def test_cancel_and_pause_do_nothing_while_packaging(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    packaging = SlowPackaging(monkeypatch)
+    backend = make_backend()
+    _open(qtbot, backend, _short_book(tmp_path))
+    backend.goTo("voice")
+    backend.startConversion()
+    qtbot.waitUntil(lambda: backend.stage == "packaging")
+
+    backend.cancelConversion()
+    backend.pauseConversion()
+
+    assert backend.screen == "converting"  # not "Stopped"
+    assert backend.errorMessage == ""
+    assert backend.paused is False
+    packaging.release.set()
+    qtbot.waitUntil(lambda: backend.screen == "done", timeout=CONVERSION_TIMEOUT)
+    assert backend.errorMessage == ""
+    assert (tmp_path / "Short Book.m4b").is_file()  # and the book really was written
+
+
+def test_a_cancel_that_arrives_after_packaging_began_is_refused(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The window still shows "voicing" (the stage message is on its way), but the worker has
+    already committed to packaging: Cancel must not claim to have stopped anything."""
+    packaging = SlowPackaging(monkeypatch)
+    backend = make_backend()
+    _open(qtbot, backend, _short_book(tmp_path))
+    backend.goTo("voice")
+    backend.startConversion()
+    qtbot.waitUntil(packaging.entered.is_set)
+    backend._update("stage", "voicing")  # the window hasn't heard about packaging yet
+
+    backend.cancelConversion()
+    backend.pauseConversion()
+
+    assert backend.screen == "converting"
+    assert backend.errorMessage == ""
+    assert backend.paused is False
+    packaging.release.set()
+    qtbot.waitUntil(lambda: backend.screen == "done", timeout=CONVERSION_TIMEOUT)
+    assert (tmp_path / "Short Book.m4b").is_file()
+
+
+def test_cancelling_on_the_last_piece_writes_nothing(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    engines = Engines()
+    backend = make_backend(engines)
+    _open(qtbot, backend, _short_book(tmp_path))
+    backend.goTo("voice")
+    total = sum(1 for _ in _speakable_texts(backend))
+    engines.block_at = total
+    backend.startConversion()
+    qtbot.waitUntil(engines.blocked.is_set)
+
+    backend.cancelConversion()
+    engines.release.set()  # the last piece finishes; the checkpoint before packaging stops it
+    qtbot.waitUntil(lambda: bool(engines.made) and engines.made[0].closed)
+
+    assert backend.screen == "voice"
+    assert backend.errorMessage == STOPPED_MESSAGE
+    assert not list(tmp_path.glob("*.m4b"))
+    assert not list(tmp_path.glob(".*.partial.m4b"))
+
+
+def _speakable_texts(backend: Backend) -> list[str]:
+    book = backend._book
+    assert book is not None
+    return [
+        chunk.text
+        for chunks in plan_chunks(book, FakeEngine.max_chars)
+        for chunk in chunks
+        if chunk.speakable
+    ]
+
+
+def test_pause_works_only_while_voicing(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    release = threading.Event()
+    entered = threading.Event()
+    from tomecast.downloads import ensure as real_ensure
+
+    def slow_ensure(*args: object, **kwargs: object) -> object:
+        entered.set()
+        release.wait(timeout=10)
+        return real_ensure(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("tomecast.gui.worker.ensure", slow_ensure)
+    asset = _test_asset(tmp_path, "model.bin", b"model weights")
+    backend = make_backend(assets=(asset,))
+    _open(qtbot, backend, _short_book(tmp_path))
+    backend.goTo("voice")
+    backend.startConversion()
+    qtbot.waitUntil(lambda: entered.is_set() and backend.stage == "downloading")
+
+    backend.pauseConversion()
+
+    assert backend.paused is False  # nothing to pause between pieces yet
+    assert _control(backend).paused is False
+    release.set()
+    qtbot.waitUntil(lambda: backend.screen == "done", timeout=CONVERSION_TIMEOUT)
+
+
+# --- A book finishing its read during a conversion -----------------------------------------------
+
+
+def test_start_waits_while_another_book_is_being_read(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    engines = Engines()
+    backend = make_backend(engines)
+    _open(qtbot, backend, _short_book(tmp_path))
+    backend.goTo("voice")
+    other = _book_with_front_matter(tmp_path)
+
+    backend.openBook(_url(other))
+    assert backend.loading is True
+    backend.startConversion()
+
+    assert backend.screen == "voice"  # Start did nothing: the read would replace this book
+    assert backend._control is None
+
+    qtbot.waitUntil(lambda: backend.screen == "chapters")
+    assert backend.bookTitle == "Test Book"
+    assert engines.made == []
+
+
+def test_a_book_read_finishing_mid_conversion_is_dropped(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    engines = Engines()
+    engines.block_at = 2
+    backend = make_backend(engines)
+    _open(qtbot, backend, _short_book(tmp_path))
+    backend.goTo("voice")
+    backend.startConversion()
+    qtbot.waitUntil(engines.blocked.is_set)
+    control = _control(backend)
+
+    # A read that was still running when Start was pressed now finishes.
+    stranger = Book("Stranger", ("Z",), None, (Chapter("Elsewhere", ("Not this one.",)),))
+    backend._read_job = 99
+    backend._update("loading", True)
+    backend._worker.bookRead.emit(99, stranger)
+    qtbot.waitUntil(lambda: not backend.loading)
+
+    assert backend.screen == "converting"  # the conversion is not stranded…
+    assert backend.bookTitle == "Short Book"  # …and the other book was not taken over
+    assert backend.chapters.rowCount() == 2
+    assert backend._control is control
+
+    backend.cancelConversion()  # still cancellable
+    assert backend.screen == "voice"
+    assert backend.errorMessage == STOPPED_MESSAGE
+    assert control.cancelled
+    engines.release.set()
+    qtbot.waitUntil(lambda: bool(engines.made) and engines.made[0].closed)
+
+
+def test_shutdown_after_a_dropped_read_does_not_wait_for_the_conversion(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    engines = Engines()
+    engines.block_at = 2
+    backend = make_backend(engines)
+    _open(qtbot, backend, _short_book(tmp_path))
+    backend.goTo("voice")
+    backend.startConversion()
+    qtbot.waitUntil(engines.blocked.is_set)
+    control = _control(backend)
+    backend._read_job = 99
+    backend._worker.bookRead.emit(99, Book("Stranger", ("Z",), None, ()))
+
+    engines.release.set()
+    backend.shutdown()
+
+    assert control.cancelled
+    assert backend.worker_thread.isFinished()
+    assert len(engines.texts) == 2  # it stopped after the piece in progress, not at the end
+    assert not list(tmp_path.glob("*.m4b"))
+
+
+# --- Chapter ticks and resuming -------------------------------------------------------------------
+
+
+def test_untick_after_a_cancel_keeps_the_chunks_already_voiced(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    """Chunk IDs use the book's own chapter numbers, so unticking an earlier section between
+    two runs doesn't make the later ones voice again."""
+    engines = Engines()
+    engines.block_at = 7  # the 7th piece is chapter 2's first sentence
+    backend = make_backend(engines)
+    _open(qtbot, backend, _short_book(tmp_path))
+    backend.goTo("voice")
+    backend.startConversion()
+    qtbot.waitUntil(engines.blocked.is_set)
+    backend.cancelConversion()
+    engines.release.set()
+    qtbot.waitUntil(lambda: bool(engines.made) and engines.made[0].closed)
+    first_run = list(engines.texts)
+    assert first_run[-1] == "Morning came."
+
+    backend.goTo("chapters")
+    backend.setChapterSelected(0, False)
+    backend.goTo("voice")
+    backend.startConversion()
+    qtbot.waitUntil(lambda: backend.screen == "done", timeout=CONVERSION_TIMEOUT)
+
+    second_run = engines.texts[len(first_run) :]
+    assert second_run == ["The birds sang.", "Everyone woke up at last."]
+    book = backend._book
+    assert book is not None
+    chapter_two = [c.text for c in plan_chunks(book, FakeEngine.max_chars, [1])[0]]
+    assert chapter_two == ["Chapter 2", "Morning came.", "The birds sang.",
+                           "Everyone woke up at last."]  # fmt: skip
+    # Every sentence of the ticked section was voiced, once, across the two runs.
+    assert [t for t in engines.texts if t in chapter_two] == chapter_two
+    assert backend.doneSummary.startswith("OF AUDIO · 1 CHAPTER · ")
+    assert (tmp_path / "Short Book.m4b").is_file()
+
+
+def test_the_window_passes_the_whole_book_and_the_ticked_indices(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    engines = Engines()
+    engines.block_at = 1
+    backend = make_backend(engines)
+    _open(qtbot, backend, _book_with_front_matter(tmp_path))  # rows 2, 3, 4 are ticked
+    jobs: list[object] = []
+    backend._jobRequested.connect(jobs.append)
+
+    backend.goTo("voice")
+    backend.startConversion()
+    qtbot.waitUntil(engines.blocked.is_set)
+
+    job = jobs[-1]
+    assert job.chapters == (2, 3, 4)  # type: ignore[attr-defined]
+    assert len(job.book.chapters) == 5  # type: ignore[attr-defined]
+    engines.release.set()
+    backend.cancelConversion()
+
+
+# --- Never overwriting, even later ---------------------------------------------------------------
+
+
+def test_a_file_that_appears_while_converting_is_not_overwritten(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    taken = tmp_path / "Short Book.m4b"
+    packaging = SlowPackaging(monkeypatch)
+
+    def someone_saves_a_file() -> None:
+        taken.write_bytes(b"saved after Start was pressed")
+
+    packaging.before = someone_saves_a_file
+    packaging.release.set()
+    backend = make_backend()
+    _open(qtbot, backend, _short_book(tmp_path))
+    assert not taken.exists()  # free when Start is pressed
+
+    _convert(qtbot, backend)
+
+    assert backend.screen == "done", backend.errorMessage
+    assert backend.outputPath == str(tmp_path / "Short Book (2).m4b")
+    assert (tmp_path / "Short Book (2).m4b").is_file()
+    assert taken.read_bytes() == b"saved after Start was pressed"
+    assert backend.doneSummary.startswith("OF AUDIO · 2 CHAPTERS")
+
+
+# --- What Start will download -------------------------------------------------------------
+
+
+def _test_asset(folder: Path, name: str, content: bytes, size: int | None = None) -> Asset:
+    source = folder / "source" / name
+    source.parent.mkdir(exist_ok=True)
+    source.write_bytes(content)
+    return Asset(
+        name=f"Test {name}",
+        url=source.as_uri(),
+        sha256=hashlib.sha256(content).hexdigest(),
+        size=len(content) if size is None else size,
+        path=f"models/{name}",
+    )
+
+
+def _install(asset: Asset, root: Path, content: bytes) -> None:
+    target = root / asset.path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(content)
+
+
+def test_download_note_says_what_start_will_download(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    engine_asset = _test_asset(tmp_path, "engine.bin", b"engine", size=1_500_000)
+    voice_asset = _test_asset(tmp_path, "voice.bin", b"voice", size=270_000_001)
+    backend = make_backend(assets=(engine_asset, voice_asset))
+    _open(qtbot, backend, _short_book(tmp_path))
+    notes: list[str] = []
+    backend.downloadNoteChanged.connect(lambda: notes.append(backend.downloadNote))
+
+    backend.goTo("voice")  # nothing installed: both are missing (1.5 + 270.000001, rounded up)
+    assert backend.downloadNote == "STARTING DOWNLOADS THE VOICE ONCE · 272 MB"
+
+    backend.goTo("chapters")
+    _install(engine_asset, tmp_path / "data", b"engine")
+    backend.goTo("voice")  # only the missing voice counts
+    assert backend.downloadNote == "STARTING DOWNLOADS THE VOICE ONCE · 271 MB"
+
+    backend.goTo("chapters")
+    _install(voice_asset, tmp_path / "data", b"a damaged file")  # wrong checksum: still missing
+    backend.goTo("voice")
+    assert backend.downloadNote == "STARTING DOWNLOADS THE VOICE ONCE · 271 MB"
+
+    backend.goTo("chapters")
+    _install(voice_asset, tmp_path / "data", b"voice")
+    backend.goTo("voice")  # everything is installed
+    assert backend.downloadNote == ""
+    assert notes == [
+        "STARTING DOWNLOADS THE VOICE ONCE · 272 MB",
+        "STARTING DOWNLOADS THE VOICE ONCE · 271 MB",
+        "",
+    ]
+
+
+def test_download_note_clears_after_the_downloads_finish(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    asset = _test_asset(tmp_path, "model.bin", b"model weights", size=80_000_000)
+    backend = make_backend(assets=(asset,))
+    _open(qtbot, backend, _short_book(tmp_path))
+    backend.goTo("voice")
+    assert backend.downloadNote == "STARTING DOWNLOADS THE VOICE ONCE · 80 MB"
+    notes: list[str] = []
+    backend.downloadNoteChanged.connect(lambda: notes.append(backend.downloadNote))
+
+    backend.startConversion()
+    qtbot.waitUntil(lambda: backend.stage not in ("downloading", "starting") or bool(notes))
+
+    assert notes == [""]  # cleared once the files were in, while the conversion carries on
+    assert backend.downloadNote == ""
+    qtbot.waitUntil(lambda: backend.screen == "done", timeout=CONVERSION_TIMEOUT)
+    assert backend.downloadNote == ""
+
+
+def test_download_note_is_back_after_a_failed_download(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    asset = _test_asset(tmp_path, "model.bin", b"model weights", size=2_000_000)
+    (tmp_path / "source" / "model.bin").write_bytes(b"changed on the server")  # bad checksum
+    backend = make_backend(assets=(asset,))
+    _open(qtbot, backend, _short_book(tmp_path))
+    backend.goTo("voice")
+
+    backend.startConversion()
+    qtbot.waitUntil(lambda: backend.screen == "voice" and bool(backend.errorMessage))
+
+    assert backend.downloadNote == "STARTING DOWNLOADS THE VOICE ONCE · 2 MB"
+
+
+def test_no_assets_means_no_note(qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path) -> None:
+    backend = make_backend()
+    _open(qtbot, backend, _short_book(tmp_path))
+    backend.goTo("voice")
+    assert backend.downloadNote == ""

@@ -8,3 +8,5 @@ import os
 
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 os.environ["QT_QUICK_BACKEND"] = "software"
+# The desktop's Qt theme plugin could otherwise leak its colour scheme into the tests.
+os.environ["QT_QPA_PLATFORMTHEME"] = ""

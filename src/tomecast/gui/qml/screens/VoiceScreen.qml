@@ -174,17 +174,41 @@ ScreenPage {
         Layout.fillWidth: true
         title: "Voice"
 
-        PillButton {
-            objectName: "voiceBackButton"
-            text: "Back"
-            onClicked: Backend.goTo("chapters")
-        }
+        ColumnLayout {
+            spacing: 10
 
-        PillButton {
-            objectName: "startConvertingButton"
-            variant: "filled"
-            text: "Start converting"
-            onClicked: Backend.startConversion()
+            // What Start will download, if anything (the first time only).
+            MonoLabel {
+                objectName: "downloadNote"
+                Layout.alignment: Qt.AlignRight
+                Layout.fillWidth: true
+                Layout.maximumWidth: page.innerWidth
+                visible: Backend.downloadNote !== ""
+                text: Backend.downloadNote
+                size: 10
+                tracking: 0.12
+                horizontalAlignment: Text.AlignRight
+                wrapMode: Text.Wrap
+            }
+
+            RowLayout {
+                Layout.alignment: Qt.AlignRight
+                spacing: 10
+
+                PillButton {
+                    objectName: "voiceBackButton"
+                    text: "Back"
+                    onClicked: Backend.goTo("chapters")
+                }
+
+                PillButton {
+                    objectName: "startConvertingButton"
+                    variant: "filled"
+                    text: "Start converting"
+                    enabled: !Backend.loading
+                    onClicked: Backend.startConversion()
+                }
+            }
         }
     }
 

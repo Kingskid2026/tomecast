@@ -159,7 +159,7 @@ def _desktop_entry(args: argparse.Namespace) -> int:
 
     try:
         messages = desktop.install() if args.action == "install" else desktop.uninstall()
-    except OSError as error:
+    except (OSError, desktop.ForeignEntryError) as error:
         raise CliError(str(error)) from error
     print("\n".join(messages))
     return 0

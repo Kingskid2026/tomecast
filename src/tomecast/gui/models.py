@@ -66,13 +66,18 @@ def is_numbered_chapter(title: str) -> bool:
     return bool(_NUMBERED_HEADING.match(title) or _BARE_NUMBER.match(title))
 
 
+UNTITLED = "Untitled section"
+"""What a section with no title is called in the window."""
+
+
 def display_title(title: str) -> str:
-    """The title without a leading "Chapter N.": the window shows chapter titles only."""
+    """The title without a leading "Chapter N.": the window shows chapter titles only.
+    A section with no title is called "Untitled section"."""
     for prefix in (_CHAPTER_PREFIX, _BARE_PREFIX):
         stripped = prefix.sub("", title, count=1)
         if stripped != title:
-            return stripped.strip()
-    return title.strip()
+            return stripped.strip() or UNTITLED
+    return title.strip() or UNTITLED
 
 
 def word_count(chapter: Chapter) -> int:

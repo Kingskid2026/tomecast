@@ -59,7 +59,8 @@ def test_path_with_spaces_is_quoted() -> None:
 
 
 def test_special_characters_in_exec_are_escaped() -> None:
-    assert desktop.quote_exec('/x/a"b$c') == '"/x/a\\"b\\$c"'
+    # Quoting layer (\" \$), then the string layer doubles each backslash.
+    assert desktop.quote_exec('/x/a"b$c') == r'"/x/a\\"b\\$c"'
     assert desktop.quote_exec("/x/100%") == "/x/100%%"
 
 
@@ -137,3 +138,54 @@ def test_icon_is_a_clean_svg() -> None:
     assert "PLACEHOLDER" in text
     assert "<script" not in text
     assert "http" not in text.replace("http://www.w3.org/2000/svg", "")
+
+
+NASTY_PATHS = ['/x/a"b', "/x/a`b", "/x/a$b", "/x/a\\b", '/x/$HOME/"q"/`id`/\\n a b', "/x/100%/y"]
+
+
+@pytest.mark.parametrize("path", [p for p in NASTY_PATHS if "%" not in p])
+def test_exec_quoting_matches_the_two_layer_spec(path: str) -> None:
+    quoted = desktop.quote_exec(path)
+    expected = "".join("\\" + c if c in '"`$\\' else c for c in path)
+    expected = expected.replace("\\", "\\\\").replace("%", "%%")
+    assert quoted == f'"{expected}"'
+
+
+@pytest.mark.parametrize("path", NASTY_PATHS)
+def test_exec_round_trips_through_glib(path: str) -> None:
+    glib = pytest.importorskip("gi.repository.GLib")
+    line = next(
+        entry_line
+        for entry_line in desktop.desktop_entry_text(path).splitlines()
+        if entry_line.startswith("Exec=")
+    )
+    # Undo the string layer (a doubled backslash is one), and %% is a literal %.
+    value = line.removeprefix("Exec=").replace("\\\\", "\\").replace("%%", "%")
+    assert glib.shell_parse_argv(value)[1] == [path, "gui", "%f"]
+
+
+@pytest.mark.parametrize("path", NASTY_PATHS)
+def test_nasty_paths_pass_desktop_file_validate(path: str, tmp_path: Path) -> None:
+    validator = shutil.which("desktop-file-validate")
+    if validator is None:
+        pytest.skip("desktop-file-validate isn't installed")
+    entry = tmp_path / "tomecast.desktop"
+    entry.write_text(desktop.desktop_entry_text(path))
+    result = subprocess.run([validator, str(entry)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_install_refuses_to_overwrite_someone_elses_entry(data_home: Path) -> None:
+    entry = data_home / "applications" / "tomecast.desktop"
+    entry.parent.mkdir(parents=True)
+    entry.write_text("[Desktop Entry]\nName=Something else\n")
+    with pytest.raises(desktop.ForeignEntryError, match="already exists"):
+        desktop.install()
+    assert entry.read_text() == "[Desktop Entry]\nName=Something else\n"
+    assert not (data_home / "icons").exists()
+
+
+def test_install_updates_its_own_entry(data_home: Path) -> None:
+    desktop.install()
+    desktop.install()
+    assert desktop.is_ours(data_home / "applications" / "tomecast.desktop")
