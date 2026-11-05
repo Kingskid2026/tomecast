@@ -17,6 +17,7 @@ import ctypes
 import http.client
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -164,6 +165,12 @@ MAX_CHARS = 200
 _ESPEAK_PATH_LIMIT = 150  # bytes; eSpeak NG 1.52 has a 160-byte path buffer
 SAMPLE_RATE = 24_000  # Kokoro's output
 _MAX_RESTARTS = 2  # in a row, on the same text, before giving up
+# The port is picked free, then released for the engine to take, so on a busy machine another
+# program can grab it first. The engine then says so and exits; Tomecast tries a fresh port.
+_PORT_ATTEMPTS = 3
+_PORT_TAKEN = re.compile(
+    r"could not bind|failed to bind ip|failed to listen|address already in use", re.IGNORECASE
+)
 _PHONEME_LIMIT_MESSAGE = "exceeds 510"
 
 
@@ -405,9 +412,26 @@ class KokoroServer:
         return Path(self._tempdir.name) / "server.log"
 
     def _launch(self) -> None:
-        """Start the server process in the temp folder and wait until it's healthy."""
+        """Start the server process in the temp folder and wait until it's healthy.
+
+        If the port was taken in the moment between picking and binding it, try a new one.
+        """
+        for attempt in range(1, _PORT_ATTEMPTS + 1):
+            try:
+                self._launch_once()
+                return
+            except _PortTaken as taken:
+                self._process = None
+                if attempt == _PORT_ATTEMPTS:
+                    raise EngineError(
+                        "the voice engine couldn't get a free network port on this computer "
+                        f"after {_PORT_ATTEMPTS} tries:\n{taken}"
+                    ) from None
+
+    def _launch_once(self) -> None:
         assert self._tempdir is not None
         workdir = Path(self._tempdir.name)
+        log_start = self._log_path.stat().st_size if self._log_path.exists() else 0
         port = _free_port()
         self._base_url = f"http://127.0.0.1:{port}"
         config = workdir / "server.json"
@@ -424,6 +448,11 @@ class KokoroServer:
         deadline = time.monotonic() + self._startup_timeout
         while time.monotonic() < deadline:
             if self._process.poll() is not None:
+                with self._log_path.open("rb") as log_file:
+                    log_file.seek(log_start)
+                    this_start = log_file.read().decode("utf-8", "replace")
+                if _PORT_TAKEN.search(this_start):
+                    raise _PortTaken(this_start.strip()[-400:])
                 raise EngineError(
                     f"the voice engine stopped while starting:\n{_tail(self._log_path)}"
                 )
@@ -548,6 +577,10 @@ def _stop_with_parent() -> None:
     window must start the engine from a thread that lives as long as the conversion.
     """
     _PRCTL(_PR_SET_PDEATHSIG, signal.SIGTERM)
+
+
+class _PortTaken(Exception):
+    """The engine exited at startup because its port was already in use."""
 
 
 def _free_port() -> int:

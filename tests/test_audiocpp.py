@@ -433,3 +433,46 @@ def test_the_engine_build_follows_the_choice(tmp_path: Path) -> None:
     assert AUDIOCPP_CPU in required_assets(False)
     assert AUDIOCPP_VULKAN not in required_assets(False)
     assert AUDIOCPP_VULKAN.path == "engines/audiocpp-0.9.4-vulkan"
+
+
+def test_a_port_taken_at_startup_is_retried_on_a_fresh_one(
+    tmp_path: Path, fake_server: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import socket
+
+    # Another program holds the first port Tomecast picks, as happens on a busy machine.
+    blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    blocker.bind(("127.0.0.1", 0))
+    blocker.listen()
+    taken = blocker.getsockname()[1]
+    real_free_port = audiocpp._free_port
+    ports = iter([taken])
+    monkeypatch.setattr(audiocpp, "_free_port", lambda: next(ports, None) or real_free_port())
+    try:
+        with _server(tmp_path, fake_server) as engine:
+            engine.synthesize("Hello there.", tmp_path / "out.wav")
+    finally:
+        blocker.close()
+    assert wav_info(tmp_path / "out.wav").frames > 0
+    starts = [event for event in _events(tmp_path) if "config" in event]
+    first = starts[0]["config"]
+    assert isinstance(first, dict)
+    assert first["port"] == taken
+    assert len(starts) == 2  # the first start failed on the taken port; the second worked
+
+
+def test_a_port_that_stays_taken_gives_a_clear_error(
+    tmp_path: Path, fake_server: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import socket
+
+    blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    blocker.bind(("127.0.0.1", 0))
+    blocker.listen()
+    taken = blocker.getsockname()[1]
+    monkeypatch.setattr(audiocpp, "_free_port", lambda: taken)
+    try:
+        with pytest.raises(EngineError, match="couldn't get a free network port"):
+            _server(tmp_path, fake_server).start()
+    finally:
+        blocker.close()
