@@ -30,4 +30,6 @@ Run all four checks (ruff check, ruff format --check, mypy, pytest) before sayin
 - **No network in unit tests.** Mark integration tests that download things.
 - **Types:** everything is typed, and mypy runs in strict mode.
 - **Docs:** if a change alters the design, update `docs/architecture.md` in the same pull request.
+- **Visual design is the maintainer's:** the desktop window follows `docs/design.md`. Don't invent or restyle the look. Offer options, and let the maintainer choose.
+- **Release pull requests** (from release-please) get no CI runs, because GitHub doesn't run workflows on pull requests a bot opened. They only bump the version and changelog, so a maintainer merges them with the admin bypass (`gh pr merge N --squash --admin`). Never use the bypass for any other pull request.
 - **Licenses:** Tomecast is Apache 2.0. Don't add AGPL/GPL Python dependencies (for example, use `pypdfium2`, not PyMuPDF). When you add an engine or model, add it to `THIRD_PARTY.md`.

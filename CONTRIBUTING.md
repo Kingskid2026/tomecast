@@ -41,6 +41,7 @@ If your change affects audio, **listen to the result** and say what you checked 
 4. **Unit tests don't use the network.** Anything that downloads goes in a separately marked integration test.
 5. **Built-in voices only.** No cloning of real people's voices.
 6. **Keep the docs true.** If you change the design, update [docs/architecture.md](docs/architecture.md) in the same pull request.
+7. **The look is the maintainer's.** The desktop window follows [docs/design.md](docs/design.md). Visual ideas are welcome as suggestions in an issue.
 
 ## Commit messages
 
@@ -62,5 +63,7 @@ Maintainers don't tag releases by hand:
 1. Pull requests merge into `main` once CI passes.
 2. [release-please](https://github.com/googleapis/release-please) keeps an open "release" pull request that collects the changes and writes `CHANGELOG.md`.
 3. Merging that pull request creates the version tag and the GitHub release, then builds the package and publishes it to [PyPI](https://pypi.org/project/tomecast/) through Trusted Publishing, with no stored passwords.
+
+GitHub doesn't run CI on pull requests a bot opened, so the release pull request shows no checks. It only changes the version number and the changelog, made from code that already passed, so a maintainer merges it using the admin bypass on the `main` branch rules.
 
 Before a release, a maintainer runs the GPU checks on real hardware, because GitHub's CI machines have no graphics card.
