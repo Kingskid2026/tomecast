@@ -1,7 +1,8 @@
-// The frame every screen sits in: page padding, and either the screen's wide view (the
-// 1200 px mockups) or its compact view (the 400 x 600 corner-window mockups), whichever fits.
-// Only one view exists at a time. The page scrolls when the window is shorter than the view
-// needs, and keyboard focus scrolls into view.
+// The frame every screen sits in: page padding and the gap between sections. There is one
+// design; in a window 680 px wide or less (`narrow`) the padding, the gaps and the big numerals
+// shrink as in the mockups' narrow-window rules, and the screen's own rows reflow (they
+// stack where the mockup's flex rows wrap). The page scrolls vertically when the window is
+// shorter than the content needs, never sideways, and keyboard focus scrolls into view.
 import QtQuick
 import QtQuick.Controls.Basic as Controls
 import QtQuick.Layouts
@@ -10,21 +11,20 @@ import ".."
 Flickable {
     id: page
 
-    property Component wideView
-    property Component compactView
-    // Anything else (a FileDialog, say) can be declared inside the page.
+    // The screen's content goes into one column (the section gap apart). Anything else (a
+    // FileDialog, say) can be declared here too.
     default property alias content: column.data
-    readonly property Item view: viewLoader.item
 
-    // The corner-window layout, below Theme.compactBelow.
-    readonly property bool compact: width < Theme.compactBelow
-    property real topPadding: compact ? Theme.compactPadV : Theme.pageTop
-    property real bottomPadding: compact ? Theme.compactPadV : Theme.pageBottom
-    property real sidePadding: compact ? Theme.compactPadH : Theme.pageSide
-    // The height the approved mockup was drawn at (600 for the corner window); screenshots use
-    // max(designHeight, naturalHeight).
-    property int wideDesignHeight: 720
-    readonly property int designHeight: compact ? 600 : wideDesignHeight
+    // 680 px or less: the mockups' narrow rules.
+    readonly property bool narrow: width <= Theme.narrowMaxWidth
+    property real topPadding: narrow ? Theme.narrowPadTop : Theme.pageTop
+    property real bottomPadding: narrow ? Theme.narrowPadBottom : Theme.pageBottom
+    property real sidePadding: narrow ? Theme.narrowPadSide : Theme.pageSide
+    property real sectionGap: narrow ? Theme.narrowGap : Theme.sectionGap
+    // Doto numerals (time left, audio length): 67 px at every width, so its dots are 5 px.
+    readonly property int bigNumberSize: Theme.bigNumber
+    // The height the mockup was drawn at; screenshots use max(designHeight, naturalHeight).
+    property int designHeight: 720
     readonly property real naturalHeight: Math.ceil(column.implicitHeight + topPadding + bottomPadding)
     readonly property real innerWidth: Math.max(0, width - 2 * sidePadding)
 
@@ -44,6 +44,10 @@ Flickable {
             contentY = Math.min(contentHeight - height, bottom - height)
     }
 
+    // A page takes the room it is given; its content never asks for more (a Flickable's
+    // implicit size follows its content, which would pin the window's minimum width).
+    implicitWidth: 0
+    implicitHeight: 0
     contentWidth: width
     contentHeight: Math.max(height, naturalHeight)
     clip: true
@@ -74,13 +78,6 @@ Flickable {
         y: page.topPadding
         width: page.innerWidth
         height: page.contentHeight - page.topPadding - page.bottomPadding
-        spacing: 0
-
-        Loader {
-            id: viewLoader
-            Layout.fillWidth: true
-            Layout.fillHeight: true
-            sourceComponent: page.compact && page.compactView ? page.compactView : page.wideView
-        }
+        spacing: page.sectionGap
     }
 }

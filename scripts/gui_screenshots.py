@@ -1,11 +1,13 @@
 """Render every screen of the desktop window, in both themes, to PNG files, headless.
 
     uv run python scripts/gui_screenshots.py [--out local/screenshots] [--cover IMAGE]
+                                             [--width 1200 520]
 
 Uses the demo backend in ``tests/gui/demo_backend.py`` (Alice in Wonderland's real numbers),
 the bundled fonts, the real ``DotGrid`` and the ``dots`` image provider when they exist, and
-stand-ins when they don't. Each screen is drawn 1200 px wide at its own height (the taller of
-the mockup's height and what the content needs) to ``<out>/<screen>-<theme>.png``.
+stand-ins when they don't. Each screen is drawn at each width (default 1200 and 520; any width
+from 400 up) at its own height (the taller of the mockup's height and what the content needs) to
+``<out>/<screen>-<theme>-<width>.png``.
 Any QML warning or error fails the run, after every screen has been tried.
 """
 
@@ -19,10 +21,14 @@ import time
 from pathlib import Path
 from types import ModuleType
 
-# Always headless and at scale 1, even inside a desktop session that sets these.
+# Always headless, and at scale 1 unless --scale asks otherwise (1.6 shows what a fractionally
+# scaled screen sees), even inside a desktop session that sets these. Qt takes the scale from
+# the environment, so --scale is read here, before Qt starts.
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 os.environ["QT_QUICK_BACKEND"] = "software"
-os.environ["QT_SCALE_FACTOR"] = "1"
+os.environ["QT_SCALE_FACTOR"] = next(
+    (sys.argv[i + 2] for i, arg in enumerate(sys.argv[1:-1]) if arg == "--scale"), "1"
+)
 os.environ.pop("QT_SCREEN_SCALE_FACTORS", None)
 
 from PySide6.QtCore import (
@@ -45,7 +51,7 @@ DEFAULT_COVER = ROOT / "local" / "mockups" / "assets" / "alice-cover-src.png"
 DEFAULT_OUT = ROOT / "local" / "screenshots"
 SCREENS = ("drop", "chapters", "voice", "converting", "done")
 THEMES = ("dark", "light")
-WIDTH = 1200
+WIDTHS = (1200, 520)
 MIN_WIDTH = 400
 
 # Platform chatter that isn't about our QML.
@@ -130,7 +136,13 @@ def wait_for_images(app: QGuiApplication, root: QObject, timeout: float = 20.0) 
 
 def find_screen(window: QQuickWindow, screen: str) -> QQuickItem:
     # Items declared inside the ApplicationWindow are QObject children of the window itself.
-    page = window.findChild(QQuickItem, f"{screen}Screen")
+    # An unloaded screen lingers (invisible, parentless) until Qt deletes it: take the live one.
+    pages = [
+        item
+        for item in window.findChildren(QQuickItem, f"{screen}Screen")
+        if item.isVisible() and item.parentItem() is not None
+    ]
+    page = pages[0] if pages else None
     if page is None:
         raise SystemExit(f"The {screen} screen didn't load (no item named {screen}Screen)")
     return page
@@ -142,7 +154,7 @@ def render(
     backend: QObject,
     out: Path,
     problems: Problems,
-    width: int = WIDTH,
+    width: int,
 ) -> list[Path]:
     show = getattr(backend, "show")  # noqa: B009  (the demo module is loaded dynamically)
     written: list[Path] = []
@@ -152,21 +164,23 @@ def render(
             window.resize(width, window.height())
             settle(app)
             page = find_screen(window, screen)
-            # Lay out at the mockup's height first (600 for the corner window), then grow until
-            # the content fits.
+            # Lay out at the mockup's height first, then grow until the content fits.
             floor = int(page.property("designHeight"))
             height = floor
             for _ in range(6):
                 window.resize(width, height)
-                settle(app)
+                settle(app, 0.25)  # lists lay out their rows over a few frames
                 wait_for_images(app, window)
-                settle(app)
+                settle(app, 0.1)
+                window.grabWindow()  # a rendered frame runs the layout polish that's still due
+                settle(app, 0.05)
                 needed = max(floor, int(page.property("naturalHeight")))
                 if needed == height:
                     break
                 height = needed
-            suffix = "" if width == WIDTH else f"-{width}"
-            path = out / f"{screen}-{theme}{suffix}.png"
+            scale = os.environ["QT_SCALE_FACTOR"]
+            suffix = "" if float(scale) == 1 else f"@{scale}x"
+            path = out / f"{screen}-{theme}-{width}{suffix}.png"
             image = window.grabWindow()
             if image.isNull() or not image.save(str(path)):
                 problems.add(f"couldn't save {path}")
@@ -191,11 +205,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--width",
         type=int,
-        default=WIDTH,
-        help=f"window width (default {WIDTH}; other widths add -<width> to the file names)",
+        nargs="+",
+        default=list(WIDTHS),
+        help=f"window width(s) (default {' '.join(map(str, WIDTHS))}); file names end in -<width>",
+    )
+    parser.add_argument(
+        "--scale",
+        default="1",
+        help="screen scale to render at, e.g. 1.6 (default 1); file names end in @<scale>x",
     )
     args = parser.parse_args(argv)
-    if args.width < MIN_WIDTH:
+    if any(width < MIN_WIDTH for width in args.width):
         parser.error(f"the window's minimum width is {MIN_WIDTH}")
 
     problems = Problems()
@@ -232,7 +252,9 @@ def main(argv: list[str] | None = None) -> int:
     window = roots[0]
 
     args.out.mkdir(parents=True, exist_ok=True)
-    written = render(app, window, backend, args.out, problems, args.width)
+    written: list[Path] = []
+    for width in args.width:
+        written += render(app, window, backend, args.out, problems, width)
     window.close()
     return report(problems, written)
 

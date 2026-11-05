@@ -55,14 +55,14 @@ from tomecast.gui.worker import (
     megabytes,
     preview_file,
 )
+from tomecast.readers import FORMATS
 
 SCREENS = ("drop", "chapters", "voice", "converting", "done")
 THEME_SETTINGS = ("system", "dark", "light")
 MIN_SPEED, MAX_SPEED, SPEED_STEP = 0.75, 1.25, 0.05
 PLAYERS = ("pw-play", "paplay", "aplay")  # the first one found plays previews
 
-ART_CREDIT = "LUCA DELLA ROBBIA · CANTORIA · 1431\u201338"
-FORMATS_LABEL = "EPUB · PDF · DOCX · FB2 · HTML · TXT"
+FORMATS_LABEL = " · ".join(FORMATS)  # only what Tomecast can read today
 # Formats the window lists but can't read yet.
 COMING_SOON = {
     ".pdf": "PDF", ".docx": "DOCX", ".fb2": "FB2", ".html": "HTML", ".htm": "HTML",
@@ -214,7 +214,6 @@ class Backend(QObject):
     bookAuthorsChanged = Signal()
     coverSourceChanged = Signal()
     artSourceChanged = Signal()
-    artCreditChanged = Signal()
     formatsLabelChanged = Signal()
     chaptersChanged = Signal()
     skipFrontMatterChanged = Signal()
@@ -373,11 +372,6 @@ class Backend(QObject):
         return f"image://dots/cantoria/{self._theme}"
 
     artSource = _property(str, _get_art_source, artSourceChanged)
-
-    def _get_art_credit(self) -> str:
-        return ART_CREDIT
-
-    artCredit = _property(str, _get_art_credit, artCreditChanged)
 
     def _get_formats_label(self) -> str:
         return FORMATS_LABEL

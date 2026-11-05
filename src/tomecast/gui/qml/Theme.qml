@@ -29,13 +29,18 @@ QtObject {
     readonly property int sectionGap: 28
     readonly property int columnGap: 40
 
-    // Below this window width the screens use the compact "corner window" layout (the window
-    // is often small, parked in a corner; mockups Corner-*.dc.html, drawn at 400 x 600).
-    // The window itself goes down to 400 x 560.
-    readonly property int compactBelow: 640
-    readonly property int compactPadV: 16
-    readonly property int compactPadH: 18
-    readonly property int compactGap: 14
+    // The same design reflows in a narrow window (often parked in a corner): at this width or
+    // less, from the mockups' `@container tc (max-width: 680px)` rules. The window goes down
+    // to 400 x 560.
+    readonly property int narrowMaxWidth: 680
+    readonly property int narrowPadTop: 20
+    readonly property int narrowPadSide: 20
+    readonly property int narrowPadBottom: 24
+    readonly property int narrowGap: 20
+    // Every dot outside the cover and the Cantoria is 5 px (Doto's dots are 0.075 em: 67 px).
+    readonly property int dotSize: 5
+    readonly property int dotGap: 3
+    readonly property int bigNumber: 67
 
     // Controls.
     readonly property int controlHeight: 44

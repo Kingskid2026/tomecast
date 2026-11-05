@@ -12,7 +12,7 @@ T.Control {
 
     implicitWidth: contentItem.implicitWidth + leftPadding + rightPadding
     implicitHeight: contentItem.implicitHeight + topPadding + bottomPadding
-    leftPadding: width < Theme.compactBelow ? Theme.compactPadH : Theme.pageSide
+    leftPadding: width <= Theme.narrowMaxWidth ? Theme.narrowPadSide : Theme.pageSide
     rightPadding: leftPadding
     topPadding: 12
     bottomPadding: 12

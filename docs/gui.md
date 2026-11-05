@@ -22,7 +22,7 @@ src/tomecast/gui/
   qml/
     Main.qml       ApplicationWindow; shows the screen named by Backend.screen
     Theme.qml      singleton: palettes, fonts, spacing (follows Backend.theme)
-    components/    PillButton, RoundButton, CropMarks, DotMeter, MonoLabel, Header, ErrorBanner
+    components/    buttons, meters, labels, the header, the error banner, the chapter row (see the folder)
     screens/       DropScreen, ChaptersScreen, VoiceScreen, ConvertingScreen, DoneScreen
 ```
 
@@ -37,7 +37,8 @@ src/tomecast/gui/
 - **Light on resources:** nothing animates continuously while converting. `DotGrid` repaints only when `done` changes; screen changes animate for 150–400 ms. A system "reduce motion" setting (or `Backend.reduceMotion`) turns animations off.
 - **No new heavy dependencies:** PySide6-Essentials only (no QtMultimedia, no Pillow). The voice preview plays through the system's player (`pw-play`, then `paplay`, then `aplay`).
 - **Accessibility:** every control has `Accessible.name`; keyboard focus is visible (2 px accent outline); text meets 4.5:1.
-- **Native window decorations,** and layouts that reflow when the window is tiled to a third of the screen (minimum width 640 px).
+- **Native window decorations.**
+- **One design that resizes well** (see `docs/design.md`). The window opens at 1200 × 780, is at least 400 × 560, and remembers its size. At 680 px wide and under, padding and gaps shrink, side-by-side parts stack, and chapter rows drop the word count and length dots. The sentence grid always fits: up to 70 columns of 5 px dots with 3 px gaps. **Every dot outside the dot art is 5 px at every width**: the grid, the meters, the waveform, and Doto's numerals, which are 67 px because Doto's dots are 0.075 em. Nothing scrolls sideways; tall screens scroll down. The mockups' `@container tc` CSS block is the spec.
 
 ## The `Backend` singleton (Python ↔ QML contract)
 
@@ -70,13 +71,12 @@ Every property has a `<name>Changed` notify signal. Lists are plain JS arrays of
 | `bookTitle`, `bookAuthors` | string | authors joined with ", " |
 | `coverSource` | string | `"image://dots/cover/<theme>?<n>"` (`<n>` changes per book), or `""` without a cover |
 | `artSource` | string | `"image://dots/cantoria/<theme>"` |
-| `artCredit` | string | `"LUCA DELLA ROBBIA · CANTORIA · 1431–38"` |
-| `formatsLabel` | string | `"EPUB · PDF · DOCX · FB2 · HTML · TXT"` (formats that aren't built yet show an error when chosen) |
+| `formatsLabel` | string | the formats Tomecast can read today, from `tomecast.readers.FORMATS` joined with `" · "` (just `"EPUB"` for now) |
 | `chapters` | ChapterModel | one row per section of the book |
 | `skipFrontMatter` | bool | ticks and unticks the rows marked front matter |
 | `selectionSummary` | object | `{sections, words, audio, make}`: ready-to-show uppercase strings, as in the mockup ("12 OF 15 SECTIONS", "26,371 WORDS", "ABOUT 2 H 47 MIN OF AUDIO", "ABOUT 36 MIN TO MAKE HERE") |
 
-`ChapterModel` roles: `number` (`"[ 01 ]"`, or `"—"` for front matter), `title`, `wordsLabel` (`"2,181"`), `minutesLabel` (`"14 min"`, `"<1 min"`), `meterLit` (0–17 dots), `frontMatter` (bool), `selected` (bool, editable).
+`ChapterModel` roles: `title` (without a leading "Chapter N."; rows show titles only, no index numbers), `wordsLabel` (`"2,181"`), `minutesLabel` (`"14 min"`, `"<1 min"`), `meterLit` (0–17 dots), `frontMatter` (bool), `selected` (bool, editable).
 
 | Slot | Does |
 |---|---|
@@ -111,7 +111,7 @@ Front matter is guessed until the real cleanup lands (issue #4): sections before
 | `stage` | string | `"downloading"`, `"starting"`, `"voicing"`, `"packaging"` |
 | `downloadLabel` | string | e.g. `"DOWNLOADING THE KOKORO VOICE MODEL · 45% OF 190 MB"` |
 | `chunksDone`, `chunksTotal` | int | for the sentence grid and the percentage |
-| `chapterLabel` | string | `"[ 03 ] A CAUCUS-RACE AND A LONG TALE"` |
+| `chapterLabel` | string | the chapter being voiced, in capitals: `"A CAUCUS-RACE AND A LONG TALE"` |
 | `timeLeft` | string | `"00:30:32"`, or `"--:--:--"` until it's measurable |
 | `progressLabel` | string | `"225 / 1,610 PIECES · 14%"` |
 | `speedLabel` | string | `"4.7× REAL TIME"` (measured: audio made ÷ time taken) |
@@ -151,6 +151,13 @@ DotGrid {
 ```
 
 One `QQuickPaintedItem`. It repaints only when a property changes and draws in device pixels, so it stays crisp at fractional scaling. Accessible role: progress bar, named "<done> of <total> pieces voiced".
+
+## Gotchas found while building it
+
+- **Register `Backend` before creating the QML engine.** With PySide6 6.12, calling `qmlRegisterSingletonInstance` after a `QQmlEngine` exists breaks that engine.
+- **One QML engine per process.** A second engine doesn't see the shared singleton's change signals, so the tests share one window and reset the demo backend between tests.
+- **No QML property may start with `on` plus a capital.** QML reads it as a signal handler, so the accent's text colour is `Theme.textOnAccent`, not `onAccent`.
+- **Qt asks image providers for screen pixels** (`sourceSize` times the screen scale), and the dots provider draws for that scale.
 
 ## Testing
 

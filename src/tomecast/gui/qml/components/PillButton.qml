@@ -9,17 +9,15 @@ T.AbstractButton {
 
     property string variant: "outline"
     readonly property bool filled: variant === "filled"
-    // Corner-window pill: 40 px tall with 11 px type (Cancel while converting is 36 px).
-    property bool compact: false
-    readonly property int textSize: compact ? 11 : 12
+    readonly property int textSize: 12
     // Letter spacing in em (0.14 on the drop screen's Choose a book).
     property real tracking: 0.12
 
     // Fractional text width plus padding and the 1 px border on each side, like the mockup's CSS.
     implicitWidth: Math.max(Theme.controlHeight,
                             metrics.advanceWidth + leftPadding + rightPadding + (filled ? 0 : 2))
-    implicitHeight: compact ? 40 : Theme.controlHeight
-    leftPadding: compact || variant === "outline" ? 20 : 22
+    implicitHeight: Theme.controlHeight
+    leftPadding: variant === "outline" ? 20 : 22
     rightPadding: leftPadding
     focusPolicy: Qt.StrongFocus
     hoverEnabled: true

@@ -1,8 +1,9 @@
 // A row of n dots with k lit: chapter length, the preview waveform, and (interactive) the speed.
 //
 // Read-only: dots of dotSize with dotSpacing between them, wrapping when the row is too narrow.
-// Interactive: each dot is a 28 x 44 radio target spread across the full width; the chosen dot
-// is larger and in the accent, dots before it are lit, dots after it wait. Arrow keys move it.
+// Interactive: each dot is a 28 x 44 radio target (never under 24 px wide) spread across the full
+// width; every dot is 5 px, the chosen one in the accent, dots before it lit, dots after it
+// waiting. Arrow keys move it.
 import QtQuick
 import QtQuick.Templates as T
 import ".."
@@ -12,20 +13,20 @@ T.Control {
 
     property int count: 17
     property int lit: 0
-    property real dotSize: 6
-    property real dotSpacing: 2
+    property real dotSize: Theme.dotSize
+    property real dotSpacing: Theme.dotGap
+    // Read-only: keep to one row; dots that don't fit are clipped on the right.
+    property bool singleLine: false
     property color litColor: Theme.text
     property color offColor: Theme.wait
     // Optional per-dot colour, e.g. a waveform: function(index) -> color.
     property var colorAt: null
-    // Read-only: spread the dots across the full width in one row (at least dotSpacing apart)
-    // instead of wrapping.
-    property bool spread: false
 
     property bool interactive: false
     property int current: -1
-    property real currentSize: 12
     property real cellWidth: 28
+    // Narrower than count x cellWidth, the targets shrink to fit instead of overflowing.
+    readonly property real fitCellWidth: count > 0 ? Math.min(cellWidth, width / count) : cellWidth
     property real cellHeight: Theme.controlHeight
     // Accessible name of each dot when interactive: function(index) -> string.
     property var labelAt: function(index) { return String(index + 1) }
@@ -51,7 +52,7 @@ T.Control {
 
     implicitWidth: interactive ? count * cellWidth
                                : count * dotSize + Math.max(0, count - 1) * dotSpacing
-    implicitHeight: interactive ? cellHeight : dotFlow.implicitHeight
+    implicitHeight: interactive ? cellHeight : (singleLine ? dotSize : dotFlow.implicitHeight)
     focusPolicy: interactive ? Qt.StrongFocus : Qt.NoFocus
     activeFocusOnTab: interactive
 
@@ -74,6 +75,7 @@ T.Control {
     }
 
     contentItem: Item {
+        clip: meter.singleLine
         implicitWidth: meter.implicitWidth
         implicitHeight: meter.implicitHeight
 
@@ -81,9 +83,7 @@ T.Control {
             id: dotFlow
             visible: !meter.interactive
             width: parent.width
-            spacing: meter.spread && meter.count > 1
-                     ? Math.max(meter.dotSpacing, (width - meter.count * meter.dotSize) / (meter.count - 1) - 0.01)
-                     : meter.dotSpacing
+            spacing: meter.dotSpacing
             layoutDirection: Qt.LeftToRight
 
             Repeater {
@@ -102,7 +102,7 @@ T.Control {
             id: cells
             visible: meter.interactive
             anchors.fill: parent
-            spacing: meter.count > 1 ? Math.max(0, (width - meter.count * meter.cellWidth) / (meter.count - 1)) : 0
+            spacing: meter.count > 1 ? Math.max(0, (width - meter.count * meter.fitCellWidth) / (meter.count - 1)) : 0
 
             Repeater {
                 model: meter.interactive ? meter.count : 0
@@ -111,7 +111,7 @@ T.Control {
                     required property int index
                     readonly property bool chosen: index === meter.current
 
-                    width: meter.cellWidth
+                    width: meter.fitCellWidth
                     height: meter.cellHeight
                     focusPolicy: Qt.NoFocus
                     checkable: false
@@ -129,15 +129,10 @@ T.Control {
                     contentItem: Item {
                         Rectangle {
                             anchors.centerIn: parent
-                            width: cell.chosen ? meter.currentSize : 7
+                            width: meter.dotSize
                             height: width
                             radius: width / 2
                             color: meter.dotColor(cell.index)
-
-                            Behavior on width {
-                                enabled: Theme.motion
-                                NumberAnimation { duration: Theme.quickMs }
-                            }
                         }
                     }
                 }

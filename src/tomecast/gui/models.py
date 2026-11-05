@@ -47,7 +47,7 @@ _NUMBERED_HEADING = re.compile(
 )
 # A title that is only a number, or starts with one followed by punctuation: "3", "IV. Pig".
 _BARE_NUMBER = re.compile(r"^\s*(?:\d+|[IVXLCDM]+)(?:[.:)]|\s*$)")
-# The "CHAPTER I. " in "CHAPTER I. Down the Rabbit-Hole", which the [ 01 ] column replaces.
+# The "CHAPTER I. " in "CHAPTER I. Down the Rabbit-Hole": rows show titles only (see the mockups).
 _CHAPTER_PREFIX = re.compile(
     rf"^\s*(?:chapter|chap\.)\s+{_NUMBER}"
     # then ". ", ": ", " - ", "—" or a space (a bare hyphen belongs to "Twenty-One")
@@ -67,7 +67,7 @@ def is_numbered_chapter(title: str) -> bool:
 
 
 def display_title(title: str) -> str:
-    """The title without a leading "Chapter N.", since the list numbers its rows itself."""
+    """The title without a leading "Chapter N.": the window shows chapter titles only."""
     for prefix in (_CHAPTER_PREFIX, _BARE_PREFIX):
         stripped = prefix.sub("", title, count=1)
         if stripped != title:
@@ -160,7 +160,6 @@ class Section:
     title: str  # as shown, without a "Chapter N." prefix
     words: int
     front_matter: bool
-    number: str  # "[ 01 ]", or "—" for front matter
     selected: bool
 
     @property
@@ -173,14 +172,13 @@ class Section:
 
     @property
     def label(self) -> str:
-        """``"[ 03 ] A CAUCUS-RACE AND A LONG TALE"``, as the converting screen shows it."""
-        return f"{self.number} {self.title.upper()}".strip()
+        """``"A CAUCUS-RACE AND A LONG TALE"``, as the converting screen shows it."""
+        return self.title.upper()
 
 
 class ChapterModel(QAbstractListModel):
     """One row per section of the book, with an editable ``selected`` role."""
 
-    NumberRole = Qt.ItemDataRole.UserRole + 1
     TitleRole = Qt.ItemDataRole.UserRole + 2
     WordsLabelRole = Qt.ItemDataRole.UserRole + 3
     MinutesLabelRole = Qt.ItemDataRole.UserRole + 4
@@ -189,7 +187,6 @@ class ChapterModel(QAbstractListModel):
     SelectedRole = Qt.ItemDataRole.UserRole + 7
 
     _ROLE_NAMES: ClassVar[dict[int, bytes]] = {
-        NumberRole: b"number",
         TitleRole: b"title",
         WordsLabelRole: b"wordsLabel",
         MinutesLabelRole: b"minutesLabel",
@@ -211,17 +208,13 @@ class ChapterModel(QAbstractListModel):
         """Replace the rows with ``book``'s chapters."""
         front = guess_front_matter(book)
         sections: list[Section] = []
-        number = 0
         for chapter, is_front in zip(book.chapters, front, strict=True):
-            if not is_front:
-                number += 1
             sections.append(
                 Section(
                     chapter=chapter,
                     title=display_title(chapter.title),
                     words=word_count(chapter),
                     front_matter=is_front,
-                    number="\u2014" if is_front else f"[ {number:02d} ]",
                     selected=not (is_front and skip_front_matter),
                 )
             )
@@ -304,8 +297,6 @@ class ChapterModel(QAbstractListModel):
         section = self._sections[index.row()]
         if role in (self.TitleRole, Qt.ItemDataRole.DisplayRole):
             return section.title
-        if role == self.NumberRole:
-            return section.number
         if role == self.WordsLabelRole:
             return f"{section.words:,}"
         if role == self.MinutesLabelRole:

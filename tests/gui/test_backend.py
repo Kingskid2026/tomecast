@@ -234,10 +234,9 @@ def test_opening_a_book_lists_its_chapters(
     assert backend.bookAuthors == "Test Author"
     assert backend.coverSource.startswith("image://dots/cover/dark?")
     assert backend.artSource == "image://dots/cantoria/dark"
-    assert backend.artCredit == "LUCA DELLA ROBBIA · CANTORIA · 1431\u201338"
-    assert backend.formatsLabel == "EPUB · PDF · DOCX · FB2 · HTML · TXT"
+    assert backend.formatsLabel == "EPUB"  # only formats with a reader today
     rows = _rows(backend.chapters)
-    assert [row["number"] for row in rows] == ["\u2014", "\u2014", "[ 01 ]", "[ 02 ]", "[ 03 ]"]
+    assert all("number" not in row for row in rows)  # no index tags: rows are listed by title
     assert [row["title"] for row in rows] == [
         "Test Book", "Contents", "Preface", "The Start", "The End"
     ]  # fmt: skip
@@ -337,14 +336,13 @@ def test_alice_is_listed_as_in_the_mockup() -> None:
     rows = _rows(model)
 
     assert [row["frontMatter"] for row in rows] == [True] * 3 + [False] * 12
-    assert rows[3]["number"] == "[ 01 ]"
     assert rows[3]["title"] == "Down the Rabbit-Hole"
     assert rows[3]["wordsLabel"] == "2,181"
     assert rows[3]["minutesLabel"] == "14 min"
     assert [row["meterLit"] for row in rows] == [
         0, 0, 0, 14, 13, 11, 17, 14, 16, 14, 16, 14, 13, 12, 13
     ]  # fmt: skip
-    assert model.sections[5].label == "[ 03 ] A CAUCUS-RACE AND A LONG TALE"
+    assert model.sections[5].label == "A CAUCUS-RACE AND A LONG TALE"
     assert model.summary(DEMO["speedup"]) == {
         "sections": "12 OF 15 SECTIONS",
         "words": "26,371 WORDS",
@@ -547,8 +545,8 @@ def test_a_whole_conversion_ends_on_the_done_screen(
     assert backend.warnings == []
     assert backend.chunksDone == backend.chunksTotal > 5
     assert backend.progressLabel == f"{backend.chunksTotal} / {backend.chunksTotal} PIECES · 100%"
-    assert labels[0] == "[ 01 ] THE NIGHT"
-    assert labels[-1] == "[ 02 ] CHAPTER 2"
+    assert labels[0] == "THE NIGHT"
+    assert labels[-1] == "CHAPTER 2"
     assert any(re.fullmatch(r"\d\d:\d\d:\d\d", time) for time in times)
     assert re.fullmatch(r"[\d,]+\.\d\u00d7 REAL TIME", backend.speedLabel)
     assert re.fullmatch(r"CPU · ABOUT [\d,]+\.\d\u00d7 REAL TIME", backend.hardwareLabel)

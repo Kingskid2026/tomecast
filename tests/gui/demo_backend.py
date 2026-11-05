@@ -91,7 +91,6 @@ def _display_title(raw: str) -> str:
 class Section:
     """One row of the chapter list."""
 
-    number: str
     title: str
     words: int
     minutes: float
@@ -103,16 +102,14 @@ class Section:
 class DemoChapterModel(QAbstractListModel):
     """``ChapterModel``-compatible list: the roles documented in docs/gui.md."""
 
-    NumberRole = Qt.ItemDataRole.UserRole + 1
-    TitleRole = Qt.ItemDataRole.UserRole + 2
-    WordsLabelRole = Qt.ItemDataRole.UserRole + 3
-    MinutesLabelRole = Qt.ItemDataRole.UserRole + 4
-    MeterLitRole = Qt.ItemDataRole.UserRole + 5
-    FrontMatterRole = Qt.ItemDataRole.UserRole + 6
-    SelectedRole = Qt.ItemDataRole.UserRole + 7
+    TitleRole = Qt.ItemDataRole.UserRole + 1
+    WordsLabelRole = Qt.ItemDataRole.UserRole + 2
+    MinutesLabelRole = Qt.ItemDataRole.UserRole + 3
+    MeterLitRole = Qt.ItemDataRole.UserRole + 4
+    FrontMatterRole = Qt.ItemDataRole.UserRole + 5
+    SelectedRole = Qt.ItemDataRole.UserRole + 6
 
     _ROLE_NAMES: ClassVar[dict[int, bytes]] = {
-        NumberRole: b"number",
         TitleRole: b"title",
         WordsLabelRole: b"wordsLabel",
         MinutesLabelRole: b"minutesLabel",
@@ -143,8 +140,6 @@ class DemoChapterModel(QAbstractListModel):
         section = self._sections[index.row()]
         if role in (self.TitleRole, Qt.ItemDataRole.DisplayRole):
             return section.title
-        if role == self.NumberRole:
-            return section.number
         if role == self.WordsLabelRole:
             return f"{section.words:,}"
         if role == self.MinutesLabelRole:
@@ -203,7 +198,6 @@ class DemoBackend(QObject):
     bookAuthorsChanged = Signal()
     coverSourceChanged = Signal()
     artSourceChanged = Signal()
-    artCreditChanged = Signal()
     formatsLabelChanged = Signal()
     chaptersChanged = Signal()
     skipFrontMatterChanged = Signal()
@@ -251,10 +245,8 @@ class DemoBackend(QObject):
             front = not numbered and chapter == 0
             if numbered:
                 chapter += 1
-            number = f"[ {chapter:02d} ]" if numbered else "—"
             sections.append(
                 Section(
-                    number=number,
                     title=_display_title(title),
                     words=int(raw["words"]),
                     minutes=float(raw["minutes"]),
@@ -291,8 +283,7 @@ class DemoBackend(QObject):
             "bookAuthors": ", ".join(data["authors"]),
             "coverSource": "",
             "artSource": "",
-            "artCredit": "LUCA DELLA ROBBIA · CANTORIA · 1431–38",
-            "formatsLabel": "EPUB · PDF · DOCX · FB2 · HTML · TXT",
+            "formatsLabel": "EPUB",
             "skipFrontMatter": True,
             "selectionSummary": {},
             "voiceGroups": self._voice_groups(),
@@ -306,7 +297,7 @@ class DemoBackend(QObject):
             "downloadLabel": ("DOWNLOADING ONCE · KOKORO VOICE MODEL (82M, 8-BIT) · 45% OF 190 MB"),
             "chunksDone": chunks_done,
             "chunksTotal": chunks_total,
-            "chapterLabel": f"{third.number} {third.title.upper()}",
+            "chapterLabel": third.title.upper(),
             "timeLeft": "00:30:32",
             "progressLabel": (
                 f"{chunks_done:,} / {chunks_total:,} PIECES · "
@@ -581,7 +572,6 @@ class DemoBackend(QObject):
     bookAuthors = Property(str, lambda self: self._get("bookAuthors"), notify=bookAuthorsChanged)
     coverSource = Property(str, lambda self: self._get("coverSource"), notify=coverSourceChanged)
     artSource = Property(str, lambda self: self._get("artSource"), notify=artSourceChanged)
-    artCredit = Property(str, lambda self: self._get("artCredit"), notify=artCreditChanged)
     formatsLabel = Property(str, lambda self: self._get("formatsLabel"), notify=formatsLabelChanged)
     chapters = Property(QObject, _chapters_model, notify=chaptersChanged)
     skipFrontMatter = Property(

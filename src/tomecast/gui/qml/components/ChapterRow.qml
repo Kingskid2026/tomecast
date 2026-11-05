@@ -1,6 +1,7 @@
-// One section in the chapter list (a ChapterModel row): tick, "[ 03 ]", title, words, minutes
-// and a 17-dot length meter. The corner window keeps the tick, number, title and minutes in a
-// 36 px row. Clicking it ticks or unticks the section through the backend.
+// One section in the chapter list (a ChapterModel row): tick, title, words, minutes and a
+// 17-dot length meter, as in Chapters.dc.html. In a narrow window (680 px or less) the word
+// count and the meter are dropped, leaving tick, title (elided) and minutes, as in the
+// mockup's narrow rules. Clicking the row ticks or unticks the section through the backend.
 import QtQuick
 import QtQuick.Layouts
 import QtQuick.Templates as T
@@ -11,7 +12,6 @@ T.AbstractButton {
     id: row
 
     required property int index
-    required property string number
     required property string title
     required property string wordsLabel
     required property string minutesLabel
@@ -19,16 +19,16 @@ T.AbstractButton {
     required property bool frontMatter
     required property bool selected
 
-    property bool compact: false
+    // Set by the screen: the window is 680 px wide or less.
+    property bool narrow: false
     readonly property color ink: selected ? Theme.text : Theme.muted
-    // In a narrower wide layout the length meter, then the word count, make way for titles
-    // (both stay in the accessible description).
-    readonly property bool showMeter: !compact && width >= 600
-    readonly property bool showWords: !compact && width >= 480
+    // The word count and meter stay in the accessible description when they're hidden.
+    readonly property bool showWords: !narrow
+    readonly property bool showMeter: !narrow
 
     objectName: "chapterRow" + index
-    // 48 px (36 px compact) plus the 1 px rule under it, as in the mockups.
-    implicitHeight: compact ? 36 : Math.max(49, cells.implicitHeight + 9)
+    // 48 px plus the 1 px rule under it, as in the mockups.
+    implicitHeight: Math.max(49, cells.implicitHeight + 9)
     focusPolicy: Qt.StrongFocus
     hoverEnabled: true
     Accessible.role: Accessible.CheckBox
@@ -56,28 +56,21 @@ T.AbstractButton {
 
     contentItem: RowLayout {
         id: cells
-        spacing: row.compact ? 8 : 12
+        spacing: row.narrow ? 10 : 12
 
         Item {
-            Layout.preferredWidth: row.compact ? 18 : 28
+            Layout.preferredWidth: row.narrow ? 24 : 28
             Layout.preferredHeight: tick.height
 
             Tick {
                 id: tick
                 anchors.verticalCenter: parent.verticalCenter
-                size: row.compact ? 16 : 18
+                size: 18
                 checked: row.selected
             }
         }
 
-        MonoLabel {
-            Layout.preferredWidth: row.compact ? 44 : 64
-            text: row.number
-            size: row.compact ? 10 : 12
-            tracking: 0.06
-        }
-
-        // Title, elided to fit, then the FRONT MATTER tag on its baseline (wide only).
+        // Title, elided to fit, then the FRONT MATTER tag on its baseline.
         Item {
             id: titleCell
             readonly property real tagRoom: frontTag.visible ? 10 + frontTag.implicitWidth : 0
@@ -95,14 +88,14 @@ T.AbstractButton {
                 text: row.title
                 color: row.ink
                 font.family: Theme.sans
-                font.pixelSize: row.compact ? 13 : 15
+                font.pixelSize: 15
                 elide: Text.ElideRight
                 textFormat: Text.PlainText
             }
 
             MonoLabel {
                 id: frontTag
-                visible: row.frontMatter && !row.compact
+                visible: row.frontMatter
                 x: chapterTitle.width + 10
                 y: chapterTitle.y + chapterTitle.baselineOffset - baselineOffset
                 text: "FRONT MATTER"
@@ -112,6 +105,7 @@ T.AbstractButton {
         }
 
         MonoLabel {
+            objectName: "chapterWords"
             visible: row.showWords
             Layout.preferredWidth: 84
             horizontalAlignment: Text.AlignRight
@@ -121,25 +115,27 @@ T.AbstractButton {
         }
 
         MonoLabel {
-            Layout.preferredWidth: row.compact ? 46 : 64
+            objectName: "chapterMinutes"
+            Layout.preferredWidth: row.narrow ? 56 : 64
             horizontalAlignment: Text.AlignRight
             text: row.minutesLabel
-            size: row.compact ? 10 : 12
+            size: 12
             tracking: 0
         }
 
         Item {
+            objectName: "chapterMeter"
             visible: row.showMeter
             Layout.preferredWidth: 136
-            Layout.preferredHeight: 6
+            Layout.preferredHeight: Theme.dotSize
 
             DotMeter {
                 anchors.right: parent.right
                 anchors.verticalCenter: parent.verticalCenter
                 count: 17
                 lit: row.meterLit
-                dotSize: 6
-                dotSpacing: 2
+                dotSize: Theme.dotSize
+                dotSpacing: Theme.dotGap
                 litColor: row.ink
                 Accessible.ignored: true
             }

@@ -7,20 +7,18 @@ T.AbstractButton {
     id: control
 
     property bool chosen: false
-    // Corner-window size: 36 px tall, 13 px type.
-    property bool compact: false
 
     // Fractional text width plus padding and the 1 px border on each side, like the mockup's
     // CSS, so a row of voices wraps where the mockup's does.
     implicitWidth: metrics.advanceWidth + leftPadding + rightPadding + 2
-    implicitHeight: compact ? 36 : Theme.controlHeight
-    leftPadding: compact ? 14 : 18
+    implicitHeight: Theme.controlHeight
+    leftPadding: 18
     rightPadding: leftPadding
     focusPolicy: Qt.StrongFocus
     hoverEnabled: true
 
     font.family: Theme.sans
-    font.pixelSize: compact ? 13 : 14
+    font.pixelSize: 14
 
     Accessible.role: Accessible.RadioButton
     Accessible.name: text

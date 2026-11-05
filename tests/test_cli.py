@@ -12,6 +12,7 @@ from epub_factory import NavPoint, Page, build_epub
 from tomecast import __version__, cli
 from tomecast.downloads import Asset
 from tomecast.engines.audiocpp import EngineError
+from tomecast.workdirs import work_folder
 
 
 class FakeKokoro:
@@ -203,7 +204,7 @@ def test_the_same_book_cant_be_converted_twice_at_once(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     book = _epub(tmp_path)
-    workdir = cli._work_folder(tmp_path / "data", book, "af_heart", 1.0)
+    workdir = work_folder(tmp_path / "data", book, "af_heart", 1.0)
     with (workdir / ".lock").open("w") as handle:
         fcntl.flock(handle, fcntl.LOCK_EX)  # another run is busy with this book
 

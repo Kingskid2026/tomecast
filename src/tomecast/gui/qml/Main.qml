@@ -10,13 +10,13 @@ import "screens"
 ApplicationWindow {
     id: window
 
-    // True while a file is dragged over the window (the drop screen's outline brightens).
+    // True while a file is dragged over the window (the drop screen's title turns the accent).
     readonly property bool bookDragActive: dropArea.containsDrag
 
     objectName: "mainWindow"
     width: 1200
     height: 780
-    // Often small, parked in a corner: every screen works down to 400 x 560.
+    // Often small, parked in a corner: every screen reflows down to 400 x 560.
     minimumWidth: 400
     minimumHeight: 560
     visible: true
@@ -24,6 +24,13 @@ ApplicationWindow {
     color: Theme.bg
     font.family: Theme.sans
     font.pixelSize: 15
+
+    // Size and position come back as they were. Only the real app (which names its
+    // organization) does this, so tests and screenshots leave the user's settings alone.
+    Loader {
+        active: Qt.application.organization !== ""
+        sourceComponent: WindowMemory { target: window }
+    }
 
     ColumnLayout {
         anchors.fill: parent

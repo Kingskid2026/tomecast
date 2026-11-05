@@ -4,14 +4,12 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import fcntl
-import hashlib
 import shutil
 import signal
 import sys
 import time
 import wave
-from collections.abc import Iterator, Sequence
+from collections.abc import Sequence
 from pathlib import Path
 from typing import TextIO
 
@@ -27,8 +25,6 @@ from tomecast.downloads import (
     is_installed,
 )
 from tomecast.engines.audiocpp import (
-    AUDIOCPP_VERSION,
-    DEFAULT_SEED,
     DEFAULT_VOICE,
     MAX_CHARS,
     REQUIRED_ASSETS,
@@ -39,6 +35,7 @@ from tomecast.engines.audiocpp import (
 )
 from tomecast.packaging import PackagingError
 from tomecast.readers.epub import InvalidEbookError, read_epub
+from tomecast.workdirs import WorkFolderBusy, exclusive, work_folder
 
 
 class CliError(Exception):
@@ -46,7 +43,6 @@ class CliError(Exception):
 
 
 # Unfinished conversions are kept so they can be resumed; after this long they're removed.
-STALE_WORK_DAYS = 14
 
 
 def _speed(value: str) -> float:
@@ -192,7 +188,7 @@ def _convert(args: argparse.Namespace) -> int:
     root = data_dir()
     try:
         _install(REQUIRED_ASSETS, root, assume_yes=args.yes)
-        workdir = _work_folder(root, book_path, args.voice, args.speed)
+        workdir = work_folder(root, book_path, args.voice, args.speed)
     except OSError as error:
         raise CliError(str(error)) from error
 
@@ -203,7 +199,11 @@ def _convert(args: argparse.Namespace) -> int:
     )
     progress = _ProgressPrinter(sys.stderr)
     started = time.monotonic()
-    with _exclusive(workdir):
+    with contextlib.ExitStack() as stack:
+        try:
+            stack.enter_context(exclusive(workdir))
+        except WorkFolderBusy as error:
+            raise CliError(str(error)) from None
         try:
             with KokoroServer(root, voice=args.voice, speed=args.speed) as engine:
                 result = convert_book(
@@ -237,42 +237,6 @@ def _convert(args: argparse.Namespace) -> int:
 
 def _interrupt(signum: int, frame: object) -> None:
     raise KeyboardInterrupt
-
-
-def _work_folder(root: Path, book: Path, voice: str, speed: float) -> Path:
-    """The folder for this book's chunk audio: the same book and settings resume in it."""
-    cache = root / "cache"
-    cache.mkdir(parents=True, exist_ok=True)
-    cutoff = time.time() - STALE_WORK_DAYS * 86400
-    for old in cache.glob("convert-*"):
-        if old.is_dir() and old.stat().st_mtime < cutoff:
-            shutil.rmtree(old, ignore_errors=True)
-    digest = hashlib.sha256()
-    with book.open("rb") as f:
-        while block := f.read(1024 * 1024):
-            digest.update(block)
-    # Anything that changes how the audio sounds goes in the key, so a resumed book never
-    # mixes two voices, speeds or model versions.
-    settings = [voice, str(speed), f"seed={DEFAULT_SEED}", f"audiocpp-{AUDIOCPP_VERSION}"]
-    settings += [asset.sha256 for asset in REQUIRED_ASSETS]
-    digest.update("|".join(settings).encode())
-    folder = cache / f"convert-{digest.hexdigest()[:16]}"
-    folder.mkdir(exist_ok=True)
-    folder.touch()  # counts as recently used
-    return folder
-
-
-@contextlib.contextmanager
-def _exclusive(workdir: Path) -> Iterator[None]:
-    """Hold a lock on ``workdir`` so two runs can't convert the same book at once."""
-    with (workdir / ".lock").open("w") as handle:
-        try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise CliError(
-                "this book is already being converted with the same settings (in another terminal?)"
-            ) from None
-        yield
 
 
 def _saved_note(workdir: Path) -> str:

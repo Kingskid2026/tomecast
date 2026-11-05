@@ -9,10 +9,8 @@ T.AbstractButton {
 
     // "play" or "pause"
     property string glyph: "play"
-    // 56 px, or 44 px in the corner window (with a 14 px glyph).
-    property bool compact: false
 
-    implicitWidth: compact ? 44 : Theme.roundButtonSize
+    implicitWidth: Theme.roundButtonSize
     implicitHeight: implicitWidth
     focusPolicy: Qt.StrongFocus
     hoverEnabled: true
@@ -39,7 +37,6 @@ T.AbstractButton {
             id: glyphShape
             width: 16
             height: 16
-            scale: control.compact ? 14 / 16 : 1
             anchors.centerIn: parent
             preferredRendererType: Shape.CurveRenderer
 

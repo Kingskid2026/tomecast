@@ -236,11 +236,11 @@ def test_theme_switches_the_palette(app_window: Window, messages: Messages) -> N
 def test_drop_screen_texts(app_window: Window, messages: Messages) -> None:
     app_window.show("drop")
     assert app_window.text("dropTitle") == "DROP A BOOK HERE"
-    assert app_window.text("formatsLabel") == "EPUB · PDF · DOCX · FB2 · HTML · TXT"
+    assert app_window.text("formatsLabel") == "EPUB"
     assert app_window.text("hardwareLabel") == "CPU · ABOUT 4.7× REAL TIME"
-    assert app_window.text("artCredit") == "LUCA DELLA ROBBIA · CANTORIA · 1431–38"
+    assert app_window.find("artCredit") is None  # no art credit under the Cantoria
     assert app_window.text("chooseBookButton") == "Choose a book"
-    assert app_window.text("noBookLabel") == "[ 00 ] NO BOOK YET"
+    assert app_window.text("noBookLabel") == "NO BOOK YET"
     assert app_window.get("artImage").property("source") == QUrl("image://dots/cantoria/dark")
     assert not app_window.get("errorBanner").isVisible()
     assert_clean(messages)
@@ -248,7 +248,7 @@ def test_drop_screen_texts(app_window: Window, messages: Messages) -> None:
 
 def test_chapters_screen_lists_every_section(app_window: Window, messages: Messages) -> None:
     app_window.show("chapters")
-    assert app_window.text("screenTitle") == "[ 02 ] CHAPTERS"
+    assert app_window.text("screenTitle") == "CHAPTERS"
     assert app_window.text("bookTitle") == "Alice's Adventures in Wonderland"
     assert app_window.text("bookAuthors") == "Lewis Carroll"
     assert app_window.get("chapterList").property("count") == 15
@@ -265,7 +265,7 @@ def test_chapters_screen_lists_every_section(app_window: Window, messages: Messa
 
 def test_voice_screen_texts(app_window: Window, messages: Messages) -> None:
     app_window.show("voice")
-    assert app_window.text("screenTitle") == "[ 03 ] VOICE"
+    assert app_window.text("screenTitle") == "VOICE"
     assert app_window.text("previewVoiceLabel") == "PREVIEW · HEART · AMERICAN · FEMALE"
     assert app_window.text("speedValue") == "1.00×"
     assert app_window.get("voice_af_heart").property("chosen") is True
@@ -277,8 +277,8 @@ def test_voice_screen_texts(app_window: Window, messages: Messages) -> None:
 
 def test_converting_screen_texts(app_window: Window, messages: Messages) -> None:
     app_window.show("converting")
-    assert app_window.text("screenTitle") == "[ 04 ] CONVERTING"
-    assert app_window.text("chapterLabel") == "[ 03 ] A CAUCUS-RACE AND A LONG TALE"
+    assert app_window.text("screenTitle") == "CONVERTING"
+    assert app_window.text("chapterLabel") == "A CAUCUS-RACE AND A LONG TALE"
     assert app_window.text("timeLeft") == "00:30:32"
     assert app_window.text("progressLabel") == "225 / 1,610 PIECES · 14%"
     assert app_window.text("convertingStatus") == (
@@ -295,7 +295,7 @@ def test_converting_screen_texts(app_window: Window, messages: Messages) -> None
 
 def test_done_screen_texts(app_window: Window, messages: Messages) -> None:
     app_window.show("done")
-    assert app_window.text("screenTitle") == "[ 05 ] DONE"
+    assert app_window.text("screenTitle") == "DONE"
     assert app_window.text("audioLength") == "2:47:00"
     assert app_window.text("doneSummary") == (
         "OF AUDIO · 12 CHAPTERS · ABOUT 79 MB · MADE IN ABOUT 36 MIN"
@@ -448,83 +448,150 @@ def test_keyboard_focus_reaches_the_buttons(app_window: Window, messages: Messag
     assert_clean(messages)
 
 
-@pytest.mark.parametrize("width", [400, 639, 640, 900])
+WIDTHS = [400, 520, 680, 681, 900, 1200]
+
+
+def sticks_out(page: QQuickItem, width: int) -> list[str]:
+    """Named visible items laid out wider than the window."""
+    found = []
+    for item in descendants(page):
+        if item.isVisible() and item.objectName():
+            left = item.mapToScene(QPointF(0, 0)).x()
+            right = left + item.width()
+            if left < -0.5 or right > width + 0.5:
+                found.append(f"{item.objectName()} spans {left:.1f}..{right:.1f}")
+    return found
+
+
+@pytest.mark.parametrize("width", WIDTHS)
 @pytest.mark.parametrize("screen", SCREENS)
-def test_small_windows_reflow(
+def test_every_screen_reflows_without_overflow(
     app_window: Window, messages: Messages, screen: str, width: int
 ) -> None:
     app_window.window.resize(width, 560)
     page = app_window.show(screen)
     app_window.settle()
-    assert page.property("compact") is (width < 640)
-    # Nothing is laid out wider than the window.
-    for item in page.findChildren(QQuickItem):
-        if item.isVisible() and item.objectName():
-            left = item.mapToScene(QPointF(0, 0)).x()
-            right = left + item.width()
-            assert left >= -0.5, f"{item.objectName()} starts off the left edge"
-            assert right <= width + 0.5, f"{item.objectName()} sticks out ({right} > {width})"
+    assert page.property("narrow") is (width <= 680)
+    assert page.property("contentWidth") == width  # nothing scrolls sideways
+    assert sticks_out(page, width) == []
+    # Page padding: 40 wide, 20 narrow.
+    assert page.property("sidePadding") == (20 if width <= 680 else 40)
     assert_clean(messages)
 
 
-def test_corner_window_layouts_follow_the_compact_mockups(
-    app_window: Window, messages: Messages
+@pytest.mark.parametrize("width", [1200, 520])
+def test_chapter_rows_drop_words_and_meter_when_narrow(
+    app_window: Window, messages: Messages, width: int
 ) -> None:
-    app_window.window.resize(400, 600)
-    app_window.show("drop")
-    assert app_window.get("artImage").width() == 160
-    assert app_window.get("chooseBookButton").height() == 40
-
+    app_window.window.resize(width, 780)
     app_window.show("chapters")
-    assert app_window.get("chaptersCover").width() == 72
-    assert app_window.get("chooseVoiceButton").property("text") == "Next"
-    chapter_list = app_window.get("chapterList")
-    # The list scrolls by itself, so the page fits the window.
-    assert chapter_list.property("interactive") is True
-    assert chapter_list.property("contentHeight") > chapter_list.height()
-    assert app_window.get("chaptersScreen").property("naturalHeight") <= 600
-    assert app_window.get("chapterRow3").height() == 36
-    assert app_window.text("summary_line1") == "12 OF 15 SECTIONS · ABOUT 2 H 47 MIN"
-    assert app_window.text("summary_line2") == "ABOUT 36 MIN TO MAKE HERE"
+    row = app_window.get("chapterRow3")
+    names = {i.objectName(): i for i in descendants(row) if i.objectName()}
+    assert "chapterNumber" not in names  # no number column
+    wide = width > 680
+    assert names["chapterWords"].isVisible() is wide
+    assert names["chapterMeter"].isVisible() is wide
+    assert names["chapterTitle"].isVisible()
+    assert names["chapterMinutes"].isVisible()
+    assert row.height() >= 49
+    assert_clean(messages)
 
-    app_window.show("voice")
-    menu, panel = app_window.get("voiceMenu"), app_window.get("previewPanel")
-    assert panel.mapToScene(QPointF(0, 0)).y() > menu.mapToScene(QPointF(0, 0)).y()
-    assert app_window.get("previewButton").width() == 44
-    assert app_window.get("voiceScreen").property("naturalHeight") <= 600
 
-    app_window.show("converting")
-    cover, grid = app_window.get("convertingCover"), app_window.get("sentenceGrid")
-    assert cover.width() == 120
-    assert grid.mapToScene(QPointF(0, 0)).y() > cover.mapToScene(QPointF(0, 0)).y()
-    assert (grid.property("dotSize"), grid.property("gap")) == (3, 2)
-    assert grid.property("columns") == 72  # as in Corner-converting.dc.html
-    assert 100 <= grid.height() <= 140
-    assert app_window.get("timeLeft").height() == 38
-    assert app_window.text("convertingStatus") == "4.7× REAL TIME"
-    assert app_window.get("cancelButton").height() == 36
+def test_sections_stack_when_narrow(app_window: Window, messages: Messages) -> None:
+    def y(name: str) -> float:
+        return app_window.get(name).mapToScene(QPointF(0, 0)).y()
 
-    app_window.show("done")
-    assert app_window.get("doneCover").width() == 120
-    assert app_window.text("checkedLabel") == "1,610 OF 1,610 CHECKED"
-    assert app_window.get("openFolderButton").width() == 400 - 2 * 18
+    def x(name: str) -> float:
+        return app_window.get(name).mapToScene(QPointF(0, 0)).x()
 
     app_window.window.resize(1200, 780)
+    app_window.show("chapters")
+    assert y("bookTitle") > y("chaptersCover")
+    assert x("chapterList") > x("chaptersCover") + 240  # the table is beside the book
+    app_window.window.resize(520, 780)
+    app_window.settle()
+    assert y("chapterList") > y("bookTitle")  # ...and under it
+    assert x("chapterList") == x("chaptersCover")
+
+    app_window.show("voice")
+    assert y("previewPanel") > y("voiceMenu")
+    app_window.window.resize(1200, 780)
+    app_window.settle()
+    assert y("previewPanel") == y("voiceMenu") or x("previewPanel") > x("voiceMenu")
+
     app_window.show("converting")
-    grid = app_window.get("sentenceGrid")
-    assert (grid.property("dotSize"), grid.property("columns")) == (5, 70)
-    assert app_window.get("timeLeft").height() == 64
-    assert app_window.get("convertingCover").width() == 200
+    app_window.window.resize(520, 780)
+    app_window.settle()
+    assert y("sentenceGrid") > y("convertingCover") + app_window.get("convertingCover").height()
     assert_clean(messages)
 
 
-def test_speed_text_hides_until_measured(app_window: Window, messages: Messages) -> None:
-    app_window.window.resize(400, 600)
+@pytest.mark.parametrize("width", [1200, 900, 520, 400])
+def test_sentence_grid_columns_follow_the_width(
+    app_window: Window, messages: Messages, width: int
+) -> None:
+    app_window.window.resize(width, 780)
+    for screen, name in (("converting", "sentenceGrid"), ("done", "completeGrid")):
+        app_window.show(screen)
+        grid = app_window.get(name)
+        room = grid.parentItem().width()
+        assert (grid.property("dotSize"), grid.property("gap")) == (5, 3)
+        assert grid.property("columns") == min(70, int(room // 8))
+        assert grid.width() <= room
+    if width == 1200:
+        assert grid.property("columns") == 70
+    if width == 520:
+        assert grid.property("columns") == 60  # (520 - 2 x 20) / 8
+    assert_clean(messages)
+
+
+def descendants(item: QQuickItem) -> list[QQuickItem]:
+    """Every live item below this one (findChildren can return delegates that are going away)."""
+    found = []
+    for child in item.childItems():
+        found.append(child)
+        found.extend(descendants(child))
+    return found
+
+
+def pixel_size(item: QQuickItem) -> int:
+    texts = [i for i in descendants(item) if i.metaObject().className() == "QQuickText"]
+    assert texts, "no text inside the display number"
+    return int(texts[0].property("font").pixelSize())
+
+
+@pytest.mark.parametrize("width", [1200, 520, 400])
+def test_every_dot_outside_the_art_is_five_pixels(
+    app_window: Window, messages: Messages, width: int
+) -> None:
+    app_window.window.resize(width, 780)
+    app_window.show("chapters")
+    meters = [
+        i for i in descendants(app_window.get("chapterList"))
+        if i.property("lit") is not None and i.property("dotSize") is not None
+    ]  # fmt: skip
+    if width > 680:
+        assert len(meters) == 15
+    for meter in meters:
+        assert (meter.property("dotSize"), meter.property("dotSpacing")) == (5, 3)
+        assert meter.property("count") == 17
+
+    app_window.show("voice")
+    wave = app_window.get("previewWave")
+    assert (wave.property("dotSize"), wave.property("dotSpacing")) == (5, 3)
+    assert wave.property("count") == 40
+    assert wave.height() == 5  # one line: dots that don't fit are clipped, never wrapped
+    speed = app_window.get("speedMeter")
+    assert speed.property("dotSize") == 5
+    assert speed.property("currentSize") is None  # the chosen speed is a colour, not a size
+    assert speed.property("fitCellWidth") >= 24  # click and keyboard targets
+    assert speed.width() <= app_window.get("previewPanel").width()
+
     app_window.show("converting")
-    assert app_window.get("convertingStatus").isVisible()
-    app_window.backend.set_speed_label("")
-    app_window.settle()
-    assert not app_window.get("convertingStatus").isVisible()
+    assert pixel_size(app_window.get("timeLeft")) == 67
+    assert app_window.get("timeLeft").height() == 67
+    app_window.show("done")
+    assert pixel_size(app_window.get("audioLength")) == 67
     assert_clean(messages)
 
 
@@ -548,7 +615,7 @@ def test_backend_property_list_matches_the_contract(backend: DemoBackend) -> Non
     contract = {
         "screen", "themeSetting", "theme", "reduceMotion", "hardwareLabel", "errorMessage",
         "bookLoaded", "loading", "bookTitle", "bookAuthors", "coverSource", "artSource",
-        "artCredit", "formatsLabel", "chapters", "skipFrontMatter", "selectionSummary",
+        "formatsLabel", "chapters", "skipFrontMatter", "selectionSummary",
         "voiceGroups", "voice", "voiceLabel", "speed", "previewText", "previewPlaying",
         "previewAvailable", "stage", "downloadLabel", "chunksDone", "chunksTotal",
         "chapterLabel", "timeLeft", "progressLabel", "speedLabel", "nowSpeaking", "paused",
@@ -570,7 +637,7 @@ def test_backend_property_list_matches_the_contract(backend: DemoBackend) -> Non
     model = backend.chapter_model
     roles = {bytes(name.data()).decode() for name in model.roleNames().values()}
     assert roles == {
-        "number", "title", "wordsLabel", "minutesLabel", "meterLit", "frontMatter", "selected",
+        "title", "wordsLabel", "minutesLabel", "meterLit", "frontMatter", "selected",
     }  # fmt: skip
 
 
