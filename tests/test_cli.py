@@ -130,6 +130,37 @@ def test_convert_accepts_every_readable_format(
     assert "2 chapters" in capsys.readouterr().out
 
 
+def test_convert_writes_one_mp3_per_chapter(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    book = _epub(tmp_path)
+
+    assert cli.main(["convert", str(book), "--format", "mp3"]) == 0
+
+    folder = tmp_path / "story"
+    assert sorted(p.name for p in folder.iterdir()) == [
+        "01 - Chapter One.mp3",
+        "02 - Chapter Two.mp3",
+    ]
+    assert not (tmp_path / "story.m4b").exists()
+    assert f"Done: {folder} " in capsys.readouterr().out
+
+
+def test_convert_mp3_honours_output_and_refuses_an_existing_folder(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    book = _epub(tmp_path)
+    taken = tmp_path / "mine"
+    taken.mkdir()
+
+    assert cli.main(["convert", str(book), "--format", "mp3", "-o", str(taken)]) == 1
+
+    assert "already exists (use --force" in capsys.readouterr().err
+    assert list(taken.iterdir()) == []
+    assert cli.main(["convert", str(book), "--format", "mp3", "-o", str(taken), "--force"]) == 0
+    assert len(list(taken.glob("*.mp3"))) == 2
+
+
 def test_convert_refuses_to_overwrite_without_force(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

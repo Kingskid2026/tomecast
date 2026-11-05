@@ -839,7 +839,7 @@ def test_an_existing_audiobook_is_never_overwritten(
 
 
 def test_output_names_are_safe_and_unique(tmp_path: Path) -> None:
-    assert safe_file_name("Either/Or: A Fragment\nof Life") == "Either-Or: A Fragment of Life"
+    assert safe_file_name("Either/Or: A Fragment\nof Life") == "Either-Or - A Fragment of Life"
     assert safe_file_name("...Hidden") == "Hidden"
     assert len(safe_file_name("é" * 300).encode()) <= 200
     (tmp_path / "Book.m4b").write_bytes(b"")
@@ -1290,6 +1290,86 @@ def test_a_file_that_appears_while_converting_is_not_overwritten(
     assert (tmp_path / "Short Book (2).m4b").is_file()
     assert taken.read_bytes() == b"saved after Start was pressed"
     assert backend.doneSummary.startswith("OF AUDIO · 2 CHAPTERS")
+
+
+# --- MP3 output ---------------------------------------------------------------------------
+
+
+def test_the_output_format_is_remembered(make_backend: MakeBackend, tmp_path: Path) -> None:
+    backend = make_backend()
+    assert backend.outputFormat == "m4b"
+    changes: list[str] = []
+    backend.outputFormatChanged.connect(lambda: changes.append(backend.outputFormat))
+
+    backend.setOutputFormat("mp3")
+    backend.setOutputFormat("mp3")  # no change, no signal
+    backend.setOutputFormat("wav")  # not a format: ignored
+
+    assert changes == ["mp3"]
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    assert settings.value("outputFormat") == "mp3"
+    assert make_backend().outputFormat == "mp3"  # the next window remembers
+
+
+def test_a_bad_saved_format_falls_back_to_m4b(tmp_path: Path, make_backend: MakeBackend) -> None:
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    settings.setValue("outputFormat", "ogg")
+    settings.sync()
+    assert make_backend().outputFormat == "m4b"
+
+
+def test_unique_output_names_a_folder_for_mp3(tmp_path: Path) -> None:
+    assert unique_output(tmp_path, "Book", "mp3") == tmp_path / "Book"
+    (tmp_path / "Book").mkdir()
+    (tmp_path / "Book.m4b").write_bytes(b"")  # a different kind of output: no clash
+    assert unique_output(tmp_path, "Book", "mp3") == tmp_path / "Book (2)"
+    assert unique_output(tmp_path, "Book") == tmp_path / "Book (2).m4b"
+
+
+def test_converting_to_mp3_writes_a_folder_and_opens_it(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = make_backend()
+    backend.setOutputFormat("mp3")
+    _open(qtbot, backend, _short_book(tmp_path))
+
+    _convert(qtbot, backend)
+
+    assert backend.errorMessage == ""
+    assert backend.screen == "done"
+    folder = tmp_path / "Short Book"
+    assert sorted(p.name for p in folder.iterdir()) == [
+        "01 - Chapter 1 - The Night.mp3",
+        "02 - Chapter 2.mp3",
+    ]
+    assert not list(tmp_path.glob("*.m4b"))
+    assert backend.outputPath == str(folder)
+    assert re.fullmatch(r"OF AUDIO · 2 MP3 FILES · <1 MB · MADE IN \d+ SEC", backend.doneSummary)
+
+    opened: list[QUrl] = []
+
+    class FakeDesktop:
+        @staticmethod
+        def openUrl(url: QUrl) -> bool:
+            opened.append(url)
+            return True
+
+    monkeypatch.setattr(backend_module, "QDesktopServices", FakeDesktop)
+    backend.openOutputFolder()
+    assert opened == [_url(folder)]  # the folder itself, not the one holding it
+
+
+def test_one_mp3_chapter_is_one_file(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    backend = make_backend()
+    backend.setOutputFormat("mp3")
+    _open(qtbot, backend, _short_book(tmp_path))
+    backend.setChapterSelected(0, False)
+
+    _convert(qtbot, backend)
+
+    assert backend.doneSummary.startswith("OF AUDIO · 1 MP3 FILE · ")
 
 
 # --- What Start will download -------------------------------------------------------------

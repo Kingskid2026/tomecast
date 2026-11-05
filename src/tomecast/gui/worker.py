@@ -21,7 +21,7 @@ import wave
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 
 from PySide6.QtCore import QObject, QThread, Signal, Slot
 
@@ -157,6 +157,7 @@ class ConvertJob:
     speed: float
     control: TimedControl
     use_gpu: bool = False
+    format: Literal["m4b", "mp3"] = "m4b"  # "mp3": ``output`` is a folder of MP3 files
 
 
 Job = ReadJob | ScanJob | PreviewJob | ConvertJob
@@ -187,6 +188,13 @@ class ConvertResult:
     seconds_taken: float  # from the engine starting to the file being written, minus pauses
     warnings: tuple[str, ...]
     speedup: float | None
+
+
+def _size_of(output: Path) -> int:
+    """The size of the audiobook file, or of all the files in the MP3 folder."""
+    if output.is_dir():
+        return sum(p.stat().st_size for p in output.iterdir() if p.is_file())
+    return output.stat().st_size
 
 
 class _Meter:
@@ -467,7 +475,7 @@ class ConversionWorker(QObject):
 
             result = convert_book(
                 job.book, meter, job.output, workdir=workdir, progress=report, control=control,
-                chapters=job.chapters, overwrite=False,
+                chapters=job.chapters, overwrite=False, format=job.format,
             )  # fmt: skip
             taken = time.monotonic() - started - (control.paused_seconds - paused_before)
         finally:
@@ -476,7 +484,7 @@ class ConversionWorker(QObject):
             output=result.output,  # not job.output if that name was taken meanwhile
             audio_seconds=result.chapters[-1].end_seconds if result.chapters else 0.0,
             chapters=len(result.chapters),
-            size_bytes=result.output.stat().st_size,
+            size_bytes=_size_of(result.output),
             seconds_taken=max(0.0, taken),
             warnings=(*((engine.warning,) if engine.warning else ()), *result.warnings),
             speedup=meter.speedup(),

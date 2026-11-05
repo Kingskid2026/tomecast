@@ -15,8 +15,11 @@ uv tool install tomecast                      # or: pipx install tomecast
 tomecast convert book.epub                    # writes book.m4b next to the book
 tomecast convert book.docx                    # EPUB, DOCX, FB2, HTML and TXT work today (PDF is coming)
 tomecast convert book.epub --voice bm_george --speed 1.1   # speed: 0.5 to 3.0 (default 1.0)
+tomecast convert book.epub --format mp3       # a folder "book/" with one MP3 per chapter
 tomecast voices                               # list the 54 built-in voices
 ```
+
+`--format mp3` writes `book/01 - Chapter title.mp3`, `02 - …` and so on, for players and car stereos that don't know `.m4b`. Each file is tagged (album, author, track n/total, chapter title) and carries the cover. MP3 is 64 kbps mono, about 29 MB per hour, the same as the M4B. Like the M4B, it never overwrites without `--force`; the window always picks a free name ("book (2)").
 
 The first conversion downloads the voice engine, eSpeak NG and the Kokoro model (about 264 MB, after asking). On an 8-core laptop CPU, a 13-minute story took about 3 minutes to make.
 

@@ -16,7 +16,9 @@ import demo_backend
 import pytest
 from demo_backend import SCREENS, DemoBackend
 from PySide6.QtCore import (
+    Q_ARG,
     QMessageLogContext,
+    QMetaObject,
     QPointF,
     Qt,
     QtMsgType,
@@ -99,8 +101,20 @@ class Window:
             for item in self.window.contentItem().findChildren(QQuickItem)
         )
 
+    def scroll_into_view(self, item: QQuickItem) -> None:
+        """Scroll the page holding ``item`` so it's on screen, as a person would."""
+        node = item.parentItem()
+        while node is not None:
+            meta = node.metaObject()
+            if meta.indexOfMethod("ensureVisible(QVariant)") != -1:
+                QMetaObject.invokeMethod(node, "ensureVisible", Q_ARG("QVariant", item))
+                self.settle()
+                return
+            node = node.parentItem()
+
     def click(self, name_or_item: str | QQuickItem, at: QPointF | None = None) -> None:
         item = self.get(name_or_item) if isinstance(name_or_item, str) else name_or_item
+        self.scroll_into_view(item)
         local = at if at is not None else QPointF(item.width() / 2, item.height() / 2)
         point = item.mapToScene(local).toPoint()
         QTest.mouseClick(
@@ -621,7 +635,8 @@ def test_backend_property_list_matches_the_contract(backend: DemoBackend) -> Non
         "gpuAvailable", "useGpu", "gpuName",
         "bookLoaded", "loading", "bookTitle", "bookAuthors", "coverSource", "artSource",
         "formatsLabel", "chapters", "skipFrontMatter", "selectionSummary",
-        "voiceGroups", "voice", "voiceLabel", "speed", "previewText", "previewPlaying",
+        "voiceGroups", "voice", "voiceLabel", "speed", "outputFormat", "previewText",
+        "previewPlaying",
         "previewAvailable", "downloadNote", "stage", "downloadLabel", "chunksDone", "chunksTotal",
         "chapterLabel", "timeLeft", "progressLabel", "speedLabel", "nowSpeaking", "paused",
         "outputPath", "audioLength", "doneSummary", "warnings",
@@ -634,7 +649,8 @@ def test_backend_property_list_matches_the_contract(backend: DemoBackend) -> Non
         assert meta.property(meta.indexOfProperty(name)).hasNotifySignal(), name
     slots = {
         "setThemeSetting", "goTo", "chooseBookFolder", "dismissError", "openBook",
-        "setChapterSelected", "setSkipFrontMatter", "setVoice", "setSpeed", "setUseGpu",
+        "setChapterSelected", "setSkipFrontMatter", "setVoice", "setSpeed", "setOutputFormat",
+        "setUseGpu",
         "togglePreview",
         "startConversion", "pauseConversion", "resumeConversion", "cancelConversion",
         "openOutputFolder", "convertAnother",
@@ -762,6 +778,34 @@ def test_start_is_disabled_while_a_book_is_being_read(
     app_window.backend.set_loading(False)
     app_window.settle()
     assert start.property("enabled") is True
+    assert_clean(messages)
+
+
+@pytest.mark.parametrize("width", [1200, 520])
+def test_output_format_choice(app_window: Window, messages: Messages, width: int) -> None:
+    app_window.window.resize(width, 780)
+    app_window.show("voice")
+    m4b, mp3 = app_window.get("format_m4b"), app_window.get("format_mp3")
+    assert (m4b.property("text"), mp3.property("text")) == (
+        "M4B audiobook",
+        "MP3 per chapter",
+    )
+    assert (m4b.property("chosen"), mp3.property("chosen")) == (True, False)
+    # Under SPEED in the preview panel, like the panel's other settings, and inside the window.
+    choice = app_window.get("outputFormatChoice")
+    meter = app_window.get("speedMeter")
+    assert choice.mapToScene(QPointF(0, 0)).y() > meter.mapToScene(QPointF(0, 0)).y()
+    for pill in (m4b, mp3):
+        left = pill.mapToScene(QPointF(0, 0)).x()
+        assert left >= 0 and left + pill.width() <= width
+        assert pill.height() == 44
+
+    app_window.click("format_mp3")
+    assert ("setOutputFormat", ("mp3",)) in app_window.backend.calls
+    assert (m4b.property("chosen"), mp3.property("chosen")) == (False, True)
+    app_window.click("format_m4b")
+    assert app_window.backend.property("outputFormat") == "m4b"
+    assert m4b.property("chosen") is True
     assert_clean(messages)
 
 

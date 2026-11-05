@@ -14,7 +14,7 @@ import time
 import wave
 from collections.abc import Sequence
 from pathlib import Path
-from typing import TextIO
+from typing import Literal, TextIO
 
 from tomecast import __version__
 from tomecast.chunking import CoverageError
@@ -78,13 +78,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     convert = commands.add_parser(
         "convert",
-        help="turn an ebook into an M4B audiobook",
-        description="Turn an ebook into an M4B audiobook with chapters.",
+        help="turn an ebook into an M4B audiobook, or MP3s",
+        description="Turn an ebook into an M4B audiobook with chapters, or into one MP3 per "
+        "chapter (--format mp3).",
     )
     convert.add_argument("book", type=Path, help=f"the ebook to convert ({', '.join(FORMATS)})")
     convert.add_argument(
-        "-o", "--output", type=Path, help="where to write the audiobook (default: BOOK.m4b)"
-    )
+        "-o", "--output", type=Path,
+        help="where to write the audiobook (default: BOOK.m4b, or a BOOK folder with --format mp3)",
+    )  # fmt: skip
+    convert.add_argument(
+        "--format", choices=("m4b", "mp3"), default="m4b",
+        help="m4b: one audiobook file with chapters (default); mp3: a folder, one MP3 per chapter",
+    )  # fmt: skip
     convert.add_argument(
         "--voice", default=DEFAULT_VOICE, choices=VOICES, metavar="VOICE",
         help=f"Kokoro voice (default: {DEFAULT_VOICE}; see `tomecast voices`)",
@@ -98,7 +104,7 @@ def build_parser() -> argparse.ArgumentParser:
     convert.add_argument(
         "-y", "--yes", action="store_true", help="download the voice engine without asking"
     )
-    convert.add_argument("-f", "--force", action="store_true", help="overwrite the output file")
+    convert.add_argument("-f", "--force", action="store_true", help="overwrite the output")
     convert.add_argument(
         "--gpu", action=argparse.BooleanOptionalAction, default=None,
         help="use the graphics card through the driver already installed "
@@ -201,8 +207,11 @@ def _convert(args: argparse.Namespace) -> int:
     book_path: Path = args.book
     if not book_path.is_file():
         raise CliError(f"{book_path} doesn't exist")
-    output: Path = args.output or book_path.with_suffix(".m4b")
-    if output.exists() and not args.force:
+    output_format: Literal["m4b", "mp3"] = args.format
+    output: Path = args.output or (
+        book_path.with_suffix("") if output_format == "mp3" else book_path.with_suffix(".m4b")
+    )
+    if (output.exists() or output.is_symlink()) and not args.force:
         raise CliError(f"{output} already exists (use --force to overwrite it)")
     if not output.parent.is_dir():
         raise CliError(f"the folder {output.parent} doesn't exist")
@@ -241,7 +250,12 @@ def _convert(args: argparse.Namespace) -> int:
                 if engine.warning:
                     print(f"Note: {engine.warning}")
                 result = convert_book(
-                    book, engine, output, workdir=workdir, progress=progress.update
+                    book,
+                    engine,
+                    output,
+                    workdir=workdir,
+                    progress=progress.update,
+                    format=output_format,
                 )
         except KeyboardInterrupt:
             progress.finish()
@@ -262,7 +276,7 @@ def _convert(args: argparse.Namespace) -> int:
         print(f"Picked up where the last run stopped ({_plural(result.reused_chunks, 'piece')}).")
     length = result.chapters[-1].end_seconds if result.chapters else 0.0
     print(
-        f"Done: {output} ({_duration(length)} of audio, "
+        f"Done: {result.output} ({_duration(length)} of audio, "
         f"{_plural(len(result.chapters), 'chapter')}, "
         f"made in {_duration(time.monotonic() - started)})."
     )

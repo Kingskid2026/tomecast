@@ -211,6 +211,7 @@ class DemoBackend(QObject):
     voiceChanged = Signal()
     voiceLabelChanged = Signal()
     speedChanged = Signal()
+    outputFormatChanged = Signal()
     previewTextChanged = Signal()
     previewPlayingChanged = Signal()
     previewAvailableChanged = Signal()
@@ -299,6 +300,7 @@ class DemoBackend(QObject):
             "voice": "af_heart",
             "voiceLabel": "",
             "speed": 1.0,
+            "outputFormat": "m4b",
             "previewText": str(data["ch1_first_sentences"][0]),
             "previewPlaying": False,
             "previewAvailable": True,
@@ -524,6 +526,12 @@ class DemoBackend(QObject):
         self._set("speed", round(MIN_SPEED + steps * SPEED_STEP, 2))
         self._set("selectionSummary", self._summary())
 
+    @Slot(str)
+    def setOutputFormat(self, name: str) -> None:
+        self._record("setOutputFormat", name)
+        if name in ("m4b", "mp3"):
+            self._set("outputFormat", name)
+
     @Slot(bool)
     def setUseGpu(self, on: bool) -> None:
         self._record("setUseGpu", on)
@@ -617,6 +625,7 @@ class DemoBackend(QObject):
     voice = Property(str, lambda self: self._get("voice"), notify=voiceChanged)
     voiceLabel = Property(str, lambda self: self._get("voiceLabel"), notify=voiceLabelChanged)
     speed = Property(float, lambda self: self._get("speed"), notify=speedChanged)
+    outputFormat = Property(str, lambda self: self._get("outputFormat"), notify=outputFormatChanged)
     minSpeed = Property(float, lambda self: MIN_SPEED, constant=True)
     maxSpeed = Property(float, lambda self: MAX_SPEED, constant=True)
     speedStep = Property(float, lambda self: SPEED_STEP, constant=True)
