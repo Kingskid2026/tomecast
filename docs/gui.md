@@ -26,7 +26,10 @@ src/tomecast/gui/
     screens/       DropScreen, ChaptersScreen, VoiceScreen, ConvertingScreen, DoneScreen
 ```
 
-QML module URI: `Tomecast` (version 1.0). It holds `Backend` (singleton), `DotGrid`, and the QML files above.
+**Imports:**
+- Python registers its types under the URI `TomecastNative` 1.0: the `Backend` singleton (`qmlRegisterSingletonInstance`) and `DotGrid` (`qmlRegisterType`). QML files write `import TomecastNative`.
+- The QML files are plain directory imports. `qml/qmldir` declares `singleton Theme 1.0 Theme.qml`. `Main.qml` writes `import "."`, `import "components"` and `import "screens"`; files in subfolders write `import ".."` (for `Theme`) and `import "../components"`.
+- `app.py` loads `qml/Main.qml` by file path, after registering the Python types and the `dots` image provider.
 
 ## Rules
 
@@ -55,6 +58,7 @@ Every property has a `<name>Changed` notify signal. Lists are plain JS arrays of
 |---|---|
 | `setThemeSetting(name)` | switch the theme |
 | `goTo(screen)` | move between screens that are allowed from here (back buttons) |
+| `chooseBookFolder()` → string | the folder the file dialog should open in (last used, else `~`) |
 | `dismissError()` | clear `errorMessage` |
 
 ### Book (drop and chapters screens)
