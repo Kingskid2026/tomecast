@@ -310,7 +310,7 @@ _NOT_A_NOUN = frozenset(
     "be been are this that it".split()
 )
 _ARTICLE_BEFORE = re.compile(r"\b(?:a|an)\s+$", re.IGNORECASE)
-_WORD_AFTER = re.compile(r"\s+([a-z][a-z'’-]*)")
+_WORD_AFTER = re.compile(r"\s+([a-z][a-z'\u2019-]*)")  # \u2019: a curly apostrophe
 
 
 def _describes_next_word(text: str, match: re.Match[str]) -> bool:
