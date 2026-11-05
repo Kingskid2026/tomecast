@@ -151,7 +151,11 @@ def _gui(args: argparse.Namespace) -> int:
 
         return run([str(book)] if book else [])
     except ImportError as error:
-        raise CliError(f"the desktop window can't start ({error})") from error
+        raise CliError(
+            f"the desktop window can't start: {error}. The window needs the graphics libraries "
+            "every Linux desktop has (libEGL, libxkbcommon, fontconfig). On a machine without "
+            "a desktop, use 'tomecast convert' instead."
+        ) from error
 
 
 def _desktop_entry(args: argparse.Namespace) -> int:
