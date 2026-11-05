@@ -9,6 +9,7 @@ from typing import ClassVar
 
 import pytest
 from epub_factory import NavPoint, Page, build_epub
+from format_factory import book_in_format
 
 from tomecast import __version__, cli
 from tomecast.downloads import Asset
@@ -117,6 +118,18 @@ def test_convert_writes_an_audiobook(tmp_path: Path, capsys: pytest.CaptureFixtu
     assert not any((tmp_path / "data" / "cache").iterdir())  # work files cleaned up
 
 
+@pytest.mark.parametrize("name", ["book.docx", "book.fb2", "book.txt", "book.html", "book.htm"])
+def test_convert_accepts_every_readable_format(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], name: str
+) -> None:
+    book = book_in_format(tmp_path, name)
+
+    assert cli.main(["convert", str(book)]) == 0
+
+    assert book.with_suffix(".m4b").is_file()
+    assert "2 chapters" in capsys.readouterr().out
+
+
 def test_convert_refuses_to_overwrite_without_force(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -135,7 +148,9 @@ def test_convert_refuses_to_overwrite_without_force(
     ("name", "content", "message"),
     [
         ("missing.epub", None, "doesn't exist"),
-        ("book.pdf", b"%PDF-1.7", "only EPUB"),
+        ("book.pdf", b"%PDF-1.7", "can't read .pdf files"),
+        ("notes.xyz", b"hello", "reads EPUB, DOCX, FB2, HTML and TXT books"),
+        ("picture.txt", bytes(range(256)) * 20, "isn't a text file"),
         ("broken.epub", b"not a zip", "not"),
     ],
 )

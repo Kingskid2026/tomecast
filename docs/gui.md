@@ -33,7 +33,7 @@ src/tomecast/gui/
 
 ## Rules
 
-- **Threads:** `convert_book()`, downloads and EPUB reading run on a `QThread` that lives for the whole job, never on the GUI thread. The engine's "stop when Tomecast dies" signal fires when the *thread* that started it exits, so the engine must be started from that long-lived thread. Workers talk to the GUI only through Qt signals (queued connections). QML never sees worker objects.
+- **Threads:** `convert_book()`, downloads and book reading run on a `QThread` that lives for the whole job, never on the GUI thread. The engine's "stop when Tomecast dies" signal fires when the *thread* that started it exits, so the engine must be started from that long-lived thread. Workers talk to the GUI only through Qt signals (queued connections). QML never sees worker objects.
 - **Light on resources:** nothing animates continuously while converting. `DotGrid` repaints only when `done` changes; screen changes animate for 150–400 ms. A system "reduce motion" setting (or `Backend.reduceMotion`) turns animations off.
 - **No new heavy dependencies:** PySide6-Essentials only (no QtMultimedia, no Pillow). The voice preview plays through the system's player (`pw-play`, then `paplay`, then `aplay`).
 - **Accessibility:** every control has `Accessible.name`; keyboard focus is visible (2 px accent outline); text meets 4.5:1.
@@ -75,7 +75,7 @@ Every property has a `<name>Changed` notify signal. Lists are plain JS arrays of
 | `bookTitle`, `bookAuthors` | string | authors joined with ", " |
 | `coverSource` | string | `"image://dots/cover/<theme>?<n>"` (`<n>` changes per book), or `""` without a cover (a cover whose shape is thinner than 1:4 or wider than 4:1 counts as none) |
 | `artSource` | string | `"image://dots/cantoria/<theme>"` |
-| `formatsLabel` | string | the formats Tomecast can read today, from `tomecast.readers.FORMATS` joined with `" · "` (just `"EPUB"` for now) |
+| `formatsLabel` | string | the formats Tomecast can read today, from `tomecast.readers.FORMATS` joined with `" · "` ("EPUB · DOCX · FB2 · HTML · TXT" today). The file dialog's filter in `DropScreen.qml` must list the same suffixes as `tomecast.readers.SUFFIXES` (a test checks this). Books are read with `tomecast.readers.read_book`, which also picks the reader by content, so a mis-named book still opens once it's chosen |
 | `chapters` | ChapterModel | one row per section of the book. A section with no title is called `"Untitled section"` (its accessible name is "Include untitled section") |
 | `skipFrontMatter` | bool | ticks and unticks the rows marked front matter |
 | `selectionSummary` | object | `{sections, words, audio, make}`: ready-to-show uppercase strings, as in the mockup. `audio` is the length of the finished book, so it shrinks as the speed goes up; `make` is the time to voice it, which stops shrinking above 1.5× because the voice never speaks faster than that. It is recomputed when the speed changes ("12 OF 15 SECTIONS", "26,371 WORDS", "ABOUT 2 H 47 MIN OF AUDIO", "ABOUT 36 MIN TO MAKE HERE") |

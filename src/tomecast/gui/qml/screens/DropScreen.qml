@@ -147,7 +147,7 @@ ScreenPage {
         title: "Choose a book"
         fileMode: FileDialog.OpenFile
         nameFilters: [
-            "Books (*.epub)",
+            "Books (*.epub *.docx *.fb2 *.html *.htm *.xhtml *.txt)",
             "All files (*)"
         ]
         onAccepted: Backend.openBook(selectedFile)

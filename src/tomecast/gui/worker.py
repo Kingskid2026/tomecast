@@ -42,7 +42,7 @@ from tomecast.downloads import Asset, DownloadError, ensure, is_installed, local
 from tomecast.engines.audiocpp import AUDIOCPP_VULKAN, AutoKokoro, EngineError
 from tomecast.hardware import list_devices, pick_device
 from tomecast.packaging import PackagingError, stretch_wav
-from tomecast.readers.epub import InvalidEbookError, read_epub
+from tomecast.readers import InvalidEbookError, read_book
 from tomecast.workdirs import WorkFolderBusy, exclusive, work_folder
 
 # Speed and time left are shown once this many chunks have been voiced in the current run.
@@ -331,7 +331,7 @@ class ConversionWorker(QObject):
 
     def _read(self, job: ReadJob) -> None:
         try:
-            book = read_epub(job.path)
+            book = read_book(job.path)
         except InvalidEbookError as error:
             self.failed.emit(job.job, _as_sentence(str(error), capitalize=False))
             return

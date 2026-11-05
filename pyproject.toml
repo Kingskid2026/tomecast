@@ -10,7 +10,7 @@ authors = [{ name = "Ambrose Sigler" }]
 # setDevicePixelRatio...). That's harmless where None is immortal (3.12+, PEP 683) but
 # crashes 3.11. uv fetches a newer Python automatically where the system's is older.
 requires-python = ">=3.12"
-keywords = ["audiobook", "text-to-speech", "tts", "epub", "ebook", "linux", "kokoro", "local-ai"]
+keywords = ["audiobook", "text-to-speech", "tts", "epub", "docx", "fb2", "ebook", "linux", "kokoro", "local-ai"]
 classifiers = [
     "Development Status :: 1 - Planning",
     "Environment :: Console",
@@ -28,6 +28,7 @@ dependencies = [
     "imageio-ffmpeg>=0.8.1",
     "lxml>=6.1.3",
     "pyside6-essentials>=6.12.0",
+    "python-docx>=1.2.0",
 ]
 
 [project.urls]

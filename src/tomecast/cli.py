@@ -46,7 +46,7 @@ from tomecast.engines.audiocpp import (
 )
 from tomecast.hardware import list_devices, vulkan_possible
 from tomecast.packaging import PackagingError
-from tomecast.readers.epub import InvalidEbookError, read_epub
+from tomecast.readers import FORMATS, InvalidEbookError, read_book
 from tomecast.workdirs import WorkFolderBusy, exclusive, work_folder
 
 
@@ -81,7 +81,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="turn an ebook into an M4B audiobook",
         description="Turn an ebook into an M4B audiobook with chapters.",
     )
-    convert.add_argument("book", type=Path, help="the ebook to convert (EPUB for now)")
+    convert.add_argument("book", type=Path, help=f"the ebook to convert ({', '.join(FORMATS)})")
     convert.add_argument(
         "-o", "--output", type=Path, help="where to write the audiobook (default: BOOK.m4b)"
     )
@@ -201,8 +201,6 @@ def _convert(args: argparse.Namespace) -> int:
     book_path: Path = args.book
     if not book_path.is_file():
         raise CliError(f"{book_path} doesn't exist")
-    if book_path.suffix.lower() != ".epub":
-        raise CliError("only EPUB books are supported so far (PDF and other formats are coming)")
     output: Path = args.output or book_path.with_suffix(".m4b")
     if output.exists() and not args.force:
         raise CliError(f"{output} already exists (use --force to overwrite it)")
@@ -210,7 +208,7 @@ def _convert(args: argparse.Namespace) -> int:
         raise CliError(f"the folder {output.parent} doesn't exist")
 
     try:
-        book = read_epub(book_path)
+        book = read_book(book_path)
         check_system()
     except (InvalidEbookError, EngineError, OSError) as error:
         raise CliError(str(error)) from error

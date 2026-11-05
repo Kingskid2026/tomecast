@@ -236,7 +236,7 @@ def test_theme_switches_the_palette(app_window: Window, messages: Messages) -> N
 def test_drop_screen_texts(app_window: Window, messages: Messages) -> None:
     app_window.show("drop")
     assert app_window.text("dropTitle") == "DROP A BOOK HERE"
-    assert app_window.text("formatsLabel") == "EPUB"
+    assert app_window.text("formatsLabel") == "EPUB · DOCX · FB2 · HTML · TXT"
     assert app_window.text("hardwareLabel") == "CPU · ABOUT 4.7× REAL TIME"
     assert app_window.find("artCredit") is None  # no art credit under the Cantoria
     assert app_window.text("chooseBookButton") == "Choose a book"
