@@ -331,10 +331,10 @@ def _ffmpeg_command(
         # Input 0: the whole book as raw 16-bit mono PCM, streamed on stdin.
         "-f", "s16le", "-ar", str(sample_rate), "-ch_layout", "mono", "-i", "pipe:0",
         # Input 1: the tags and chapter markers.
-        "-f", "ffmetadata", "-i", str(metadata),
+        "-f", "ffmetadata", "-i", _ffmpeg_path(metadata),
     ]  # fmt: skip
     if cover is not None:
-        command += ["-i", str(cover)]  # input 2: the cover image
+        command += ["-i", _ffmpeg_path(cover)]  # input 2: the cover image
     command += ["-map", "0:a", "-map_metadata", "1", "-map_chapters", "1"]
     if cover is not None:
         # Copy the image unchanged, stored as cover art rather than as a video track.
@@ -344,9 +344,37 @@ def _ffmpeg_command(
         "-f", "ipod",  # the MP4 flavour ffmpeg uses for .m4a/.m4b
         "-brand", "M4B ",  # the major brand players use to recognise audiobooks
         "-movflags", "+faststart",  # index at the front, so players can start right away
-        str(output),
+        _ffmpeg_path(output),
     ]  # fmt: skip
     return command
+
+
+def _ffmpeg_path(path: Path) -> str:
+    """A path ffmpeg can't misread: absolute and marked as a file.
+
+    ffmpeg treats ``name:rest`` as a protocol (so ``Dune: Messiah.m4b`` fails) and names
+    starting with ``-`` as options; ``file:`` plus an absolute path avoids both.
+    """
+    return f"file:{path.absolute()}"
+
+
+def cover_is_usable(cover: Cover, ffmpeg: str | None = None) -> bool:
+    """True if ffmpeg can decode ``cover`` cleanly, so it's safe to embed.
+
+    Checked before a book is voiced, so a damaged cover can't fail packaging at the very end.
+    """
+    try:
+        result = subprocess.run(
+            [ffmpeg or _bundled_ffmpeg(), "-hide_banner", "-v", "error",
+             "-i", "pipe:0", "-f", "null", "-"],
+            input=cover.data,
+            capture_output=True,
+            check=False,
+            timeout=60,
+        )  # fmt: skip
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0 and not result.stderr.strip()
 
 
 def _encode(command: list[str], chapters: Sequence[_PlannedChapter], *, log_path: Path) -> None:

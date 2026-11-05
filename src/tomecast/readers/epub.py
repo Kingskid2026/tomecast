@@ -44,16 +44,18 @@ _PACKAGE_MEDIA_TYPE = "application/oebps-package+xml"
 _NCX_MEDIA_TYPE = "application/x-dtbncx+xml"
 _EPUB_TYPE = "{http://www.idpf.org/2007/ops}type"
 
-# Spine items with these media types are read; anything else (images, SVG) has no text.
+# Media types (without parameters like "; charset=utf-8") of documents read as (X)HTML. Other
+# spine items are read too if they look like markup, except images, which have no text.
 _TEXT_MEDIA_TYPES = frozenset(
     {
         "application/xhtml+xml",
+        "application/xhtml",
+        "text/xhtml",
         "text/html",
         "application/xml",
         "text/xml",
         "application/x-dtbook+xml",
         "text/x-oeb1-document",
-        "",  # no media type given: try to read it rather than risk losing text
     }
 )
 
@@ -83,7 +85,17 @@ _SKIPPED_CLASSES = frozenset({"pagenum", "pg-boilerplate"})
 
 _XML_ENCODING = re.compile(rb"""^\s*<\?xml[^>]*?\sencoding\s*=\s*["']([A-Za-z0-9._:-]+)""")
 _META_CHARSET = re.compile(rb"""<meta[^>]*?charset\s*=\s*["']?([A-Za-z0-9._:-]+)""", re.IGNORECASE)
+# Image classes that mark a drop cap: "dropcap", "drop-cap", "cap", "capital", but not
+# "caption", "landscape" or "escape".
+_DROP_CAP_CLASS = re.compile(r"drop|\bcap(?!tion)", re.IGNORECASE)
 _WORD = re.compile(r"[^\W_]+")
+_NUMBER_WORDS = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8,
+    "nine": 9, "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14,
+    "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19,
+    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60, "seventy": 70,
+    "eighty": 80, "ninety": 90,
+}  # fmt: skip
 _ROMAN_NUMERAL = re.compile(r"m{0,4}(cm|cd|d?c{0,3})(xc|xl|l?x{0,3})(ix|iv|v?i{0,3})")
 _ROMAN_VALUES = {"i": 1, "v": 5, "x": 10, "l": 50, "c": 100, "d": 500, "m": 1000}
 
@@ -184,8 +196,9 @@ class _Item:
     """One file listed in the package manifest."""
 
     path: str  # the file's name inside the zip
-    media_type: str
+    media_type: str  # lowercase, without parameters like "; charset=utf-8"
     properties: frozenset[str]
+    fallback: str  # the ID of an item to use instead when this one can't be read, or ""
 
 
 def _find_package_path(archive: _Archive) -> str:
@@ -226,25 +239,56 @@ def _read_manifest(
         path, _ = _resolve_href(package_path, href)
         manifest[item_id] = _Item(
             path=archive.canonical(path),
-            media_type=(element.get("media-type") or "").strip().lower(),
+            media_type=(element.get("media-type") or "").partition(";")[0].strip().lower(),
             properties=_tokens(element.get("properties")),
+            fallback=element.get("fallback") or "",
         )
     return manifest
 
 
 def _read_spine(package: etree._Element, manifest: Mapping[str, _Item]) -> list[_Item]:
-    """Return the text documents in reading order, without ``linear="no"`` items or images."""
+    """Return the documents to read, in reading order.
+
+    Items marked ``linear="no"`` and images are left out. Nothing else is skipped: an itemref
+    naming no manifest item is an error, not a missing chapter.
+    """
     spine = _first(package, "spine")
     if spine is None:
         raise InvalidEbookError("the package document has no spine (reading order)")
+    # Some books get the case of IDs wrong, so they're also matched case-insensitively.
+    folded_ids: dict[str, str] = {}
+    for item_id in manifest:
+        folded_ids.setdefault(item_id.casefold(), item_id)
     documents: list[_Item] = []
     for itemref in _descendants(spine, "itemref"):
         if (itemref.get("linear") or "").strip().lower() == "no":
             continue
-        item = manifest.get(itemref.get("idref") or "")
-        if item is not None and item.media_type in _TEXT_MEDIA_TYPES:
-            documents.append(item)
+        idref = (itemref.get("idref") or "").strip()
+        item = manifest.get(idref) or manifest.get(folded_ids.get(idref.casefold(), ""))
+        if item is None:
+            raise InvalidEbookError(
+                f"the reading order names {idref!r}, which isn't in the manifest"
+            )
+        document = _document_to_read(item, manifest)
+        if document is not None:
+            documents.append(document)
     return documents
+
+
+def _document_to_read(item: _Item, manifest: Mapping[str, _Item]) -> _Item | None:
+    """Return the item to read for a spine item, or None for an image (which has no text).
+
+    A spine item that isn't (X)HTML may name a fallback that is, as EPUB 3 allows. Failing
+    that, it's still read, as long as it turns out to be markup (see :func:`_read_spine_item`).
+    """
+    candidate: _Item | None = item
+    seen: set[str] = set()
+    while candidate is not None and candidate.path not in seen:
+        if candidate.media_type in _TEXT_MEDIA_TYPES:
+            return candidate
+        seen.add(candidate.path)
+        candidate = manifest.get(candidate.fallback)
+    return None if item.media_type.startswith("image/") else item
 
 
 def _read_metadata(package: etree._Element) -> tuple[str, tuple[str, ...], str | None]:
@@ -345,7 +389,7 @@ def _read_toc(
 
 def _read_nav(archive: _Archive, nav_path: str) -> list[_TocEntry]:
     """Read the ``<nav epub:type="toc">`` list. Nested lists are flattened in reading order."""
-    root = _parse_document(archive.read(nav_path))
+    root = _parse_document(archive.read(nav_path), nav_path)
     toc = next((nav for nav in _descendants(root, "nav") if "toc" in _epub_types(nav)), None)
     if toc is None:
         return []
@@ -369,7 +413,7 @@ def _find_ncx(package: etree._Element, manifest: Mapping[str, _Item]) -> _Item |
 
 def _read_ncx(archive: _Archive, ncx_path: str) -> list[_TocEntry]:
     """Read the NCX ``navPoint``s in document order, which flattens nested ones in order."""
-    root = _parse_document(archive.read(ncx_path))
+    root = _parse_document(archive.read(ncx_path), ncx_path)
     nav_map = _first(root, "navmap")
     if nav_map is None:
         return []
@@ -418,14 +462,28 @@ def _read_chapters(
 
     events: list[_Event] = []
     for item in spine:
-        root = _parse_document(archive.read(item.path))
+        root = _read_spine_item(archive, item)
         document_events = _read_document(root, toc_by_path.get(item.path, ()))
         if not toc_by_path:
-            # No usable table of contents: each file is a chapter, titled by its first heading.
-            headings = (e.text for e in document_events if isinstance(e, _Block) and e.is_heading)
-            document_events.insert(0, _ChapterStart(next(headings, "")))
+            # No usable table of contents: each file is a chapter. A file that opens with a
+            # heading is titled by it; a heading further in stays where it is, so nothing is
+            # spoken out of order.
+            first = next((e for e in document_events if isinstance(e, _Block)), None)
+            title = first.text if first is not None and first.is_heading else ""
+            document_events.insert(0, _ChapterStart(title))
         events.extend(document_events)
     return _assemble_chapters(events)
+
+
+def _read_spine_item(archive: _Archive, item: _Item) -> etree._Element:
+    """Parse a document from the reading order, refusing one that isn't markup at all."""
+    data = archive.read(item.path)
+    if item.media_type not in _TEXT_MEDIA_TYPES and not _looks_like_markup(data):
+        media_type = item.media_type or "no media type"
+        raise InvalidEbookError(
+            f"{item.path} ({media_type}) is in the reading order but isn't XHTML"
+        )
+    return _parse_document(data, item.path)
 
 
 def _read_document(root: etree._Element, entries: Sequence[_TocEntry]) -> list[_Event]:
@@ -457,6 +515,7 @@ class _DocumentWalker:
         self._targets = dict(targets)  # element id -> titles of the chapters starting there
         self._events: list[_Event] = []
         self._text: list[str] = []
+        self._has_text = False  # whether the paragraph so far has text besides drop caps
         self._heading_depth = 0
 
     def walk(self, root: etree._Element) -> list[_Event]:
@@ -478,6 +537,10 @@ class _DocumentWalker:
             self._end_paragraph()
         if _is_skipped(element, name):
             return  # the caller still reads the text after it (its tail)
+        if name == "img":
+            # No space after it: a drop cap is the start of the word that follows.
+            self._text.append(_drop_cap_letters(element))
+            return
         if is_heading:
             self._heading_depth += 1
         self._add(element.text)
@@ -500,12 +563,33 @@ class _DocumentWalker:
     def _add(self, text: str | None) -> None:
         if text:
             self._text.append(text)
+            self._has_text = self._has_text or not text.isspace()
 
     def _end_paragraph(self) -> None:
-        text = normalize_whitespace("".join(self._text))
+        # A drop cap with no text around it is an image on its own, not part of a word.
+        text = normalize_whitespace("".join(self._text)) if self._has_text else ""
         self._text.clear()
+        self._has_text = False
         if text:
             self._events.append(_Block(text, is_heading=self._heading_depth > 0))
+
+
+def _drop_cap_letters(image: etree._Element) -> str:
+    """Return the alt text of an image that holds the first letter of a word, else ``""``.
+
+    Illustrated drop caps draw a word's first letter as a picture (``<img alt="T"/>he quick
+    fox``), so the letter must be read for the word to make sense. An image counts as one when
+    its alt text is one or two characters, or when it or its parent has a drop-cap class, and
+    the alt text has a letter or digit (so ornaments like ``*`` aren't read). Any other alt
+    text describes a picture, which isn't read.
+    """
+    alt = (image.get("alt") or "").strip()
+    if not any(character.isalnum() for character in alt):
+        return ""
+    parent = image.getparent()
+    parent_class = parent.get("class") if parent is not None else None
+    classes = f"{image.get('class') or ''} {parent_class or ''}"
+    return alt if len(alt) <= 2 or _DROP_CAP_CLASS.search(classes) else ""
 
 
 def _is_skipped(element: etree._Element, name: str) -> bool:
@@ -585,8 +669,21 @@ def _repeats(heading: str, title: str) -> bool:
 
 
 def _comparable_words(text: str) -> list[str]:
-    """Lowercase words and numbers, with roman numerals turned into digits."""
-    return [_roman_to_digits(word) for word in _WORD.findall(text.casefold())]
+    """Lowercase words, with numbers as digits whether written "4", "IV" or "four".
+
+    Number words go up to ninety-nine: "twenty-one" (two words here) becomes "21".
+    """
+    words: list[str] = []
+    after_tens = False  # whether the previous word was "twenty", "thirty" and so on
+    for word in _WORD.findall(text.casefold()):
+        number = _NUMBER_WORDS.get(word)
+        if number is not None and number < 10 and after_tens:
+            words[-1] = str(int(words[-1]) + number)
+            after_tens = False
+            continue
+        after_tens = number is not None and number >= 20
+        words.append(str(number) if number is not None else _roman_to_digits(word))
+    return words
 
 
 def _roman_to_digits(word: str) -> str:
@@ -625,13 +722,17 @@ def _parse_xml(data: bytes, name: str) -> etree._Element:
         raise InvalidEbookError(f"{name} isn't well-formed XML: {error}") from error
 
 
-def _parse_document(data: bytes) -> etree._Element:
+def _parse_document(data: bytes, name: str) -> etree._Element:
     """Parse an XHTML document, falling back to the forgiving HTML parser for broken markup.
 
     The XML parser is tried first, because it's exact. Many books aren't well-formed XML,
     though, most often because they use HTML entities like ``&nbsp;`` without a DTD. With
     entity expansion off, those either fail to parse or are left as unexpanded references
     (which would lose their characters), and either way the HTML parser reads the file instead.
+
+    The HTML parser recovers from almost anything, but when it hits a resource limit (nesting
+    deeper than 256 levels, or a single text over about 10 MB) it stops and returns what it
+    has so far. That would silently lose the rest of the file, so it raises instead.
     """
     try:
         root = etree.fromstring(data, _xml_parser())
@@ -640,10 +741,15 @@ def _parse_document(data: bytes) -> etree._Element:
     else:
         if next(root.iter(etree.Entity), None) is None:
             return root
+    parser = _html_parser(_guess_encoding(data))
     try:
-        return lxml.html.document_fromstring(data, parser=_html_parser(_guess_encoding(data)))
-    except etree.ParserError:  # the HTML parser only gives up on documents with no content
-        return etree.Element("html")
+        root = lxml.html.document_fromstring(data, parser=parser)
+    except etree.ParserError:  # the document has no content at all
+        root = etree.Element("html")
+    fatal = next((e for e in parser.error_log if e.level == etree.ErrorLevels.FATAL), None)
+    if fatal is not None:
+        raise InvalidEbookError(f"{name} can't be read completely: {fatal.message}")
+    return root
 
 
 def _html_parser(encoding: str) -> lxml.html.HTMLParser:
@@ -661,7 +767,8 @@ def _html_parser(encoding: str) -> lxml.html.HTMLParser:
 
 
 def _guess_encoding(data: bytes) -> str:
-    """Find a document's encoding from its byte-order mark, XML declaration or ``<meta>``.
+    """Find a document's encoding from its byte-order mark, its bytes, its XML declaration or
+    its ``<meta>`` tag.
 
     The HTML parser would otherwise assume Latin-1 and garble UTF-8 text, so this defaults to
     UTF-8, the encoding EPUB requires.
@@ -670,8 +777,38 @@ def _guess_encoding(data: bytes) -> str:
         return "utf-8"
     if data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
         return "utf-16"
+    utf16 = _utf16_without_bom(data)
+    if utf16 is not None:
+        return utf16
     match = _XML_ENCODING.match(data) or _META_CHARSET.search(data)
     return match.group(1).decode("ascii") if match else "utf-8"
+
+
+def _utf16_without_bom(data: bytes) -> str | None:
+    """Spot UTF-16 that has no byte-order mark, returning "utf-16le", "utf-16be" or None.
+
+    Markup is mostly ASCII, so near the start of a UTF-16 file every other byte is NUL:
+    ``<p`` is ``<\\0p\\0`` in little-endian order and ``\\0<\\0p`` in big-endian order.
+    """
+    sample = data[:256]
+    pairs = len(sample) // 2
+    if pairs < 2:
+        return None
+    even_nuls, odd_nuls = sample[0 : pairs * 2 : 2].count(0), sample[1 : pairs * 2 : 2].count(0)
+    if odd_nuls >= pairs / 2 and even_nuls < pairs / 8:
+        return "utf-16le"
+    if even_nuls >= pairs / 2 and odd_nuls < pairs / 8:
+        return "utf-16be"
+    return None
+
+
+def _looks_like_markup(data: bytes) -> bool:
+    """Return whether a file is text that starts with a tag, as (X)HTML does."""
+    try:
+        text = data.decode(_guess_encoding(data))
+    except (UnicodeDecodeError, LookupError):
+        return False
+    return text.lstrip("\ufeff \t\r\n").startswith("<")
 
 
 # --- Small helpers -------------------------------------------------------------------------

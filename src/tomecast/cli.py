@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import shutil
+import signal
 import sys
-import tempfile
 import time
+import wave
 from collections.abc import Sequence
 from pathlib import Path
 from typing import TextIO
 
 from tomecast import __version__
+from tomecast.chunking import CoverageError
 from tomecast.convert import ConversionProgress, MissingAudioError, convert_book, plan_chunks
 from tomecast.downloads import (
     Asset,
@@ -21,6 +25,7 @@ from tomecast.downloads import (
     is_installed,
 )
 from tomecast.engines.audiocpp import (
+    AUDIOCPP_VERSION,
     DEFAULT_VOICE,
     MAX_CHARS,
     REQUIRED_ASSETS,
@@ -35,6 +40,20 @@ from tomecast.readers.epub import InvalidEbookError, read_epub
 
 class CliError(Exception):
     """A problem to report to the user as ``tomecast: error: …``."""
+
+
+# Unfinished conversions are kept so they can be resumed; after this long they're removed.
+STALE_WORK_DAYS = 14
+
+
+def _speed(value: str) -> float:
+    try:
+        speed = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value!r} isn't a number") from None
+    if not 0.5 <= speed <= 2.0:
+        raise argparse.ArgumentTypeError("must be between 0.5 and 2.0")
+    return speed
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -60,7 +79,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Kokoro voice (default: {DEFAULT_VOICE}; see `tomecast voices`)",
     )  # fmt: skip
     convert.add_argument(
-        "--speed", type=float, default=1.0, help="speaking speed, 0.5 to 2.0 (default: 1.0)"
+        "--speed", type=_speed, default=1.0, help="speaking speed, 0.5 to 2.0 (default: 1.0)"
     )
     convert.add_argument(
         "-y", "--yes", action="store_true", help="download the voice engine without asking"
@@ -75,6 +94,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Run the ``tomecast`` command and return its exit code."""
     parser = build_parser()
     args = parser.parse_args(argv)
+    # Treat `kill` like Ctrl-C, so the voice engine is stopped and work is saved for resuming.
+    previous = signal.signal(signal.SIGTERM, _interrupt)
     try:
         if args.command == "convert":
             return _convert(args)
@@ -86,6 +107,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("\ntomecast: stopped.", file=sys.stderr)
         return 130
+    finally:
+        signal.signal(signal.SIGTERM, previous)
     parser.print_help()
     return 0
 
@@ -118,7 +141,7 @@ def _convert(args: argparse.Namespace) -> int:
     try:
         book = read_epub(book_path)
         check_system()
-    except (InvalidEbookError, EngineError) as error:
+    except (InvalidEbookError, EngineError, OSError) as error:
         raise CliError(str(error)) from error
     if not book.chapters:
         raise CliError(f"no readable text found in {book_path.name}")
@@ -131,29 +154,60 @@ def _convert(args: argparse.Namespace) -> int:
         f"Converting “{book.title}”: {_plural(len(book.chapters), 'chapter')}, "
         f"{_plural(chunk_count, 'piece')} of text, voice {args.voice}."
     )
+    workdir = _work_folder(root, book_path, args.voice, args.speed)
     progress = _ProgressPrinter(sys.stderr)
-    cache = root / "cache"
-    cache.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
     try:
-        with (
-            tempfile.TemporaryDirectory(prefix="convert-", dir=cache) as workdir,
-            KokoroServer(root, voice=args.voice, speed=args.speed) as engine,
-        ):
-            chapters = convert_book(
-                book, engine, output, workdir=Path(workdir), progress=progress.update
-            )
-    except (EngineError, MissingAudioError, PackagingError) as error:
+        with KokoroServer(root, voice=args.voice, speed=args.speed) as engine:
+            result = convert_book(book, engine, output, workdir=workdir, progress=progress.update)
+    except KeyboardInterrupt:
         progress.finish()
-        raise CliError(str(error)) from error
+        print("The audio made so far is saved. Run the same command again to continue.")
+        raise
+    except (
+        EngineError, MissingAudioError, PackagingError, CoverageError, OSError, wave.Error
+    ) as error:  # fmt: skip
+        progress.finish()
+        raise CliError(
+            f"{error}\nThe audio made so far is saved. Run the same command again to continue."
+        ) from error
     progress.finish()
+    shutil.rmtree(workdir, ignore_errors=True)
 
-    length = chapters[-1].end_seconds if chapters else 0.0
+    for warning in result.warnings:
+        print(f"Note: {warning}")
+    if result.reused_chunks:
+        print(f"Picked up where the last run stopped ({_plural(result.reused_chunks, 'piece')}).")
+    length = result.chapters[-1].end_seconds if result.chapters else 0.0
     print(
-        f"Done: {output} ({_duration(length)} of audio, {_plural(len(chapters), 'chapter')}, "
+        f"Done: {output} ({_duration(length)} of audio, "
+        f"{_plural(len(result.chapters), 'chapter')}, "
         f"made in {_duration(time.monotonic() - started)})."
     )
     return 0
+
+
+def _interrupt(signum: int, frame: object) -> None:
+    raise KeyboardInterrupt
+
+
+def _work_folder(root: Path, book: Path, voice: str, speed: float) -> Path:
+    """The folder for this book's chunk audio: the same book and settings resume in it."""
+    cache = root / "cache"
+    cache.mkdir(parents=True, exist_ok=True)
+    cutoff = time.time() - STALE_WORK_DAYS * 86400
+    for old in cache.glob("convert-*"):
+        if old.is_dir() and old.stat().st_mtime < cutoff:
+            shutil.rmtree(old, ignore_errors=True)
+    digest = hashlib.sha256()
+    with book.open("rb") as f:
+        while block := f.read(1024 * 1024):
+            digest.update(block)
+    digest.update(f"{voice}|{speed}|audiocpp-{AUDIOCPP_VERSION}".encode())
+    folder = cache / f"convert-{digest.hexdigest()[:16]}"
+    folder.mkdir(exist_ok=True)
+    folder.touch()  # counts as recently used
+    return folder
 
 
 def _install(assets: Sequence[Asset], root: Path, *, assume_yes: bool) -> None:

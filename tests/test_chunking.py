@@ -113,3 +113,50 @@ def test_verify_coverage_catches_changed_text() -> None:
     chunk = Chunk(0, 0, 0, 0, "One. Too.", Boundary.PARAGRAPH)
     with pytest.raises(CoverageError):
         verify_coverage(["One. Two."], [chunk])
+
+
+def test_japanese_and_chinese_sentences_split_without_spaces() -> None:
+    japanese = "猫が来た。犬も来た！本当？"
+    assert split_sentences(japanese) == [
+        "猫が来た。",
+        "犬も来た！",
+        "本当？",
+    ]
+    quoted = "「行こう。」彼は言った。"
+    assert split_sentences(quoted) == [
+        "「行こう。」",
+        "彼は言った。",
+    ]
+
+
+def test_hindi_sentences_split_at_the_danda() -> None:
+    hindi = "यह अच्छा है। वह भी।"
+    assert len(split_sentences(hindi)) == 2
+
+
+def test_long_cjk_text_splits_at_commas_not_mid_word() -> None:
+    clause = "あ" * 30 + "、"
+    sentence = clause * 8 + "。"
+    pieces = split_long(sentence, max_chars=100)
+    assert all(len(p) <= 100 for p in pieces)
+    assert all(p.endswith(("、", "。")) for p in pieces)
+    assert "".join(pieces) == sentence
+
+
+def test_chunks_without_letters_or_digits_are_not_speakable() -> None:
+    chunks = chunk_paragraphs(0, ["* * *", "⁂", "It went on. 1984."], max_chars=100)
+    assert [c.speakable for c in chunks] == [False, False, True, True]
+
+
+def test_random_mixed_script_text_is_always_fully_covered() -> None:
+    rng = random.Random(99)
+    pieces = [
+        "猫。", "、", "本当？", "「行こう。」",
+        "word.", "Word", "है।", "* * *", "，", "x" * 30,
+    ]  # fmt: skip
+    for _ in range(300):
+        joiner = rng.choice(["", " "])
+        paragraphs = [joiner.join(rng.choice(pieces) for _ in range(rng.randint(0, 80)))]
+        max_chars = rng.randint(5, 150)
+        chunks = chunk_paragraphs(0, paragraphs, max_chars=max_chars)
+        assert all(0 < len(c.text) <= max_chars for c in chunks)

@@ -34,6 +34,8 @@ FAKE_SERVER = textwrap.dedent(
                 struct.pack("<h", int(8000 * math.sin(i / 10))) for i in range(frames)))
         return buf.getvalue()
 
+    REQUESTS = [0]
+
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, *args):
             pass
@@ -44,6 +46,10 @@ FAKE_SERVER = textwrap.dedent(
             self.wfile.write(b'{"status":"ok"}')
 
         def do_POST(self):
+            REQUESTS[0] += 1
+            die_after = os.environ.get("FAKE_DIE_AFTER")
+            if die_after is not None and REQUESTS[0] > int(die_after):
+                os._exit(1)  # crash mid-request, like an engine running out of memory
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             text = body["input"]
             if "DIGITS" in text and len(text) > 12:
@@ -177,3 +183,70 @@ def test_check_system_needs_a_new_enough_glibc(
 
 def test_label_names_the_voice(tmp_path: Path) -> None:
     assert KokoroServer(tmp_path, voice="am_michael").label == "Kokoro (am_michael)"
+
+
+def test_requests_never_go_through_a_proxy(
+    tmp_path: Path, fake_server: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A proxy that doesn't exist: if the book's text were sent to it, this would fail.
+    monkeypatch.setenv("http_proxy", "http://127.0.0.1:9")
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9")
+    monkeypatch.delenv("no_proxy", raising=False)
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    with _server(tmp_path, fake_server) as engine:
+        engine.synthesize("Private text.", tmp_path / "out.wav")
+    assert wav_info(tmp_path / "out.wav").frames > 0
+
+
+def test_a_crash_mid_book_restarts_the_engine(
+    tmp_path: Path, fake_server: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FAKE_DIE_AFTER", "1")  # each engine process answers once, then crashes
+    with _server(tmp_path, fake_server) as engine:
+        engine.synthesize("First.", tmp_path / "1.wav")
+        engine.synthesize("Second.", tmp_path / "2.wav")  # crashes, restarts, succeeds
+    starts = [e for e in _events(tmp_path) if e["event"] == "start"]
+    assert len(starts) == 2
+    assert wav_info(tmp_path / "2.wav").frames > 0
+
+
+def test_an_engine_that_keeps_crashing_gives_a_clear_error(
+    tmp_path: Path, fake_server: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FAKE_DIE_AFTER", "0")  # every request crashes the engine
+    with _server(tmp_path, fake_server) as engine:
+        for _ in range(2):
+            with pytest.raises(EngineError):
+                engine.synthesize("Hello.", tmp_path / "out.wav")
+        with pytest.raises(EngineError, match="keeps crashing"):
+            engine.synthesize("Hello.", tmp_path / "out.wav")
+
+
+def test_a_long_install_path_gets_a_short_private_espeak_link(
+    tmp_path: Path, fake_server: Path
+) -> None:
+    root = tmp_path / ("very-long-folder-name-" * 8)
+    with KokoroServer(root, executable=fake_server, startup_timeout=20) as engine:
+        engine.synthesize("Hello.", tmp_path / "out.wav")
+        env = _events(tmp_path)[0]["env"]
+        assert isinstance(env, dict)
+        link = Path(env["AUDIOCPP_ESPEAK_DATA"])
+        assert link.is_symlink()
+        assert len(str(link).encode()) <= 150
+        assert link.parent.stat().st_mode & 0o077 == 0  # only this user can see it
+    assert not link.exists()  # cleaned up with the engine
+
+
+def test_ctrl_c_while_starting_stops_the_engine(
+    tmp_path: Path, fake_server: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine = _server(tmp_path, fake_server)
+
+    def interrupt(self: KokoroServer) -> bool:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(KokoroServer, "_healthy", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        engine.start()
+    assert engine._process is None
+    assert engine._tempdir is None

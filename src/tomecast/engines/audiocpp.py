@@ -13,9 +13,11 @@ small chunk of text per request. Facts this module relies on were checked agains
 
 from __future__ import annotations
 
-import contextlib
+import ctypes
+import http.client
 import json
 import os
+import signal
 import socket
 import subprocess
 import tempfile
@@ -132,12 +134,23 @@ DEFAULT_VOICE = "af_heart"
 # audio.cpp splits requests over 240 characters itself; staying under that keeps every
 # request a single model pass, and well clear of the 510-phoneme limit for normal prose.
 MAX_CHARS = 200
-_ESPEAK_PATH_LIMIT = 150  # eSpeak NG 1.52 has a 160-byte path buffer
+_ESPEAK_PATH_LIMIT = 150  # bytes; eSpeak NG 1.52 has a 160-byte path buffer
+SAMPLE_RATE = 24_000  # Kokoro's output
+_MAX_RESTARTS = 2  # per conversion, if the engine crashes mid-book
 _PHONEME_LIMIT_MESSAGE = "exceeds 510"
 
 
 class EngineError(RuntimeError):
     """Raised when the voice engine can't start or can't voice a piece of text."""
+
+
+class _ConnectionLost(EngineError):
+    """The engine didn't answer at all (as opposed to answering with an error)."""
+
+
+# Requests only ever go to the engine on 127.0.0.1, so never through a proxy: with
+# ``http_proxy`` set, urllib would otherwise send the book's text to the proxy.
+_LOCAL = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 def glibc_version() -> tuple[int, int] | None:
@@ -207,6 +220,7 @@ class KokoroServer:
         self._process: subprocess.Popen[bytes] | None = None
         self._tempdir: tempfile.TemporaryDirectory[str] | None = None
         self._base_url = ""
+        self._restarts = 0
 
     @property
     def label(self) -> str:
@@ -215,6 +229,10 @@ class KokoroServer:
     @property
     def max_chars(self) -> int:
         return MAX_CHARS
+
+    @property
+    def sample_rate(self) -> int:
+        return SAMPLE_RATE
 
     def __enter__(self) -> KokoroServer:
         self.start()
@@ -232,46 +250,17 @@ class KokoroServer:
         """Start the server and wait until the model is loaded."""
         if self._process is not None:
             return
+        # A private (0700) folder for the config, the log and the short eSpeak link.
         self._tempdir = tempfile.TemporaryDirectory(prefix="tomecast-audiocpp-")
-        workdir = Path(self._tempdir.name)
-        port = _free_port()
-        self._base_url = f"http://127.0.0.1:{port}"
-        config = workdir / "server.json"
-        config.write_text(json.dumps(self._server_config(port)))
-        log_path = workdir / "server.log"
-        with log_path.open("wb") as log:
-            self._process = subprocess.Popen(
-                [str(self._executable), "--config", str(config), "--no-ui"],
-                stdin=subprocess.DEVNULL,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                env=self._environment(),
-            )
-        deadline = time.monotonic() + self._startup_timeout
-        while time.monotonic() < deadline:
-            if self._process.poll() is not None:
-                tail = _tail(log_path)
-                self.close()
-                raise EngineError(f"the voice engine stopped while starting:\n{tail}")
-            if self._healthy():
-                return
-            time.sleep(0.2)
-        tail = _tail(log_path)
-        self.close()
-        raise EngineError(
-            f"the voice engine didn't start within {self._startup_timeout:.0f}s:\n{tail}"
-        )
+        try:
+            self._launch()
+        except BaseException:  # including Ctrl-C while the model loads
+            self.close()
+            raise
 
     def close(self) -> None:
         """Stop the server and clean up its temporary files."""
-        if self._process is not None:
-            self._process.terminate()
-            try:
-                self._process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self._process.kill()
-                self._process.wait()
-            self._process = None
+        self._stop_process()
         if self._tempdir is not None:
             self._tempdir.cleanup()
             self._tempdir = None
@@ -281,12 +270,14 @@ class KokoroServer:
         if self._process is None:
             raise EngineError("the voice engine isn't running")
         try:
-            output.write_bytes(self._request(text))
+            data = self._request_with_recovery(text)
         except EngineError as error:
             if _PHONEME_LIMIT_MESSAGE not in str(error) or len(text) < 2:
                 raise
             # Too many sounds for one request (long numbers, mostly): split it and join.
             self._synthesize_in_parts(text, output)
+            return
+        output.write_bytes(data)
 
     def _synthesize_in_parts(self, text: str, output: Path) -> None:
         parts = split_long(text, max(1, len(text) // 2))
@@ -297,6 +288,68 @@ class KokoroServer:
                 self.synthesize(part, wav)
                 wavs.append(wav)
             concatenate_wavs(wavs, output, gap_seconds=0.05)
+
+    def _request_with_recovery(self, text: str) -> bytes:
+        """Send ``text``; if the engine has crashed, restart it (a couple of times) and retry."""
+        try:
+            return self._request(text)
+        except _ConnectionLost as error:
+            if self._process is None or self._process.poll() is None:
+                raise  # still running, just not answering
+            log = _tail(self._log_path)
+            if self._restarts >= _MAX_RESTARTS:
+                raise EngineError(f"the voice engine keeps crashing:\n{log}") from error
+            self._restarts += 1
+            self._stop_process()
+            self._launch()
+            return self._request(text)
+
+    @property
+    def _log_path(self) -> Path:
+        assert self._tempdir is not None
+        return Path(self._tempdir.name) / "server.log"
+
+    def _launch(self) -> None:
+        """Start the server process in the temp folder and wait until it's healthy."""
+        assert self._tempdir is not None
+        workdir = Path(self._tempdir.name)
+        port = _free_port()
+        self._base_url = f"http://127.0.0.1:{port}"
+        config = workdir / "server.json"
+        config.write_text(json.dumps(self._server_config(port)))
+        with self._log_path.open("ab") as log:
+            self._process = subprocess.Popen(
+                [str(self._executable), "--config", str(config), "--no-ui"],
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                env=self._environment(workdir),
+                preexec_fn=_stop_with_parent,  # only calls prctl, safe after fork
+            )
+        deadline = time.monotonic() + self._startup_timeout
+        while time.monotonic() < deadline:
+            if self._process.poll() is not None:
+                raise EngineError(
+                    f"the voice engine stopped while starting:\n{_tail(self._log_path)}"
+                )
+            if self._healthy():
+                return
+            time.sleep(0.2)
+        raise EngineError(
+            f"the voice engine didn't start within {self._startup_timeout:.0f}s:\n"
+            f"{_tail(self._log_path)}"
+        )
+
+    def _stop_process(self) -> None:
+        if self._process is None:
+            return
+        self._process.terminate()
+        try:
+            self._process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self._process.kill()
+            self._process.wait()
+        self._process = None
 
     def _request(self, text: str) -> bytes:
         body = json.dumps(
@@ -316,20 +369,21 @@ class KokoroServer:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=self._request_timeout) as response:
+            with _LOCAL.open(request, timeout=self._request_timeout) as response:
                 data: bytes = response.read()
                 return data
         except urllib.error.HTTPError as error:
             raise EngineError(_error_message(error)) from error
-        except OSError as error:
-            raise EngineError(f"couldn't reach the voice engine: {error}") from error
+        except (OSError, http.client.HTTPException) as error:
+            raise _ConnectionLost(f"couldn't reach the voice engine: {error}") from error
 
     def _healthy(self) -> bool:
         try:
-            with urllib.request.urlopen(f"{self._base_url}/health", timeout=2) as response:
-                return bool(response.status == 200)
-        except OSError:
+            with _LOCAL.open(f"{self._base_url}/health", timeout=2) as response:
+                payload = json.loads(response.read())
+        except (OSError, http.client.HTTPException, ValueError):
             return False
+        return isinstance(payload, dict) and payload.get("status") == "ok"
 
     def _server_config(self, port: int) -> dict[str, object]:
         return {
@@ -352,11 +406,15 @@ class KokoroServer:
             ],
         }
 
-    def _environment(self) -> dict[str, str]:
+    def _environment(self, private_dir: Path) -> dict[str, str]:
         espeak = local_path(ESPEAK_NG, self._root) / "espeakng_loader"
         data = espeak / "espeak-ng-data"
-        if len(str(data)) > _ESPEAK_PATH_LIMIT:
-            data = _short_link(data)
+        if len(os.fsencode(data)) > _ESPEAK_PATH_LIMIT:
+            # eSpeak can't take a long path; link to it from our private temp folder instead.
+            link = private_dir / "espeak-ng-data"
+            if not link.is_symlink():
+                link.symlink_to(data.resolve(), target_is_directory=True)
+            data = link
         cache = self._root / "cache" / "audiocpp-tmp"
         cache.mkdir(parents=True, exist_ok=True)
         return {
@@ -369,15 +427,10 @@ class KokoroServer:
         }
 
 
-def _short_link(target: Path) -> Path:
-    """A short symlink to ``target``, for eSpeak's 160-byte path limit."""
-    link = Path(tempfile.gettempdir()) / f"tomecast-espeak-{os.getuid()}"
-    if link.is_symlink() and link.resolve() == target.resolve():
-        return link
-    with contextlib.suppress(FileNotFoundError):
-        link.unlink()
-    link.symlink_to(target, target_is_directory=True)
-    return link
+def _stop_with_parent() -> None:
+    """Runs in the engine's process before it starts: stop it if Tomecast itself dies."""
+    pr_set_pdeathsig = 1
+    ctypes.CDLL(None).prctl(pr_set_pdeathsig, signal.SIGTERM)
 
 
 def _free_port() -> int:

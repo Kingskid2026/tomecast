@@ -4,25 +4,38 @@ This is the second half of the "every sentence gets spoken" guarantee (the first
 :mod:`tomecast.chunking`): every chunk must come back from the voice engine with real audio of
 a believable length, or it's retried, and if it still fails, conversion stops with an error
 naming the exact text. A book is never packaged with a hole in it.
+
+Chunk audio is kept in a work folder under a name that includes a hash of the chunk's text,
+so an interrupted conversion can be resumed: audio that still matches its text and passes
+the checks is reused, and anything else is voiced again.
 """
 
 from __future__ import annotations
 
+import hashlib
 import wave
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from tomecast.audio import peak_level, wav_info
+from tomecast.audio import peak_level, wav_info, write_silence
 from tomecast.book import Book
 from tomecast.chunking import Boundary, Chunk, chunk_paragraphs
-from tomecast.packaging import AudiobookInfo, ChapterAudio, PackagedChapter, write_m4b
+from tomecast.packaging import (
+    AudiobookInfo,
+    ChapterAudio,
+    PackagedChapter,
+    cover_is_usable,
+    write_m4b,
+)
 
 # Seconds of silence after each kind of chunk.
 GAP_AFTER = {Boundary.PART: 0.1, Boundary.SENTENCE: 0.3, Boundary.PARAGRAPH: 0.6}
 GAP_AFTER_TITLE = 1.0
 GAP_AFTER_CHAPTER = 1.5
+# Text with no letters or digits (a ``* * *`` scene break) becomes this much silence.
+SCENE_BREAK_SECONDS = 0.8
 
 # Even very fast narration stays well under this, so shorter audio means text was cut off.
 MAX_CHARS_PER_SECOND = 40.0
@@ -41,6 +54,11 @@ class VoiceEngine(Protocol):
     @property
     def max_chars(self) -> int:
         """The longest text the engine reliably voices in one call."""
+        ...
+
+    @property
+    def sample_rate(self) -> int:
+        """The sample rate of the WAV files the engine writes."""
         ...
 
     def synthesize(self, text: str, output: Path) -> None:
@@ -65,6 +83,15 @@ class ConversionProgress:
 ProgressCallback = Callable[[ConversionProgress], None]
 
 
+@dataclass(frozen=True, slots=True)
+class ConversionResult:
+    """What :func:`convert_book` made: the chapters, and anything the user should know."""
+
+    chapters: list[PackagedChapter]
+    reused_chunks: int
+    warnings: tuple[str, ...]
+
+
 def plan_chunks(book: Book, max_chars: int) -> list[list[Chunk]]:
     """Chunk every chapter of ``book`` (title first), one list per chapter."""
     return [
@@ -81,26 +108,40 @@ def convert_book(
     workdir: Path,
     progress: ProgressCallback | None = None,
     retries: int = 1,
-) -> list[PackagedChapter]:
+) -> ConversionResult:
     """Voice ``book`` with ``engine`` and write an M4B audiobook to ``output``.
 
-    Chunk audio is written to ``workdir``, which should be an empty folder.
+    Chunk audio is written to ``workdir``. Running again with the same ``workdir`` after an
+    interruption reuses the chunks that were already voiced.
     """
+    warnings: list[str] = []
+    cover = book.cover
+    if cover is not None and not cover_is_usable(cover):
+        warnings.append("The book's cover image is damaged, so the audiobook has no cover.")
+        cover = None
+
     plan = plan_chunks(book, engine.max_chars)
     total = sum(len(chunks) for chunks in plan)
     chunk_dir = workdir / "chunks"
     chunk_dir.mkdir(parents=True, exist_ok=True)
 
     chapters: list[ChapterAudio] = []
-    done = 0
+    done = reused = 0
     for chapter_index, (chapter, chunks) in enumerate(zip(book.chapters, plan, strict=True)):
         if not chunks:
             continue
         segments: list[Path] = []
         gaps: list[float] = []
         for position, chunk in enumerate(chunks):
-            wav = chunk_dir / f"{chunk.id}.wav"
-            _voice_chunk(engine, chunk, wav, retries)
+            wav = chunk_dir / _chunk_file_name(chunk)
+            if _is_reusable(wav, chunk):
+                reused += 1
+            elif chunk.speakable:
+                _voice_chunk(engine, chunk, wav, retries)
+            else:
+                partial = wav.with_name(wav.name + ".partial")
+                write_silence(partial, SCENE_BREAK_SECONDS, engine.sample_rate)
+                partial.replace(wav)
             segments.append(wav)
             is_last = position == len(chunks) - 1
             gaps.append(_gap_after(chunk, is_title=bool(chapter.title), is_last=is_last))
@@ -114,9 +155,25 @@ def convert_book(
         authors=book.authors,
         narrator=engine.label,
         language=book.language,
-        cover=book.cover,
+        cover=cover,
     )
-    return write_m4b(chapters, info, output, workdir=workdir)
+    packaged = write_m4b(chapters, info, output, workdir=workdir)
+    return ConversionResult(packaged, reused, tuple(warnings))
+
+
+def _chunk_file_name(chunk: Chunk) -> str:
+    """The chunk's ID plus a hash of its text, so stale audio is never reused for new text."""
+    digest = hashlib.sha256(chunk.text.encode()).hexdigest()[:12]
+    return f"{chunk.id}-{digest}.wav"
+
+
+def _is_reusable(wav: Path, chunk: Chunk) -> bool:
+    """True if a previous run already made good audio for exactly this chunk."""
+    if not wav.is_file():
+        return False
+    if not chunk.speakable:
+        return True
+    return not audio_problem(wav, chunk.text)
 
 
 def _gap_after(chunk: Chunk, *, is_title: bool, is_last: bool) -> float:
@@ -128,17 +185,21 @@ def _gap_after(chunk: Chunk, *, is_title: bool, is_last: bool) -> float:
 
 
 def _voice_chunk(engine: VoiceEngine, chunk: Chunk, wav: Path, retries: int) -> None:
+    """Voice ``chunk`` into ``wav``. The file only appears once its audio passed the checks."""
+    partial = wav.with_name(wav.name + ".partial")
     problem = ""
     for _attempt in range(retries + 1):
-        wav.unlink(missing_ok=True)
+        partial.unlink(missing_ok=True)
         try:
-            engine.synthesize(chunk.text, wav)
+            engine.synthesize(chunk.text, partial)
         except RuntimeError as error:
             problem = str(error)
             continue
-        problem = audio_problem(wav, chunk.text)
+        problem = audio_problem(partial, chunk.text)
         if not problem:
+            partial.replace(wav)
             return
+    partial.unlink(missing_ok=True)
     raise MissingAudioError(f"no usable audio for {chunk.id} ({chunk.text[:80]!r}): {problem}")
 
 

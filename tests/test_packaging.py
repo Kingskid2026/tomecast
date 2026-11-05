@@ -24,6 +24,7 @@ from tomecast.packaging import (
     ChapterAudio,
     PackagedChapter,
     PackagingError,
+    cover_is_usable,
     write_m4b,
 )
 
@@ -486,3 +487,24 @@ def test_missing_ffmpeg_is_reported(tmp_path: Path) -> None:
         package(tmp_path, chapters, ffmpeg=str(tmp_path / "no-such-ffmpeg"))
 
     assert list((tmp_path / "work").iterdir()) == []
+
+
+@pytest.mark.parametrize("name", ["Dune: Messiah.m4b", "Re:Zero.m4b", "-dash first.m4b"])
+def test_tricky_relative_output_names_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    # ffmpeg reads "Dune:" as a protocol and "-dash" as an option unless paths are marked.
+    chapters = [chapter(tmp_path, "One", [(0.3, 0.1)])]
+    monkeypatch.chdir(tmp_path)
+
+    write_m4b(chapters, INFO, Path(name), workdir=Path("work"))
+
+    assert (tmp_path / name).is_file()
+    assert read_metadata(tmp_path / name).chapters[0][0] == "One"
+
+
+def test_cover_is_usable_accepts_real_images_and_rejects_damaged_ones(tmp_path: Path) -> None:
+    assert cover_is_usable(Cover(tiny_png(), "image/png"))
+    assert cover_is_usable(Cover(tiny_jpeg(tmp_path), "image/jpeg"))
+    assert not cover_is_usable(Cover(tiny_png()[:30], "image/png"))  # cut off mid-file
+    assert not cover_is_usable(Cover(b"\xff\xd8\xff" + b"\x00" * 40, "image/jpeg"))

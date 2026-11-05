@@ -40,6 +40,11 @@ class Chunk:
     boundary: Boundary
 
     @property
+    def speakable(self) -> bool:
+        """False for text with no letters or digits, like a ``* * *`` scene break."""
+        return any(character.isalnum() for character in self.text)
+
+    @property
     def id(self) -> str:
         """A stable ID like ``c003-p0012-s004-k01``, also used for file names."""
         return f"c{self.chapter:03d}-p{self.paragraph:04d}-s{self.sentence:03d}-k{self.part:02d}"
@@ -64,11 +69,15 @@ ABBREVIATIONS = frozenset(
 _CLOSING_PUNCTUATION = "\"'\u201d\u2019)]\u00bb"  # closing quotes and brackets
 _OPENING_PUNCTUATION = "\"'\u201c\u2018([\u00ab"  # opening quotes and brackets
 _DASHES = "\u2014\u2013"  # em dash, en dash
-_SENTENCE_END = re.compile(f"[.!?\u2026]+[{re.escape(_CLOSING_PUNCTUATION)}]*(?=\\s)")
-# Places a long sentence may be split, best first.
+# Sentence ends that need a space after them: . ! ? the ellipsis, and Hindi's danda.
+_SENTENCE_END = re.compile(f"[.!?\u2026\u0964]+[{re.escape(_CLOSING_PUNCTUATION)}]*(?=\\s)")
+# Chinese and Japanese sentence ends (fullwidth full stop, ! and ?), with no space after them.
+_CJK_CLOSING = "\u300d\u300f\u201d\u2019\uff09"  # closing brackets and quotes
+_CJK_SENTENCE_END = re.compile(f"[\u3002\uff01\uff1f]+[{_CJK_CLOSING}]*")
+# Places a long sentence may be split, best first. Fullwidth (CJK) marks need no space.
 _SPLIT_PREFERENCES = (
-    re.compile(r"[;:](?=\s)"),
-    re.compile(f"[,{_DASHES})](?=\\s)"),
+    re.compile("[;:](?=\\s)|[\uff1b\uff1a]"),
+    re.compile(f"[,{_DASHES})](?=\\s)|[\uff0c\u3001]"),
 )
 
 
@@ -80,23 +89,31 @@ def normalize_whitespace(text: str) -> str:
 def split_sentences(paragraph: str) -> list[str]:
     """Split a paragraph into sentences. Joining the result with spaces gives the input back.
 
-    The input is whitespace-normalized first. A sentence ends at ``.``, ``!``, ``?`` or ``…``
-    (plus any closing quotes or brackets) followed by a space, unless the period belongs to
-    an abbreviation or an initial, or the next word starts with a lowercase letter
-    (as in ``"Stop!" she cried.``).
+    The input is whitespace-normalized first. A sentence ends at ``.``, ``!``, ``?``, ``…`` or
+    ``।`` (plus any closing quotes or brackets) followed by a space, unless the period belongs
+    to an abbreviation or an initial, or the next word starts with a lowercase letter (as in
+    ``"Stop!" she cried.``). Chinese and Japanese sentences end at the fullwidth full stop,
+    exclamation mark or question mark, with or without a space.
     """
     text = normalize_whitespace(paragraph)
     if not text:
         return []
 
+    # Each boundary is (end of sentence, characters to skip after it: the space, if any).
+    boundaries = {
+        (match.end(), 1) for match in _SENTENCE_END.finditer(text) if _ends_sentence(text, match)
+    }
+    for match in _CJK_SENTENCE_END.finditer(text):
+        end = match.end()
+        if end < len(text):
+            boundaries.add((end, 1 if text[end] == " " else 0))
+
     sentences: list[str] = []
     start = 0
-    for match in _SENTENCE_END.finditer(text):
-        if not _ends_sentence(text, match):
-            continue
-        end = match.end()
-        sentences.append(text[start:end])
-        start = end + 1  # skip the single space after the boundary
+    for end, skip in sorted(boundaries):
+        if end > start:
+            sentences.append(text[start:end])
+            start = end + skip
     if start < len(text):
         sentences.append(text[start:])  # the trailing fragment is always kept
     return sentences
@@ -143,7 +160,8 @@ def _find_cut(text: str, max_chars: int) -> tuple[int, int]:
     for pattern in _SPLIT_PREFERENCES:
         cuts = [m.end() for m in pattern.finditer(window) if minimum <= m.end() <= max_chars]
         if cuts:
-            return cuts[-1], 1
+            cut = cuts[-1]
+            return cut, 1 if text[cut : cut + 1] == " " else 0
     space = window.rfind(" ", 0, max_chars + 1)
     if space > 0:
         return space, 1

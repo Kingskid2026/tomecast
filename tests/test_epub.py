@@ -10,6 +10,7 @@ from epub_factory import (
     NavPoint,
     Page,
     build_epub,
+    replace_in_file,
     tiny_png,
     without_file,
     xhtml,
@@ -189,18 +190,24 @@ def test_linear_no_documents_are_skipped(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("version", [2, 3])
-def test_missing_toc_makes_each_file_a_chapter_titled_by_its_first_heading(
+def test_missing_toc_makes_each_file_a_chapter_titled_by_its_opening_heading(
     tmp_path: Path, version: Literal[2, 3]
 ) -> None:
     pages = [
         Page("cover.xhtml", '<div><img src="cover.png" alt="Cover"/></div>'),
         Page("one.xhtml", "<h1>Alpha</h1><p>A.</p>"),
         Page("two.xhtml", "<p>No heading here.</p>"),
+        # A heading after other text isn't the title, or it would be read out of order.
+        Page("three.xhtml", "<p>An epigraph.</p><h2>Chapter One</h2><p>Text.</p>"),
     ]
 
     book = read_epub(build_epub(tmp_path / "book.epub", pages, version=version))
 
-    assert book.chapters == (Chapter("Alpha", ("A.",)), Chapter("", ("No heading here.",)))
+    assert book.chapters == (
+        Chapter("Alpha", ("A.",)),
+        Chapter("", ("No heading here.",)),
+        Chapter("", ("An epigraph.", "Chapter One", "Text.")),
+    )
 
 
 def test_toc_that_matches_nothing_falls_back_to_one_chapter_per_file(tmp_path: Path) -> None:
@@ -226,6 +233,12 @@ def test_headings_that_repeat_the_title_are_dropped(tmp_path: Path) -> None:
         ("Chapter 10", "<h2>Chapter 1</h2><p>A mislabelled chapter.</p>"),
         # Not a heading element: kept.
         ("Chapter 5", "<p>Chapter 5</p><p>Breakfast.</p>"),
+        # Number words count as numbers.
+        ("Chapter 6", "<h2>Chapter Six</h2><p>The Street.</p>"),
+        ("Chapter Twenty-One", "<h2>CHAPTER 21</h2><p>Going Aboard.</p>"),
+        ("Chapter Forty", "<h2>Chapter 40</h2><p>Midnight.</p>"),
+        # A different number: kept.
+        ("Chapter Twenty", "<h2>Chapter 21</h2><p>Another mislabelled chapter.</p>"),
     ]
     pages = [Page(f"c{n}.xhtml", body) for n, (_, body) in enumerate(chapters)]
     toc = [NavPoint(label, f"c{n}.xhtml") for n, (label, _) in enumerate(chapters)]
@@ -239,7 +252,89 @@ def test_headings_that_repeat_the_title_are_dropped(tmp_path: Path) -> None:
         Chapter("Chapter 4", ("The Counterpane", "Upon waking.")),
         Chapter("Chapter 10", ("Chapter 1", "A mislabelled chapter.")),
         Chapter("Chapter 5", ("Chapter 5", "Breakfast.")),
+        Chapter("Chapter 6", ("The Street.",)),
+        Chapter("Chapter Twenty-One", ("Going Aboard.",)),
+        Chapter("Chapter Forty", ("Midnight.",)),
+        Chapter("Chapter Twenty", ("Chapter 21", "Another mislabelled chapter.")),
     )
+
+
+# --- The reading order (spine) -------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "media_type",
+    [
+        "application/xhtml+xml; charset=utf-8",
+        "Application/XHTML+XML",
+        "text/html",
+        "text/html;charset=UTF-8",
+        "application/octet-stream",  # wrong, but the file is XHTML, so it's read
+        "",
+    ],
+)
+def test_spine_documents_are_read_whatever_their_media_type_says(
+    tmp_path: Path, media_type: str
+) -> None:
+    pages = [
+        Page("one.xhtml", "<p>Chapter one.</p>"),
+        Page("two.xhtml", "<p>Chapter two.</p>", media_type=media_type),
+    ]
+
+    book = read_epub(build_epub(tmp_path / "book.epub", pages))
+
+    assert all_paragraphs(book) == ["Chapter one.", "Chapter two."]
+
+
+def test_spine_idrefs_match_manifest_ids_ignoring_case(tmp_path: Path) -> None:
+    pages = [Page("one.xhtml", "<p>Chapter one.</p>"), Page("two.xhtml", "<p>Chapter two.</p>")]
+    path = build_epub(tmp_path / "book.epub", pages)
+    replace_in_file(path, "OEBPS/content.opf", 'idref="page2"', 'idref="Page2"')
+
+    assert all_paragraphs(read_epub(path)) == ["Chapter one.", "Chapter two."]
+
+
+def test_an_unknown_spine_idref_is_an_error_not_a_skipped_chapter(tmp_path: Path) -> None:
+    pages = [Page("one.xhtml", "<p>Chapter one.</p>"), Page("two.xhtml", "<p>Chapter two.</p>")]
+    path = build_epub(tmp_path / "book.epub", pages)
+    replace_in_file(path, "OEBPS/content.opf", 'idref="page2"', 'idref="chapter-two"')
+
+    with pytest.raises(InvalidEbookError, match="'chapter-two', which isn't in the manifest"):
+        read_epub(path)
+
+
+def test_a_spine_item_that_is_not_markup_is_an_error(tmp_path: Path) -> None:
+    pages = [
+        Page("one.xhtml", "<p>Chapter one.</p>"),
+        Page("style.css", source="p { margin: 0; }", media_type="text/css"),
+    ]
+
+    with pytest.raises(InvalidEbookError, match=r"style\.css \(text/css\) is in the reading order"):
+        read_epub(build_epub(tmp_path / "book.epub", pages))
+
+
+def test_images_in_the_spine_are_skipped(tmp_path: Path) -> None:
+    svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 9 9"><title>Cover</title></svg>'
+    pages = [
+        Page("cover.svg", source=svg, media_type="image/svg+xml"),
+        Page("one.xhtml", "<p>Chapter one.</p>"),
+    ]
+
+    book = read_epub(build_epub(tmp_path / "book.epub", pages))
+
+    assert all_paragraphs(book) == ["Chapter one."]
+
+
+def test_a_foreign_spine_item_is_read_through_its_fallback(tmp_path: Path) -> None:
+    pages = [
+        Page("one.xhtml", "<p>Chapter one.</p>"),
+        Page("two.pdf", source="%PDF-1.7 (not markup)", media_type="application/pdf"),
+        Page("two.xhtml", "<p>Chapter two, from the fallback.</p>", linear=False),
+    ]
+    path = build_epub(tmp_path / "book.epub", pages)
+    replace_in_file(path, "OEBPS/content.opf", 'id="page2"', 'id="page2" fallback="page3"')
+
+    assert all_paragraphs(read_epub(path)) == ["Chapter one.", "Chapter two, from the fallback."]
 
 
 # --- Paragraphs ----------------------------------------------------------------------------
@@ -285,7 +380,7 @@ def test_nested_blocks_are_read_once_and_loose_text_is_kept(tmp_path: Path) -> N
     ]
 
 
-def test_head_scripts_styles_and_alt_text_are_never_read(tmp_path: Path) -> None:
+def test_head_scripts_styles_and_picture_descriptions_are_never_read(tmp_path: Path) -> None:
     body = """
         <p>Visible text.<script>var hidden = "script";</script></p>
         <style>p { color: red; }</style>
@@ -296,6 +391,29 @@ def test_head_scripts_styles_and_alt_text_are_never_read(tmp_path: Path) -> None
     book = read_epub(build_epub(tmp_path / "book.epub", [Page("book.xhtml", body)]))
 
     assert all_paragraphs(book) == ["Visible text.", "After the image."]
+
+
+def test_drop_cap_images_keep_their_letter(tmp_path: Path) -> None:
+    body = """
+        <p><img src="T.png" alt="T"/>he quick fox.</p>
+        <p><span class="DropCap"><img src="O.png" alt="Once"/></span> upon a time.</p>
+        <p><img class="drop-cap" src="W.png" alt="Whe"/>n it rained.</p>
+        <p>A map <img src="map.png" alt="Map of the island"/>appears here.</p>
+        <p><img class="caption-icon" src="i.png" alt="Note"/>Captions aren't drop caps.</p>
+        <p><img src="star.png" alt="*"/>An ornament.</p>
+        <div class="illustration"><img src="fig.png" alt="A"/></div>
+    """
+
+    book = read_epub(build_epub(tmp_path / "book.epub", [Page("book.xhtml", body)]))
+
+    assert all_paragraphs(book) == [
+        "The quick fox.",
+        "Once upon a time.",
+        "When it rained.",
+        "A map appears here.",
+        "Captions aren't drop caps.",
+        "An ornament.",
+    ]
 
 
 def test_page_numbers_and_gutenberg_boilerplate_are_skipped(tmp_path: Path) -> None:
@@ -363,6 +481,31 @@ def test_html_entities_fall_back_to_the_html_parser(
             ("One two—three after the break.", "Déjà vu, written as UTF-8."),
         ),
     )
+
+
+@pytest.mark.parametrize("encoding", ["utf-16-le", "utf-16-be"])
+def test_utf16_without_a_byte_order_mark_is_decoded(tmp_path: Path, encoding: str) -> None:
+    # No XML declaration and an HTML entity, so the HTML parser has to work out the encoding.
+    source = xhtml("<p>Caf\u00e9&nbsp;au lait, in UTF-16.</p>", declaration=False)
+    pages = [Page("book.xhtml", source=source, encoding=encoding)]
+
+    book = read_epub(build_epub(tmp_path / "book.epub", pages))
+
+    assert all_paragraphs(book) == ["Caf\u00e9 au lait, in UTF-16."]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param("<div>" * 300 + "<p>Deep inside.</p>" + "</div>" * 300, id="300-levels-deep"),
+        pytest.param("<p>" + "word " * 2_100_000 + "</p>", id="10-mb-paragraph"),
+    ],
+)
+def test_text_past_a_parser_limit_is_an_error_not_silently_lost(tmp_path: Path, body: str) -> None:
+    pages = [Page("book.xhtml", body + "<p>Text after the limit.</p>")]
+
+    with pytest.raises(InvalidEbookError, match=r"book\.xhtml can't be read completely"):
+        read_epub(build_epub(tmp_path / "book.epub", pages))
 
 
 def test_url_encoded_and_parent_relative_hrefs_resolve(tmp_path: Path) -> None:

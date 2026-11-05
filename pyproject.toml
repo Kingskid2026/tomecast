@@ -64,6 +64,10 @@ select = [
     "RUF", # ruff-specific checks
 ]
 
+[tool.ruff.lint.per-file-ignores]
+# Tests use real Chinese/Japanese text, whose fullwidth punctuation looks like ASCII.
+"tests/**" = ["RUF001"]
+
 [tool.mypy]
 strict = true
 python_version = "3.11"

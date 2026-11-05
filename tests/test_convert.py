@@ -8,7 +8,7 @@ import imageio_ffmpeg  # type: ignore[import-untyped]
 import pytest
 
 from tomecast.audio import write_silence
-from tomecast.book import Book, Chapter
+from tomecast.book import Book, Chapter, Cover
 from tomecast.chunking import normalize_whitespace
 from tomecast.convert import MissingAudioError, audio_problem, convert_book
 
@@ -34,6 +34,7 @@ class FakeEngine:
 
     label = "Fake voice"
     max_chars = 60
+    sample_rate = SAMPLE_RATE
 
     def __init__(self) -> None:
         self.texts: list[str] = []
@@ -106,7 +107,7 @@ def test_every_sentence_is_voiced_and_packaged(tmp_path: Path) -> None:
     engine = FakeEngine()
     output = tmp_path / "book.m4b"
 
-    chapters = convert_book(book, engine, output, workdir=tmp_path / "work")
+    result = convert_book(book, engine, output, workdir=tmp_path / "work")
 
     spoken = "".join("".join(t.split()) for t in engine.texts)
     source = "".join(
@@ -116,7 +117,9 @@ def test_every_sentence_is_voiced_and_packaged(tmp_path: Path) -> None:
     assert all(len(t) <= engine.max_chars for t in engine.texts)
     assert engine.texts[-1] == "The last page ends mid-sentence and"
     assert output.is_file()
-    assert [c.title for c in chapters] == ["Chapter One", "Chapter Two"]
+    assert [c.title for c in result.chapters] == ["Chapter One", "Chapter Two"]
+    assert result.reused_chunks == 0
+    assert result.warnings == ()
     assert _chapter_titles(output) == ["Chapter One", "Chapter Two"]
 
 
@@ -177,3 +180,63 @@ def test_audio_problem_accepts_good_audio(tmp_path: Path) -> None:
     text = normalize_whitespace("A perfectly normal sentence.")
     _write_speech_like(wav, text)
     assert audio_problem(wav, text) == ""
+
+
+class CountingEngine(FakeEngine):
+    """Fails once it has voiced ``limit`` chunks, like a run that gets interrupted."""
+
+    def __init__(self, limit: int | None = None) -> None:
+        super().__init__()
+        self.limit = limit
+
+    def synthesize(self, text: str, output: Path) -> None:
+        if self.limit is not None and len(self.texts) >= self.limit:
+            raise RuntimeError("interrupted")
+        super().synthesize(text, output)
+
+
+def test_scene_breaks_become_silence_instead_of_failing(tmp_path: Path) -> None:
+    book = Book("B", ("A",), "en", (Chapter("One", ("Before.", "* * *", "\u2042", "After.")),))
+    engine = FakeEngine()
+    convert_book(book, engine, tmp_path / "b.m4b", workdir=tmp_path / "w")
+    assert engine.texts == ["One", "Before.", "After."]  # scene breaks aren't sent to the voice
+    assert (tmp_path / "b.m4b").is_file()
+
+
+def test_an_interrupted_conversion_resumes_without_redoing_work(tmp_path: Path) -> None:
+    book = _book()
+    workdir = tmp_path / "work"
+    first = CountingEngine(limit=3)
+    with pytest.raises(MissingAudioError, match="interrupted"):
+        convert_book(book, first, tmp_path / "b.m4b", workdir=workdir, retries=0)
+    assert not list(workdir.glob("chunks/*.partial"))  # no half-written audio is left behind
+
+    second = CountingEngine()
+    result = convert_book(book, second, tmp_path / "b.m4b", workdir=workdir)
+
+    assert result.reused_chunks == 3
+    assert len(first.texts) == 3
+    spoken = "".join("".join(t.split()) for t in first.texts[:3] + second.texts)
+    source = "".join("".join(p.split()) for c in book.chapters for p in c.spoken_paragraphs())
+    assert spoken == source  # together, the two runs voiced every character exactly once
+
+
+def test_changed_text_is_voiced_again_on_resume(tmp_path: Path) -> None:
+    workdir = tmp_path / "work"
+    convert_book(_book(), FakeEngine(), tmp_path / "b.m4b", workdir=workdir)
+    edited = Book("B", ("A",), "en", (Chapter("Chapter One", ("It was a bright day.",)),))
+
+    engine = FakeEngine()
+    convert_book(edited, engine, tmp_path / "b2.m4b", workdir=workdir)
+
+    assert engine.texts == ["It was a bright day."]  # the title was reused, the new text wasn't
+
+
+def test_a_damaged_cover_is_dropped_with_a_warning(tmp_path: Path) -> None:
+    damaged = Cover(b"\x89PNG\r\n\x1a\n" + b"\x00" * 20, "image/png")
+    book = Book("B", ("A",), "en", (Chapter("One", ("Hello.",)),), cover=damaged)
+
+    result = convert_book(book, FakeEngine(), tmp_path / "b.m4b", workdir=tmp_path / "w")
+
+    assert result.warnings == ("The book's cover image is damaged, so the audiobook has no cover.",)
+    assert (tmp_path / "b.m4b").is_file()

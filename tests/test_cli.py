@@ -16,10 +16,13 @@ class FakeKokoro:
     """Stands in for KokoroServer: same constructor and context manager, no real engine."""
 
     fail_with: str | None = None
+    fail_after: int | None = None  # chunks to voice before failing, like an interrupted run
+    voiced = 0
 
     def __init__(self, root: Path, *, voice: str, speed: float) -> None:
         self.label = f"Fake ({voice})"
         self.max_chars = 200
+        self.sample_rate = 24000
 
     def __enter__(self) -> "FakeKokoro":
         return self
@@ -35,6 +38,9 @@ class FakeKokoro:
     def synthesize(self, text: str, output: Path) -> None:
         if self.fail_with:
             raise EngineError(self.fail_with)
+        if FakeKokoro.fail_after is not None and FakeKokoro.voiced >= FakeKokoro.fail_after:
+            raise EngineError("the voice engine failed (HTTP 500): interrupted")
+        FakeKokoro.voiced += 1
         frames = round(len(text) / 15 * 24000)
         samples = array.array("h", (round(8000 * math.sin(i / 8)) for i in range(frames)))
         with wave.open(str(output), "wb") as wav:
@@ -51,6 +57,8 @@ def no_real_engine(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(cli, "REQUIRED_ASSETS", ())
     monkeypatch.setattr(cli, "data_dir", lambda: tmp_path / "data")
     FakeKokoro.fail_with = None
+    FakeKokoro.fail_after = None
+    FakeKokoro.voiced = 0
 
 
 def _epub(tmp_path: Path) -> Path:
@@ -159,3 +167,29 @@ def test_voices_lists_every_language(capsys: pytest.CaptureFixture[str]) -> None
     assert "American English: af_alloy" in out
     assert "bm_george" in out
     assert "Default: af_heart" in out
+
+
+@pytest.mark.parametrize("speed", ["3", "0.1", "fast"])
+def test_a_bad_speed_is_rejected_before_anything_happens(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], speed: str
+) -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main(["convert", str(_epub(tmp_path)), "--speed", speed])
+    assert exit_info.value.code == 2
+    assert "--speed" in capsys.readouterr().err
+
+
+def test_a_failed_run_keeps_its_work_and_the_next_run_resumes(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    book = _epub(tmp_path)
+    FakeKokoro.fail_after = 2
+
+    assert cli.main(["convert", str(book)]) == 1
+    assert "Run the same command again to continue" in capsys.readouterr().err
+
+    FakeKokoro.fail_after = None
+    assert cli.main(["convert", str(book)]) == 0
+    out = capsys.readouterr().out
+    assert "Picked up where the last run stopped (2 pieces)" in out
+    assert not list((tmp_path / "data" / "cache").glob("convert-*"))  # cleaned up on success

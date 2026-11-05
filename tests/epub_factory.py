@@ -27,6 +27,8 @@ class Page:
     body: str = ""  # markup placed inside <body>
     linear: bool = True
     source: str | None = None  # a complete file, used as-is instead of wrapping ``body``
+    media_type: str = "application/xhtml+xml"  # as written in the manifest
+    encoding: str = "utf-8"  # how the file is stored (Python codec name)
 
 
 @dataclass(frozen=True)
@@ -107,7 +109,7 @@ def build_epub(
 
     for number, page in enumerate(pages, start=1):
         source = page.source if page.source is not None else xhtml(page.body)
-        add(page.name, source.encode("utf-8"), f"page{number}", "application/xhtml+xml")
+        add(page.name, source.encode(page.encoding), f"page{number}", page.media_type)
         linear = "" if page.linear else ' linear="no"'
         spine.append(f'<itemref idref="page{number}"{linear}/>')
 
@@ -172,6 +174,21 @@ def without_file(epub: Path, name: str) -> Path:
         for info, data in contents:
             if info.filename != name:
                 rewritten.writestr(info, data)
+    return epub
+
+
+def replace_in_file(epub: Path, name: str, old: str, new: str) -> Path:
+    """Rewrite an EPUB with ``old`` replaced by ``new`` in one of its text files."""
+    with zipfile.ZipFile(epub) as original:
+        contents = [(info, original.read(info)) for info in original.infolist()]
+    with zipfile.ZipFile(epub, "w") as rewritten:
+        for info, data in contents:
+            if info.filename == name:
+                text = data.decode("utf-8")
+                if old not in text:
+                    raise ValueError(f"{old!r} isn't in {name}")
+                data = text.replace(old, new).encode("utf-8")
+            rewritten.writestr(info, data)
     return epub
 
 
