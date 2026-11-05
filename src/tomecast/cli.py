@@ -10,15 +10,25 @@ import re
 import shutil
 import signal
 import sys
+import tempfile
 import time
 import wave
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Literal, TextIO
 
-from tomecast import __version__
-from tomecast.chunking import CoverageError
-from tomecast.convert import ConversionProgress, MissingAudioError, convert_book, plan_chunks
+from tomecast import __version__, pronunciations
+from tomecast.audio import concatenate_wavs
+from tomecast.book import Book
+from tomecast.chunking import CoverageError, chunk_paragraphs
+from tomecast.convert import (
+    ConversionProgress,
+    MissingAudioError,
+    VoiceEngine,
+    audio_problem,
+    convert_book,
+    plan_chunks,
+)
 from tomecast.downloads import (
     Asset,
     DownloadError,
@@ -45,8 +55,11 @@ from tomecast.engines.audiocpp import (
     required_assets,
 )
 from tomecast.hardware import list_devices, vulkan_possible
+from tomecast.names import DEFAULT_MIN_COUNT, find_book_names
 from tomecast.packaging import PackagingError
+from tomecast.playback import PLAYERS, find_player, play
 from tomecast.readers import FORMATS, InvalidEbookError, read_book
+from tomecast.textprep import TextPrep
 from tomecast.workdirs import WorkFolderBusy, exclusive, work_folder
 
 
@@ -118,6 +131,64 @@ def build_parser() -> argparse.ArgumentParser:
         help="print what Tomecast sees on this computer (for bug reports)",
         description="Print the system, graphics and installed-file details a bug report needs.",
     )
+    names = commands.add_parser(
+        "names",
+        help="list the names and unusual words in a book",
+        description=(
+            "List the capitalised words a book uses often that aren't ordinary English, "
+            "with how many times. Names and places are the ones a voice most often gets "
+            "wrong: check them with `tomecast preview`, then add fixes to a pronunciation "
+            "list (see the README)."
+        ),
+    )
+    names.add_argument("book", type=Path, help=f"the ebook to look through ({', '.join(FORMATS)})")
+    names.add_argument(
+        "--min-count", type=int, default=DEFAULT_MIN_COUNT, metavar="N",
+        help=f"only words used at least N times (default: {DEFAULT_MIN_COUNT})",
+    )  # fmt: skip
+    names.add_argument(
+        "--limit", type=int, default=100, metavar="N",
+        help="show at most N words, most frequent first (default: 100; 0 shows all)",
+    )  # fmt: skip
+
+    preview = commands.add_parser(
+        "preview",
+        help="hear how a word or sentence sounds",
+        description=(
+            "Voice some text and play it (or save it with -o). Your pronunciation lists "
+            "and the number and abbreviation rules are applied first, so you hear what the "
+            "book would sound like; --raw skips them."
+        ),
+    )
+    preview.add_argument("text", nargs="+", help="the word or sentence to say")
+    preview.add_argument(
+        "--voice", default=DEFAULT_VOICE, choices=VOICES, metavar="VOICE",
+        help=f"Kokoro voice (default: {DEFAULT_VOICE}; see `tomecast voices`)",
+    )  # fmt: skip
+    preview.add_argument(
+        "--speed", type=_speed, default=1.0,
+        help=f"speaking speed, {MIN_SPEED} to {MAX_SPEED} (default: 1.0)",
+    )  # fmt: skip
+    preview.add_argument(
+        "-o", "--output", type=Path, help="write a WAV file instead of playing the sound"
+    )
+    preview.add_argument(
+        "--book",
+        type=Path,
+        help="also use this book's pronunciation list (BOOK.pronunciations.txt)",
+    )
+    preview.add_argument(
+        "--raw", action="store_true",
+        help="say the text exactly as typed: no pronunciation lists, no number rules",
+    )  # fmt: skip
+    preview.add_argument(
+        "-y", "--yes", action="store_true", help="download the voice engine without asking"
+    )
+    preview.add_argument("-f", "--force", action="store_true", help="overwrite the output file")
+    preview.add_argument(
+        "--gpu", action=argparse.BooleanOptionalAction, default=None,
+        help="use the graphics card (default: on when one is found); --no-gpu uses the CPU",
+    )  # fmt: skip
 
     gui = commands.add_parser(
         "gui",
@@ -148,6 +219,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _voices()
         if args.command == "doctor":
             return _doctor()
+        if args.command == "names":
+            return _names(args)
+        if args.command == "preview":
+            return _preview(args)
         if args.command == "gui":
             return _gui(args)
         if args.command == "desktop-entry":
@@ -226,17 +301,23 @@ def _convert(args: argparse.Namespace) -> int:
 
     use_gpu = _wants_gpu(args.gpu)
     root = data_dir()
+    prep, warnings = _text_prep(book, book_path, root)
+    for warning in warnings:
+        print(f"Note: {warning}", file=sys.stderr)
     try:
         _install(required_assets(use_gpu), root, assume_yes=args.yes)
         workdir = work_folder(root, book_path, args.voice, args.speed, use_gpu=use_gpu)
     except OSError as error:
         raise CliError(str(error)) from error
 
-    chunk_count = sum(len(chunks) for chunks in plan_chunks(book, MAX_CHARS))
+    chunk_count = sum(len(chunks) for chunks in plan_chunks(book, MAX_CHARS, prep=prep))
     print(
         f"Converting “{book.title}”: {_plural(len(book.chapters), 'chapter')}, "
         f"{_plural(chunk_count, 'piece')} of text, voice {args.voice}."
     )
+    if prep.pronunciations:
+        count = len(prep.pronunciations)
+        print(f"Using {count} pronunciation {'fix' if count == 1 else 'fixes'}.")
     progress = _ProgressPrinter(sys.stderr)
     started = time.monotonic()
     with contextlib.ExitStack() as stack:
@@ -256,6 +337,7 @@ def _convert(args: argparse.Namespace) -> int:
                     workdir=workdir,
                     progress=progress.update,
                     format=output_format,
+                    prep=prep,
                 )
         except KeyboardInterrupt:
             progress.finish()
@@ -348,6 +430,113 @@ def _distro() -> str:
         return "unknown"
     match = re.search(r'^PRETTY_NAME=(?:"([^"]*)"|(\S*))\s*$', text, re.MULTILINE)
     return (match.group(1) or match.group(2)) if match else "unknown"
+
+
+def _text_prep(book: Book, book_path: Path | None, root: Path) -> tuple[TextPrep, list[str]]:
+    """The text prep for ``book``: its language's rules plus the pronunciation lists (the
+    global one, then the one next to the book file), and warnings about any bad list lines."""
+    fixes, warnings = pronunciations.load_for_book(root, book_path)
+    return TextPrep.for_language(book.language, fixes), warnings
+
+
+def _names(args: argparse.Namespace) -> int:
+    book_path: Path = args.book
+    if not book_path.is_file():
+        raise CliError(f"{book_path} doesn't exist")
+    try:
+        book = read_book(book_path)
+    except (InvalidEbookError, OSError) as error:
+        raise CliError(str(error)) from error
+    if not book.chapters:
+        raise CliError(f"no readable text found in {book_path.name}")
+
+    root = data_dir()
+    fixes, warnings = pronunciations.load_for_book(root, book_path)
+    for warning in warnings:
+        print(f"Note: {warning}", file=sys.stderr)
+    found = find_book_names(book, min_count=max(1, args.min_count), skip=fixes.written_words())
+    if not found:
+        print("No unusual names found.")
+        return 0
+    shown = found if args.limit <= 0 else found[: args.limit]
+    width = max(len(name.word) for name in shown)
+    for name in shown:
+        print(f"{name.word:<{width}}  {name.count:>5}")
+    if len(shown) < len(found):
+        print(f"\n…and {len(found) - len(shown)} more (use --limit 0 to see them all).")
+    print(
+        f"\nHear one with `tomecast preview NAME`. To fix one, add a line like "
+        f"`Name → say-it-like-this` to {pronunciations.book_list_path(book_path)} "
+        f"(this book) or {pronunciations.global_list_path(root)} (every book)."
+    )
+    return 0
+
+
+def _preview(args: argparse.Namespace) -> int:
+    text = " ".join(args.text).strip()
+    output: Path | None = args.output
+    if output is not None:
+        if output.exists() and not args.force:
+            raise CliError(f"{output} already exists (use --force to overwrite it)")
+        if not output.parent.is_dir():
+            raise CliError(f"the folder {output.parent} doesn't exist")
+    elif find_player() is None:
+        raise CliError(
+            f"no audio player found ({', '.join(PLAYERS)}). Use -o FILE.wav to save the sound "
+            "instead."
+        )
+    try:
+        check_system()
+    except EngineError as error:
+        raise CliError(str(error)) from error
+
+    root = data_dir()
+    spoken = text
+    if not args.raw:
+        book_path: Path | None = args.book
+        fixes, warnings = pronunciations.load_for_book(root, book_path)
+        for warning in warnings:
+            print(f"Note: {warning}", file=sys.stderr)
+        spoken = TextPrep.for_language(None, fixes).body(text)
+    if not any(character.isalnum() for character in spoken):
+        raise CliError("there's nothing to say: give it a word or a sentence")
+    if spoken != text:
+        print(f"Saying: {spoken}")
+
+    use_gpu = _wants_gpu(args.gpu)
+    _install(required_assets(use_gpu), root, assume_yes=args.yes)
+    with tempfile.TemporaryDirectory(prefix="tomecast-preview-") as folder:
+        wav = Path(folder) / "preview.wav"
+        try:
+            with AutoKokoro(root, voice=args.voice, speed=args.speed, use_gpu=use_gpu) as engine:
+                if engine.warning:
+                    print(f"Note: {engine.warning}", file=sys.stderr)
+                _voice_text(engine, spoken, wav)
+            if problem := audio_problem(wav, spoken):
+                raise CliError(f"the voice made no usable audio: {problem}")
+            if output is not None:
+                shutil.copyfile(wav, output)
+                print(f"Saved {output}")
+            else:
+                play(wav)
+        except (EngineError, OSError, wave.Error, RuntimeError) as error:
+            raise CliError(str(error)) from error
+    return 0
+
+
+def _voice_text(engine: VoiceEngine, text: str, output: Path) -> None:
+    """Voice ``text`` into ``output``, in pieces if it is longer than the engine takes."""
+    pieces = [c.text for c in chunk_paragraphs(0, [text], engine.max_chars) if c.speakable]
+    if len(pieces) == 1:
+        engine.synthesize(pieces[0], output)
+        return
+    with tempfile.TemporaryDirectory(dir=output.parent, prefix=".pieces-") as folder:
+        parts = []
+        for index, piece in enumerate(pieces):
+            part = Path(folder) / f"{index}.wav"
+            engine.synthesize(piece, part)
+            parts.append(part)
+        concatenate_wavs(parts, output, gap_seconds=0.2)
 
 
 def _interrupt(signum: int, frame: object) -> None:

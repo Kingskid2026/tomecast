@@ -605,3 +605,70 @@ def test_mp3_format_never_overwrites_a_folder_that_appears_meanwhile(tmp_path: P
 
     assert result.output == tmp_path / "Book (2)"
     assert list(target.iterdir()) == []
+
+
+# --- text prep ---------------------------------------------------------------------------------
+
+
+def _prep_book(language: str | None = "en") -> Book:
+    return Book(
+        title="Prep",
+        authors=(),
+        language=language,
+        chapters=(
+            Chapter(
+                "Chapter XII",
+                (
+                    "Dr. Smith paid $5.50 on 4 July 1776.",
+                    "Hermione left at 3:45 p.m. Then it rained.",
+                ),
+            ),
+        ),
+    )
+
+
+def test_every_paragraph_is_prepared_just_before_chunking() -> None:
+    chunks = [c.text for c in plan_chunks(_prep_book(), 200)[0]]
+    assert chunks == [
+        "Chapter twelve",
+        "Doctor Smith paid five dollars and fifty cents on the fourth of July, "
+        "seventeen seventy-six.",
+        "Hermione left at three forty-five pee em.",
+        "Then it rained.",
+    ]
+
+
+def test_pronunciation_fixes_reach_the_voice() -> None:
+    from tomecast.pronunciations import Pronunciation, Pronunciations
+    from tomecast.textprep import TextPrep
+
+    prep = TextPrep.for_language(
+        "en", Pronunciations((Pronunciation("Hermione", "her-MY-oh-nee"),))
+    )
+    texts = [c.text for c in plan_chunks(_prep_book(), 200, prep=prep)[0]]
+    assert "her-my-oh-nee left at three forty-five pee em." in texts
+
+
+def test_a_book_in_another_language_is_voiced_as_written() -> None:
+    texts = [c.text for c in plan_chunks(_prep_book("fr"), 200)[0]]
+    assert texts[0] == "Chapter XII"
+    assert texts[1].startswith("Dr. Smith paid $5.50")
+
+
+def test_prepared_text_reaches_the_engine_and_nothing_is_lost(tmp_path: Path) -> None:
+    book = _prep_book()
+    engine = FakeEngine()
+    convert_book(book, engine, tmp_path / "prep.m4b", workdir=tmp_path / "work")
+    spoken = " ".join(engine.texts)
+    assert "Doctor Smith paid five dollars and fifty cents" in spoken
+    assert "$" not in spoken
+    assert not any(c.isdigit() for c in spoken)
+    # Every word the author wrote is still there, or is what a rule said it should become.
+    for word in ("paid", "July", "left", "rained", "Hermione", "Chapter"):
+        assert word in spoken
+
+
+def test_the_audiobook_keeps_the_written_chapter_title(tmp_path: Path) -> None:
+    output = tmp_path / "titles.m4b"
+    result = convert_book(_prep_book(), FakeEngine(), output, workdir=tmp_path / "work")
+    assert [c.title for c in result.chapters] == ["Chapter XII"]

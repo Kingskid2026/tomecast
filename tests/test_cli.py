@@ -27,6 +27,7 @@ class FakeKokoro:
     made: ClassVar[list["FakeKokoro"]] = []
     gpu_description = "NVIDIA RTX PRO 1000 Blackwell Generation Laptop GPU"
     gpu_warning: str | None = None  # set: a use_gpu run falls back to the CPU
+    texts: ClassVar[list[str]] = []  # everything the voice was asked to say, across all instances
 
     def __init__(self, root: Path, *, voice: str, speed: float, use_gpu: bool = False) -> None:
         self.label = f"Fake ({voice})"
@@ -58,6 +59,7 @@ class FakeKokoro:
         if FakeKokoro.fail_after is not None and FakeKokoro.voiced >= FakeKokoro.fail_after:
             raise EngineError("the voice engine failed (HTTP 500): interrupted")
         FakeKokoro.voiced += 1
+        FakeKokoro.texts.append(text)
         frames = round(len(text) / 15 * 24000)
         samples = array.array("h", (round(8000 * math.sin(i / 8)) for i in range(frames)))
         with wave.open(str(output), "wb") as wav:
@@ -79,6 +81,7 @@ def no_real_engine(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     FakeKokoro.voiced = 0
     FakeKokoro.made = []
     FakeKokoro.gpu_warning = None
+    FakeKokoro.texts = []
 
 
 def _epub(tmp_path: Path) -> Path:
@@ -420,3 +423,269 @@ def test_doctor_lists_devices_when_the_vulkan_engine_is_installed(
     out = capsys.readouterr().out
     assert "0: NVIDIA RTX PRO 1000 (gpu, 7.0 of 8.0 GiB free)" in out
     assert "(graphics card): yes" in out
+
+
+# --- text prep and pronunciation lists --------------------------------------------------------
+
+
+def _story_with_names(tmp_path: Path) -> Path:
+    paragraph = "Then Zorp met Quillon. Zorp paid $5 to Dr. Smith. " * 2
+    return build_epub(
+        tmp_path / "names.epub",
+        [Page("one.xhtml", f"<h1>Chapter 1</h1><p>{paragraph}</p><p>Then Zorp left Quillon.</p>")],
+        toc=[NavPoint("Chapter 1", "one.xhtml")],
+        title="Names",
+    )
+
+
+def test_convert_says_numbers_and_abbreviations_right(tmp_path: Path) -> None:
+    assert cli.main(["convert", str(_story_with_names(tmp_path))]) == 0
+    spoken = " ".join(FakeKokoro.texts)
+    assert "Chapter one" in spoken
+    assert "paid five dollars to Doctor Smith" in spoken
+    assert "$" not in spoken
+
+
+def test_convert_uses_the_global_and_the_books_pronunciation_lists(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    book = _story_with_names(tmp_path)
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "pronunciations.txt").write_text(
+        "Zorp → zorp-ee\nQuillon → kwill-ON\n", encoding="utf-8"
+    )
+    (tmp_path / "names.pronunciations.txt").write_text("Zorp → zawp\n", encoding="utf-8")
+
+    assert cli.main(["convert", str(book)]) == 0
+
+    spoken = " ".join(FakeKokoro.texts)
+    assert "Then zawp met kwill-on." in spoken  # the book's list wins; ON was lowercased
+    assert "Zorp" not in spoken
+    assert "Using 3 pronunciation fixes." in capsys.readouterr().out
+
+
+def test_convert_warns_about_bad_lines_in_a_list_and_carries_on(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    book = _story_with_names(tmp_path)
+    (tmp_path / "names.pronunciations.txt").write_text(
+        "Zorp → /zɔːp/\nthis line has no arrow\nQuillon → kwill-on\n", encoding="utf-8"
+    )
+
+    assert cli.main(["convert", str(book)]) == 0
+
+    err = capsys.readouterr().err
+    assert "names.pronunciations.txt, line 1" in err
+    assert "names.pronunciations.txt, line 2" in err
+    assert "kwill-on" in " ".join(FakeKokoro.texts)
+
+
+def test_names_lists_the_unusual_words_with_counts(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert cli.main(["names", str(_story_with_names(tmp_path))]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0].split() == ["Zorp", "5"]
+    assert lines[1].split() == ["Quillon", "3"]
+    assert any("tomecast preview" in line and "names.pronunciations.txt" in line for line in lines)
+
+
+def test_names_skips_words_that_already_have_a_fix_and_honours_min_count(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    book = _story_with_names(tmp_path)
+    (tmp_path / "names.pronunciations.txt").write_text("zorp → zawp\n", encoding="utf-8")
+    assert cli.main(["names", str(book)]) == 0
+    assert capsys.readouterr().out.splitlines()[0].split() == ["Quillon", "3"]
+
+    assert cli.main(["names", str(book), "--min-count", "50"]) == 0
+    assert capsys.readouterr().out == "No unusual names found.\n"
+
+
+def test_names_limit_shows_the_most_frequent(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert cli.main(["names", str(_story_with_names(tmp_path)), "--limit", "1"]) == 0
+    out = capsys.readouterr().out
+    assert "Zorp" in out
+    assert "Quillon" not in out.split("…and")[0]
+    assert "…and 1 more" in out
+
+
+def test_names_explains_bad_input(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    assert cli.main(["names", str(tmp_path / "missing.epub")]) == 1
+    assert "doesn't exist" in capsys.readouterr().err
+    pdf = tmp_path / "book.pdf"
+    pdf.write_bytes(b"%PDF-1.7")
+    assert cli.main(["names", str(pdf)]) == 1
+    assert "can't read .pdf files" in capsys.readouterr().err
+
+
+# --- preview ----------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def played(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+    """Pretend there is an audio player, and record which WAV files it was asked to play."""
+    heard: list[Path] = []
+
+    def fake_play(wav: Path) -> None:
+        assert wav.stat().st_size > 0
+        heard.append(wav)
+
+    monkeypatch.setattr(cli, "find_player", lambda: "/usr/bin/fake-player")
+    monkeypatch.setattr(cli, "play", fake_play)
+    return heard
+
+
+def test_preview_voices_the_text_and_plays_it(
+    played: list[Path], capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert cli.main(["preview", "Galadriel"]) == 0
+    assert FakeKokoro.texts == ["Galadriel"]
+    assert len(played) == 1
+    assert "Saying" not in capsys.readouterr().out  # nothing changed, so nothing to announce
+
+
+def test_preview_takes_several_words_without_quotes(played: list[Path]) -> None:
+    assert cli.main(["preview", "Hello", "there", "Galadriel"]) == 0
+    assert FakeKokoro.texts == ["Hello there Galadriel"]
+
+
+def test_preview_applies_the_lists_and_the_number_rules(
+    tmp_path: Path, played: list[Path], capsys: pytest.CaptureFixture[str]
+) -> None:
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "pronunciations.txt").write_text("Galadriel → ga-LAD-ree-el\n")
+    assert cli.main(["preview", "Galadriel paid $5."]) == 0
+    assert FakeKokoro.texts == ["ga-lad-ree-el paid five dollars."]
+    assert "Saying: ga-lad-ree-el paid five dollars." in capsys.readouterr().out
+
+
+def test_preview_can_use_a_books_list(tmp_path: Path, played: list[Path]) -> None:
+    book = tmp_path / "story.epub"
+    (tmp_path / "story.pronunciations.txt").write_text("Zorp → zawp\n")
+    assert cli.main(["preview", "Zorp", "--book", str(book)]) == 0
+    assert FakeKokoro.texts == ["zawp"]
+    assert cli.main(["preview", "Zorp"]) == 0
+    assert FakeKokoro.texts[-1] == "Zorp"
+
+
+def test_preview_raw_says_exactly_what_was_typed(tmp_path: Path, played: list[Path]) -> None:
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "pronunciations.txt").write_text("Galadriel → ga-lad-ree-el\n")
+    assert cli.main(["preview", "--raw", "Galadriel $5"]) == 0
+    assert FakeKokoro.texts == ["Galadriel $5"]
+
+
+def test_preview_writes_a_wav_file_instead_of_playing(
+    tmp_path: Path, played: list[Path], capsys: pytest.CaptureFixture[str]
+) -> None:
+    out = tmp_path / "word.wav"
+    assert cli.main(["preview", "Galadriel", "-o", str(out)]) == 0
+    assert played == []
+    with wave.open(str(out)) as wav:
+        assert wav.getframerate() == 24000
+        assert wav.getnframes() > 0
+    assert f"Saved {out}" in capsys.readouterr().out
+
+
+def test_preview_will_not_overwrite_without_force(
+    tmp_path: Path, played: list[Path], capsys: pytest.CaptureFixture[str]
+) -> None:
+    out = tmp_path / "word.wav"
+    out.write_bytes(b"keep me")
+    assert cli.main(["preview", "Galadriel", "-o", str(out)]) == 1
+    assert "already exists" in capsys.readouterr().err
+    assert out.read_bytes() == b"keep me"
+    assert cli.main(["preview", "Galadriel", "-o", str(out), "--force"]) == 0
+    assert out.read_bytes() != b"keep me"
+
+
+def test_preview_with_a_long_text_voices_it_in_pieces_and_joins_them(
+    tmp_path: Path, played: list[Path]
+) -> None:
+    sentence = "The boats drifted slowly toward the far green shore. "
+    out = tmp_path / "long.wav"
+    assert cli.main(["preview", sentence * 8, "-o", str(out)]) == 0
+    assert len(FakeKokoro.texts) > 1
+    assert all(len(text) <= 200 for text in FakeKokoro.texts)
+    assert " ".join(FakeKokoro.texts) == (sentence * 8).strip()
+
+
+def test_preview_passes_the_voice_and_speed_to_the_engine(
+    played: list[Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: dict[str, object] = {}
+
+    class Recording(FakeKokoro):
+        def __init__(self, root: Path, *, voice: str, speed: float, use_gpu: bool = False) -> None:
+            super().__init__(root, voice=voice, speed=speed, use_gpu=use_gpu)
+            seen.update(voice=voice, speed=speed)
+
+    monkeypatch.setattr(cli, "AutoKokoro", Recording)
+    assert cli.main(["preview", "Hi", "--voice", "bm_george", "--speed", "1.25"]) == 0
+    assert seen == {"voice": "bm_george", "speed": 1.25}
+
+
+def test_preview_uses_the_graphics_card_when_there_is_one(
+    played: list[Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli, "vulkan_possible", lambda: True)
+    assert cli.main(["preview", "Hi"]) == 0
+    assert FakeKokoro.made[-1].use_gpu is True
+    assert cli.main(["preview", "Hi", "--no-gpu"]) == 0
+    assert FakeKokoro.made[-1].use_gpu is False
+
+
+def test_preview_says_when_it_fell_back_to_the_cpu(
+    played: list[Path], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(cli, "vulkan_possible", lambda: True)
+    FakeKokoro.gpu_warning = "The graphics card didn't start, so the CPU is used."
+    assert cli.main(["preview", "Hi"]) == 0
+    assert "the CPU is used" in capsys.readouterr().err
+
+
+def test_preview_needs_something_to_say(
+    played: list[Path], capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert cli.main(["preview", "...", "***"]) == 1
+    assert "nothing to say" in capsys.readouterr().err
+    assert FakeKokoro.texts == []
+
+
+def test_preview_without_an_audio_player_suggests_a_file(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(cli, "find_player", lambda: None)
+    assert cli.main(["preview", "Hi"]) == 1
+    assert "-o FILE.wav" in capsys.readouterr().err
+    assert FakeKokoro.texts == []
+
+
+def test_preview_reports_a_player_that_fails(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def fail(wav: Path) -> None:
+        raise RuntimeError("pw-play failed: no sound server")
+
+    monkeypatch.setattr(cli, "find_player", lambda: "/usr/bin/fake-player")
+    monkeypatch.setattr(cli, "play", fail)
+    assert cli.main(["preview", "Hi"]) == 1
+    assert "no sound server" in capsys.readouterr().err
+
+
+def test_preview_reports_engine_failures(
+    played: list[Path], capsys: pytest.CaptureFixture[str]
+) -> None:
+    FakeKokoro.fail_with = "the voice engine failed (HTTP 500): out of memory"
+    assert cli.main(["preview", "Hi"]) == 1
+    assert "out of memory" in capsys.readouterr().err
+
+
+def test_preview_and_names_are_listed_in_the_help(capsys: pytest.CaptureFixture[str]) -> None:
+    assert cli.main([]) == 0
+    out = capsys.readouterr().out
+    assert "preview" in out
+    assert "names" in out

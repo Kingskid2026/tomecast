@@ -698,7 +698,7 @@ def test_only_the_ticked_chapters_are_converted(
     _convert(qtbot, backend)
 
     assert backend.screen == "done"
-    assert engines.texts == ["Chapter 2", "Morning came.", "The birds sang.",
+    assert engines.texts == ["Chapter two", "Morning came.", "The birds sang.",
                              "Everyone woke up at last."]  # fmt: skip
     assert backend.doneSummary.startswith("OF AUDIO · 1 CHAPTER · ")
 
@@ -727,7 +727,7 @@ def test_pausing_holds_the_conversion_until_resumed(
     backend.goTo("voice")
     backend.startConversion()
     qtbot.waitUntil(lambda: engines.blocked.is_set() and backend.stage == "voicing")
-    assert backend.nowSpeaking == "Chapter 1: The Night"
+    assert backend.nowSpeaking == "Chapter one: The Night"
 
     backend.pauseConversion()
     engines.release.set()  # the piece being voiced finishes…
@@ -1236,7 +1236,7 @@ def test_untick_after_a_cancel_keeps_the_chunks_already_voiced(
     book = backend._book
     assert book is not None
     chapter_two = [c.text for c in plan_chunks(book, FakeEngine.max_chars, [1])[0]]
-    assert chapter_two == ["Chapter 2", "Morning came.", "The birds sang.",
+    assert chapter_two == ["Chapter two", "Morning came.", "The birds sang.",
                            "Everyone woke up at last."]  # fmt: skip
     # Every sentence of the ticked section was voiced, once, across the two runs.
     assert [t for t in engines.texts if t in chapter_two] == chapter_two
@@ -1654,7 +1654,7 @@ def test_the_work_folder_keeps_graphics_card_and_cpu_audio_apart(
     # CPU run voiced every piece from the beginning.
     cpu_run = engines.texts[4:]
     assert len(cpu_run) == _speakable_chunks(backend._book)
-    assert cpu_run[0] == "Chapter 1: The Night"
+    assert cpu_run[0] == "Chapter one: The Night"
     leftovers = list((tmp_path / "data" / "cache").glob("convert-*"))
     assert leftovers == kept  # the card's unfinished folder is still its own
 
