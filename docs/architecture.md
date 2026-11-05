@@ -35,7 +35,7 @@ People who read ebooks want to listen to them too, without uploading books to a 
 
 ```
 book file
-  → Reader (one per format)          → chapters → paragraphs, with tags (heading, footnote, caption…)
+  → Reader (one per format)          → chapters → blocks, with tags (heading, footnote, table, header/footer…)
   → Cleanup (rules, optional AI)      → only the text that should be spoken
   → Text prep                         → pronunciation list, numbers, abbreviations, sentence chunks
   → Voice engine (Kokoro or Ming)     → audio per chunk, cached on disk (this is what makes resume work)
@@ -43,7 +43,7 @@ book file
   → Packager (ffmpeg)                 → M4B with chapters + cover + title/author, or MP3 per chapter
 ```
 
-The app is written in **Python 3.11+**, which has the best ebook and PDF libraries and holds everything together. The heavy model work runs in fast C++ engines (audio.cpp for voices, llama.cpp for the AI add-ons).
+The app is written in **Python 3.12+** (uv downloads it if the system's Python is older), which has the best ebook and PDF libraries and holds everything together. The heavy model work runs in fast C++ engines (audio.cpp for voices, llama.cpp for the AI add-ons).
 
 ## Core guarantee: every sentence gets spoken
 
@@ -60,19 +60,50 @@ The app is written in **Python 3.11+**, which has the best ebook and PDF librari
 
 ### 1. Readers (one per format)
 - **EPUB:** our own reader on `lxml` (BSD), with safe settings for untrusted files: no network, no entity expansion, and size limits against zip bombs. It follows the book's reading order and uses its table of contents for chapter titles. Many EPUBs tag their own parts (`epub:type="footnote"`, `pagebreak`, `copyright-page`, `toc`, `index`), so junk can be skipped exactly instead of guessed. Books with DRM-encrypted text are refused with a clear error. The cover image goes into the M4B. (We don't use `ebooklib`, because it's AGPL.)
-- **PDF:** `pypdfium2`, Apache/BSD-licensed, and the same PDF engine Chrome uses. It gives each character with its position (and font size through its low-level API), and we group those into lines. Chapters come from the PDF's bookmarks when present, otherwise from large or bold heading lines. We don't use PyMuPDF because it's AGPL, which doesn't fit an Apache 2.0 app.
-- **DOCX:** `python-docx`, where Heading styles mark chapters. **FB2:** XML sections. **TXT:** chapter-line patterns ("Chapter 12", "CHAPTER TWELVE", "XII"). **HTML:** same path as an EPUB chapter.
+- **PDF** (`readers/pdf.py`): `pypdfium2`, Apache/BSD-licensed, and the same PDF engine Chrome uses. We don't use PyMuPDF because it's AGPL, which doesn't fit an Apache 2.0 app. PDFium gives each character with its box, baseline and font size (times its text matrix, so text drawn at size 1 and scaled up still measures right), and the reader rebuilds the book from where the characters are:
+  1. **Segments:** characters drawn one after another on the same baseline, close together. A gap wider than 1 em (a column gutter) starts a new segment.
+  2. **Bands:** a short line on its own at the top or bottom fifth of a page (1.8 em or more from the text), or a line that's just a page number, is marked as a header or footer. Cleanup decides whether it's furniture.
+  3. **Columns:** if most of the page's text is in narrow segments that leave a clear gap in the middle half of the page, the page has two columns. Lines that cross the gap (a title over both columns, a footnote under them) cut the page into bands, read top to bottom; inside a two-column band the left column comes first. So the drawing order doesn't matter.
+  4. **Blocks:** lines are grouped into blocks (paragraphs) at a change of type size, a gap wider than the usual line spacing, an indented first line, an indented line after a short one (one-line paragraphs, dialogue), or a return to the margin after an indented quote. Small raised digits and symbols are footnote markers, wrapped in private-use brackets so cleanup can remove them. The first block of each column remembers that it may carry on the paragraph before it.
+  5. **Roles:** small type (under 0.9 of the body size) at the foot of a column that starts with a marker is a footnote (and a small block without a label right after a page whose last note didn't end is its continuation). Text 1.15 times the body size or more is a heading. Three or more rows of three or more cells that line up are a table.
+  6. **Chapters** come from the PDF's bookmarks (the top two levels; a bookmark that points partway down a page starts there), when at least two of them point at text. Headings at a bookmarked chapter's start that repeat its title are dropped, because the title is read first. Otherwise a chapter starts at a heading at least 1.25 times the body size, or at a line that reads "Chapter N" on its own; a run of headings makes one title ("Chapter One. The Gift"). While the pages before the first chapter are short (title page, copyright page, dedication), each is a section of its own, so cleanup can tell what each one is.
+  - **Metadata** comes from the document info (title, and authors split at ";"); a title like "Microsoft Word - draft.docx" or "untitled" falls back to the file name. The **cover** is the first page rendered 600 px wide, as PNG, only when pictures cover at least half of it.
+  - **Refused with a clear error:** encrypted PDFs ("protected by a password"), damaged files, PDFs whose text is mostly set sideways, and **scans**: pages that are pictures with no text layer ("Reading scanned PDFs (OCR) comes with an add-on"). A PDF where more than half the pages (and at least two) are text-less pictures counts as a scan, so scanned pages are never silently skipped.
+  - The reader keeps this layout in `Book.raw` (blocks with their page, band, role and "may carry on" flag) and fills `Book.chapters` with every block as found, only the layout repaired. Cleanup rebuilds the chapters from `Book.raw`.
+- **One entry point:** `read_book(path)` in `tomecast.readers` picks the reader. It looks at the file's contents where that's cheap (a zip holding `META-INF/container.xml` is an EPUB, one holding `word/document.xml` is a DOCX, a `<FictionBook>` root is FB2, a file starting `%PDF-` is a PDF), so a book with the wrong extension still opens, and otherwise goes by the extension. Anything else raises `InvalidEbookError` with a plain sentence. `FORMATS` (what the window lists) and `SUFFIXES` come from one table in `readers/__init__.py`, so a new format is one line there plus its reader.
+- **DOCX:** `python-docx` (MIT) opens the file, but the text is read from the document's XML so that tracked insertions and text boxes aren't lost (deleted text is not read). Title and Heading 1 paragraphs start chapters, or Heading 2 when there is no Heading 1. Text in tables is kept as paragraphs in reading order, and headers and footers are skipped. The cover is the first inline picture, if it is a PNG or JPEG at least an inch across that isn't wider than tall and comes before the book's text. Title and authors come from the core properties. Zip-bomb limits are checked before anything is decompressed.
+- **FB2:** `lxml` with the same hardened settings as the EPUB reader. Every titled `<section>` starts a chapter (nesting is flattened in reading order) and `<p>`, `<v>`, `<subtitle>` and table cells become paragraphs. Metadata and the `<coverpage>` image come from `<title-info>`. `<body name="notes">` (footnotes) is skipped for now. A file that defines XML entities at all is refused, which also stops "billion laughs" files and means a reference never silently loses text.
+- **TXT:** decoded by byte-order mark, then UTF-8, then Windows-1252, then Latin-1, so decoding never fails, but a file full of control bytes is refused as binary. Lines like "Chapter 12", "CHAPTER TWELVE", "Chapter XII. Title" and "Part One" start chapters; bare capital roman numerals ("XII") do too when at least two appear and no "Chapter" lines do. Blank lines separate paragraphs and wrapped lines are re-joined. A file with no chapter lines is one chapter titled by the book's title (the file name). Project Gutenberg's license text outside the `*** START` and `*** END` markers is dropped.
+- **HTML (a single `.html`, `.htm` or `.xhtml` file):** the same markup walker as an EPUB chapter document, shared in `readers/_markup.py` (scripts, styles, page breaks and Gutenberg boilerplate skipped). `<h1>` and `<h2>` start chapters.
 - **Later, if wanted:** Kindle MOBI/AZW3 (DRM-free only) through Calibre's `ebook-convert` when Calibre is installed.
 
 ### 2. Cleanup: "read the book, not the page"
-Rules, checked in this order:
-- **Page numbers:** a line near the top or bottom of the page that's just a number, a roman numeral, or "Page 12 of 300".
-- **Headers and footers:** the same or near-same text repeated at the top or bottom of most pages (book title, author, chapter name).
-- **Front and back matter:** copyright, dedication-style blocks, table of contents, index, "Also by", and "Read the first chapter of…" previews. Detected by EPUB tags or by section title. Each one is an on/off switch.
-- **Footnotes:** remove superscript markers. Footnote text is either dropped or collected and read at the end of the chapter (a setting).
-- **Links, captions, tables:** drop URLs and figure captions. A table becomes one short line ("A table appears here.") or is skipped.
-- **PDF layout fixes:** re-join words split by end-of-line hyphens, join lines broken mid-sentence, and handle two-column pages in the right order.
+`tomecast.cleanup.clean(book, options)` turns a book as read into the text to speak. It's format-agnostic: a book with a layout (`Book.raw`, from the PDF reader) is rebuilt from its blocks, and any other book is cleaned paragraph by paragraph. Each rule is a named switch in `CleanupOptions`:
+
+| Rule (`Removal.rule`) | Switch, default | What it removes |
+|---|---|---|
+| `page-numbers` | `page_numbers=True` | Header and footer lines (see the reader's bands) that are a page number ("12", "xiv", "- 12 -", "Page 12 of 300"), or whose words, with numbers left out, are in the same band on at least 3 pages (2 in a book of 4 pages or fewer). So "12 THE GIFT" on a left page and "THE GIFT 13" on a right page are one running header. Big text is never furniture: it's a heading. |
+| `footnote-markers` | `footnote_markers=True` | Superscript markers ("Della¹ counted" reads "Della counted"), and a footnote's own label. |
+| `footnotes` | `footnotes="drop"` | Footnote text: `"drop"`, `"end"` (read at the end of its chapter, after the chapter's text) or `"keep"` (where it was printed). A note split over two pages is joined first. |
+| `links` | `links=True` | Web addresses (`https://…`, `www.…`, `domain.org/path`) and email addresses, keeping the punctuation after them and tidying empty brackets: "free (https://…)." reads "free.". A bare "Amazon.com" in a sentence stays. |
+| `captions` | `captions=True` | Paragraphs of 80 words or fewer that start "Figure 3:", "Fig. 3.", "Table 2:", "Plate IV." and the like (a number and punctuation are needed, so "Figure 3 shows…" stays), or that are a bracketed "[Illustration: …]". |
+| `tables` | `tables=True` | Blocks the reader marked as tables: skipped, never replaced by a sentence. With the switch off, each row is read as a paragraph. |
+| front and back matter (`Matter`) | `skip=frozenset(Matter)`: each kind is its own switch | Whole sections: `front` (title page, dedication, edition notes, and sections under 100 words), `copyright`, `contents`, `index`, `also-by` and `preview` (another book's opening). They stay in the cleaned book, flagged in `CleanupResult.matter`; `CleanupResult.kept` lists the chapters to voice. |
+
+Layout repair isn't a switch: `join_lines` rejoins a word hyphenated at a line end when the next line starts in lowercase ("pen-" + "nies"), keeps the hyphen before a capital, a digit or after words like "twenty" and "self" ("Anglo-Saxon", "twenty-one"), drops soft hyphens, and joins a line ending in a dash without a space. A block that may carry on (it starts flush at the top of a column or page, or in lowercase) joins the body block before it, unless that one ended a sentence and this one starts a new one, so paragraphs split by page and column breaks come back whole. Headings and kept headers and footers never join.
+
+**Front and back matter** is found by title ("Contents", "Copyright", "Index", "Also by…", "Dedication", the book's own title) or by text (copyright notices, "Also by" lists, lines ending in page numbers for contents and index pages, "Read on for an excerpt…"). Front matter is looked for before the first numbered chapter ("Chapter 1", "IV."), back matter after the last one; a preview runs from its introduction to the end, and may start where the chapter numbers go back to 1. In a book without numbered chapters only the opening and closing runs count, and a book that would be all front matter has none. (This replaces the window's first guess, which only looked at the front.)
+
+**Every rule logs what it removed** (`CleanupResult.removed`: rule, text, chapter and page), so tests check it, the command line prints a summary ("Skipping 2 sections: …", "Left out: page numbers and running headers and footers (8), …"), and the window can show it later.
+
+Tests build PDFs from scratch (`tests/pdf_factory.py`, public-domain text only) and check known pages against the exact expected spoken text, plus a coverage test: the sample book set on short pages, with words, sentences and paragraphs split by page and column breaks, must keep every sentence of the story, in order.
+
+**Where the switches are:**
+- **Window:** above the chapter list, "Skip page numbers" (only for books with pages), "Skip front matter" (unticks the front and back matter rows, which stay listed so they can be ticked again) and "Read footnotes at chapter end". Changing the first or last cleans the book again and refreshes the list.
+- **Terminal:** `tomecast convert` with `--keep-page-numbers`, `--keep-front-matter` and `--footnotes {drop,end}`.
 - **Chapter list with checkboxes:** the window shows what it found, so the user can untick anything the rules got wrong *before* converting.
+
+Not done yet: the other readers don't tag footnotes or captions (EPUB's `epub:type="footnote"` and `figcaption`, FB2's notes body), so for those formats the footnote switch has no effect and captions are found by their text only.
 
 **Optional AI pass (off by default).** It handles two different jobs with different models. The hardware scan says which parts the machine can handle.
 
@@ -85,14 +116,26 @@ Rules, checked in this order:
 Known issue to watch: reading order is the hard part. Even Docling's own reading-order step sometimes moves a list or footnote above a heading ([docling#4433](https://github.com/docling-project/docling/issues/4433)). The chapter-list review screen is the safety net.
 
 ### 3. Text prep
-- Split into sentence-sized chunks for the voice model.
-- Expand numbers, years, dates, "Dr.", "St.", roman numerals in headings ("Chapter XIV" → "Chapter fourteen").
-- **Pronunciation fixes:**
-  - A **global list** plus a **per-book list** of *written → say it as* pairs (e.g. Hermione → her-MY-oh-nee). Stored as plain text so it's easy to edit.
-  - **Name finder:** before converting, list words that appear often but aren't in a dictionary (usually names and places) so the user can check them.
-  - **Try it:** type a word, hear it immediately, adjust the spelling.
-  - Advanced: exact phonetic spellings (IPA) aren't possible yet, because audio.cpp v0.9.4 only accepts them through its C library, not its server. Lower-case respellings work.
-- **Made-up languages:** Kokoro sounds out unknown words with eSpeak NG's spelling rules (checked: "Namárië" becomes /nˈæməɹɹˌɪɛ/), and Ming guesses from the spelling. Both read *something* reasonable, and the list fixes the rest.
+Text prep turns written text into speakable text, deterministically, in **one place**: `plan_chunks` in `convert.py`, between the Book and chunking. The window and the terminal command both go through it. Code: `textprep.py` (the framework and the safety net), `textprep_en.py` (English rules), `pronunciations.py` (the lists) and `names.py` (the name finder).
+
+- **Sentence-sized chunks** come after it (section 4 and "Core guarantee"), so numbers are already words by the time the size cap is checked. That matters: long numbers are the usual reason a chunk hits the 510-phoneme limit.
+- **English rules** (rules are per language; the book's language picks them, and a book with no language set is treated as English):
+  - Numbers: cardinals up to a quadrillion (`1,250` → "one thousand two hundred fifty"), ordinals (`1st`), decimals, negatives, fractions (`3/4`, `1 1/2`, `½`), ranges (`5-7` → "five to seven"). Leading zeros and huge numbers are read digit by digit, and phone numbers digit by digit in groups.
+  - Years only in year-like places: after *in, since, until, by, from, during, between...*, after *War of*, *Panic of* and similar, before AD/BC, in ranges (`1914-18`) and as decades (`1860s`, `'60s`). `1865` → "eighteen sixty-five", `1905` → "nineteen oh five", `2010` → "twenty ten". A bare `1500 men` stays a quantity: "one thousand five hundred men".
+  - Dates (`4 July 1776` → "the fourth of July, seventeen seventy-six"; `July 4, 1776`; `2024-03-05`; US-style `12/25`), times (`3:45 p.m.`, `10 a.m.`, `14:30`), currency (`$5.50` → "five dollars and fifty cents", `£3`, `€10`, `$3.5 million`) and percentages.
+  - Abbreviations: *Mr., Mrs., Ms., Dr., Prof., Rev., Gen., Capt., Lt., Sgt., Mt., Ft., Jr., Sr., Inc., Ltd., e.g., i.e., etc., vs., cf., et al., No. 5, p. 12, Fig. 3, Vol. 2, ch. 4, A.D., B.C.* The ambiguous ones use context: `St.` is Saint before a capitalised word (`St. Paul`) and Street after a capitalised name (`Baker St.`); `Dr.` is Doctor before a name and Drive after a street name; a title like `Gen.` is only expanded when a name follows. When an abbreviation's period also ends the sentence (`etc.`, `p.m.`), the full stop is kept so the chunker still splits there.
+  - Roman numerals: after *Chapter, Book, Part, Act, Volume, Section...* (`Chapter XII` → "Chapter twelve"), after a name as a regnal number (`Henry VIII` → "Henry the eighth"), and as a bare chapter title (`XIV.` → "fourteen."). `Malcolm X`, `Vitamin C` and the pronoun *I* are left alone.
+  - Letters in abbreviations are written out as sounds ("ay em", "pee em", "bee see"), because eSpeak reads a lone capital `A` as the word *a*.
+- **Nothing is ever dropped.** Rules only replace a written form with words that say the same thing. On top of that, every paragraph is checked (`words_lost`): if a rule would lose a word, that paragraph is voiced as written. Tests cover every rule with exact expected output, plus a test that every input word survives or is a known expansion.
+- **Other languages** plug in by registering an object with `heading()` and `body()` in `textprep.RULES`. Until then a book in another language is voiced as written (the pronunciation lists still apply).
+- **Pronunciation fixes** are plain text files of *written → say it as* lines (the exact format is in the README):
+  - A **global list**, `~/.local/share/tomecast/pronunciations.txt`, and a **per-book list** next to the book file (`Title.epub` → `Title.pronunciations.txt`). Next to the book was chosen over a folder keyed by the book's hash because it is easy to find and edit, and it travels with the book. The book's list wins over the global one. The same lists are used by the terminal command, and the window will use them too ([#10](https://github.com/Kingskid2026/tomecast/issues/10)).
+  - Whole-word matching. A left side in lowercase matches any case; one with a capital matches that spelling and its ALL-CAPS version. Fixes are applied *before* the rules, so a fix can cover an abbreviation (`Dr. Who → the Doctor`).
+  - **Right-hand sides are respellings, not phonemes** (see "Phonetic spellings" in section 10 for why). Capitalised syllables are lowercased before voicing because eSpeak spells all-caps words letter by letter.
+  - A line the program can't use (no arrow, or an IPA `/value/`) is skipped with a warning that names the line.
+- **Name finder** (`tomecast names BOOK`, and `names.find_book_names(book)` for the window): lists capitalised words that are used at least 3 times, were seen capitalised somewhere other than at the start of a sentence, are not in the common-word list and are never written in lowercase in the book (so "Table" is not a name). Counts are listed most frequent first, and words that already have a fix are left out. The common-word list (`data/common_words.txt`, about 22,000 words) is built by `scripts/make_wordlist.py` from public-domain Project Gutenberg books, so it has no license of its own.
+- **Hear a word:** `tomecast preview "text"` voices the text with the chosen voice and speed and plays it (pw-play, paplay or aplay), or saves it with `-o file.wav`. It applies the same lists and rules as a conversion, so you hear what the book will sound like; `--raw` says it exactly as typed. There is no `--phonemes` option, for the reason below.
+- **Made-up languages:** Kokoro sounds out unknown words with eSpeak NG's spelling rules (measured in section 10), so it reads *something* reasonable, and the list fixes the rest.
 
 ### 4. Voice engines
 Both sit behind one small interface (`voices()`, `languages()`, `synthesize(chunk, voice, speed)`), so more engines can be added later.
@@ -113,7 +156,7 @@ Both sit behind one small interface (`voices()`, `languages()`, `synthesize(chun
 - 82M parameters, Apache 2.0, 54 voices. Languages: English (US/UK), Spanish, French, Italian, Portuguese, Hindi, Japanese, Chinese.
 - The English file is ~190 MB. Non-English books use a larger multilingual file (~0.93 GB), downloaded only when one shows up.
 - Runs on CPU, or on any graphics card through Vulkan.
-- Pronunciation of unknown words is checked (above). Q8_0 vs BF16 by ear is still open ([#3](https://github.com/Kingskid2026/tomecast/issues/3)).
+- Pronunciation of unknown words, phonetic spellings and Q8_0 vs BF16 are checked in section 10 ([#3](https://github.com/Kingskid2026/tomecast/issues/3)): Q8_0 stays.
 
 **Ming-3.0-tts 0.5B (premium, graphics card)**
 - MIT license. Built-in voices include **UK_George** (labelled "audiobooks") and **US_Emma** (labelled "narration"). Languages: English, Chinese, German, Spanish, French, Korean, Japanese. Output is 44.1 kHz.
@@ -139,6 +182,16 @@ Both sit behind one small interface (`voices()`, `languages()`, `synthesize(chun
 
 - The **"Use graphics card"** switch is always visible, with the measured speedup next to it ("about 4× faster on your machine").
 
+**What is built so far (Kokoro on the graphics card, issue #8).** The full scan above is still to come; today's version is deliberately small and never touches drivers:
+
+- `tomecast.hardware.vulkan_possible()` is a cheap check with no download: `libvulkan.so.1` can be loaded and a graphics device node exists (`/dev/dri/renderD*` or `/dev/nvidia0`). The window shows the "Use graphics card" row only when it is true, and `tomecast convert` defaults to the card only then.
+- Which devices exist is asked of audio.cpp itself: `audiocpp_server --backend vulkan --list-devices --json` (the last stdout line that parses as JSON; `list_devices()` never raises, a failure means no devices). `pick_device()` takes the discrete `gpu` with the most free memory, else an `igpu` with at least 2 GB free, else nothing.
+- **One engine build per choice.** Using the card needs only the Vulkan build (`AUDIOCPP_VULKAN`, 117 MB), which also contains the CPU backend. Not using it needs only the CPU build. So the required files are `required_assets(use_gpu)`: that build, eSpeak and Kokoro.
+- **Fallback.** `AutoKokoro` (used by both the command line and the window) starts the Vulkan build on the picked device and checks that `/health` reports the `vulkan` backend. If no device is found, the server won't start, or it reports another backend, it raises `GpuUnavailable` internally and starts again with `"backend": "cpu"` on the same binary, with the warning "The graphics card didn't work, so Tomecast used the CPU." (or "No usable graphics card was found…"). The warning is shown as a note on the command line and on the done screen.
+- **Resuming.** The work-folder key includes which engine build is used, so card and CPU audio never mix in one book.
+- `tomecast doctor` prints the distro, glibc, CPU threads, `vulkan_possible()`, the Vulkan devices (once the Vulkan build is installed) and which engines and models are installed, for bug reports.
+- Measured on the maintainer's laptop (Gift of the Magi, 13 min of audio, whole run including start-up and packaging): 41 s on the NVIDIA RTX PRO 1000 (about 19× real time) and 2 min 51 s on the CPU (about 4.6×).
+
 ### 6. Pause & resume, preview
 - **Resume (built):**
   - Each conversion keeps its chunk audio in `~/.local/share/tomecast/cache/convert-<key>/`.
@@ -146,14 +199,26 @@ Both sit behind one small interface (`voices()`, `languages()`, `synthesize(chun
   - Each chunk's file name includes a hash of its exact text, and a file only gets its final name once its audio has passed the checks. So stopping (Ctrl-C, `kill`, a crash, a reboot) loses at most the chunk in progress, and changed text is always voiced again.
   - Running the same command again picks up where it stopped. The folder is deleted after success, and unused ones after 14 days.
   - A lock stops two runs of the same book from colliding.
+  - Chunk IDs use each chapter's index in the *whole* book, however few chapters are being voiced. So the command line (all chapters) and the window (the ticked ones) reuse each other's chunks, and changing the ticks voices only what is new.
+  - Cancel and Pause work between chunks and once more just before packaging. Packaging itself can't be stopped: once it starts, cancelling is refused.
   - The engine process is stopped with Tomecast, even if Tomecast is killed.
 - **Pause** in the desktop window will use the same mechanism.
+- **Speaking speed (0.5× to 3.0×):**
+  - Kokoro's own `speed` is linear up to about 1.5 and then saturates. Measured on one sentence (audio.cpp 0.9.4): 1.5 gave 1.55× faster, 2.0 only 1.87×, 2.5 2.06× and 3.0 only 2.12×.
+  - So a requested speed is split in one place, `split_speed()` in `engines/audiocpp.py`: `voice_speed = min(speed, 1.5)` goes to the voice, and `tempo = speed / voice_speed` (at most 2.0) is left over.
+  - The packager applies `tempo` as a pitch-preserving ffmpeg `atempo` filter inside the single encode, and divides every chapter mark by it. The preview gets the same stretch.
+  - The "too little audio" check in `audio_problem` allows proportionally shorter audio at the voice's speed, and is unchanged at 1.0 and below.
+  - The work folder's key includes the speed, so chunks voiced at one speed are never reused at another.
 - **Preview:** play the first paragraph of any chapter, or any typed text, in the chosen voice and speed before converting.
 
 ### 7. Packager
 - `ffmpeg` (available on every distro) joins the chunks.
 - **M4B:** AAC, 64 kbps mono (about 30 MB per hour), chapter markers from the book's chapters, plus cover art, title, author and "narrator: <voice>".
-- **MP3 per chapter:** numbered files with tags (album = book, track = chapter) so players keep the order.
+- **MP3 per chapter** (`write_mp3s`, chosen with `--format mp3` or the window's output choice): a folder named after the book, one file per chapter, `NN - Chapter title.mp3` with NN at least two digits, and every file and folder name made safe for FAT32, exFAT and NTFS (`portable_name`), since USB sticks for car stereos are usually FAT32 or exFAT.
+  - Each chapter is its own ffmpeg encode (libmp3lame, mono, the voice's 24 kHz, 64 kbps constant bit rate, about 28.8 MB per hour). CBR rather than VBR: the size is predictable, every player and car stereo seeks correctly, and speech gains little from VBR. Unlike the M4B there is no priming-delay drift to avoid, because each file stands alone and its length is its own chapter.
+  - The audio of each chapter is exactly what the M4B has for it: the same segments, gaps, titles and `atempo`. The test suite checks every chunk is in exactly one file.
+  - ID3v2.3 tags: title = chapter, album = book, artist and album artist = authors, track = `n/total`, composer = narrator, genre "Audiobook", plus the validated cover as the front-cover picture in every file.
+  - Written to a hidden temporary folder, then moved into place. With `overwrite=False` the name is claimed with `mkdir` ("Title", then "Title (2)"...) so an existing folder is never touched, even one that appears while encoding. With `overwrite=True` (the command line's `--force`) only the old numbered MP3s in an existing folder are replaced.
 
 ### 8. Window and terminal command
 - **Window (PySide6 / Qt):** works on KDE, GNOME and tiling setups.
@@ -163,7 +228,7 @@ Both sit behind one small interface (`voices()`, `languages()`, `synthesize(chun
   4. Pronunciation tab with the name finder and Try it.
   5. Convert, with progress, time left, and Pause/Resume.
   6. "Open output folder".
-- **Terminal:** `tomecast convert book.epub --voice UK_George --format m4b`, plus `tomecast voices`, `tomecast preview "text"`, `tomecast scan`. Easy for a techy user to script over a folder of books.
+- **Terminal:** `tomecast convert book.epub --voice UK_George --format m4b`, plus `tomecast voices`, `tomecast preview "text"`, `tomecast names book.epub`, `tomecast scan`. Easy for a techy user to script over a folder of books.
 
 ### 9. Install: the app sets everything up itself
 Users paste **one line** into a terminal: `curl -fsSL https://raw.githubusercontent.com/Kingskid2026/tomecast/main/install.sh | sh`. No `sudo`: everything goes into the user's home folder.
@@ -215,12 +280,33 @@ Rules of thumb from the research (2026-11-05):
 
 | Model | File used | Size | Second copy? | Why |
 |---|---|---|---|---|
-| **Kokoro** 82M | Q8_0 or BF16 GGUF (audio.cpp): whichever wins the step-2 listening test | 190 / 210 MB | No | Only 20 MB apart. **Avoid the common INT8 ONNX file.** It also quantizes activations, and was measured adding a steady tinny tone (4.8/9.6 kHz) and occasional garbled sentences, while running *slower* than full precision |
+| **Kokoro** 82M | **Q8_0** GGUF (audio.cpp). BF16 is not needed: measured, no artefact (see below) | 190 / 212 MB | No | Only 22 MB apart. **Avoid the common INT8 ONNX file.** It also quantizes activations, and was measured adding a steady tinny tone (4.8/9.6 kHz) and occasional garbled sentences, while running *slower* than full precision |
 | **Ming-3.0-tts** 0.5B | **Q8_0 GGUF** (audio.cpp, official) | 1.74 GB (BF16: 3.0 GB) | No | In audio.cpp's tests, Q8 runs up to ~1.5× faster with ~37% less graphics memory than 16-bit. Below 8-bit isn't officially possible, because its 896-wide layers don't fit llama.cpp's 4–6-bit formats. A community 6.4-bit file (1.39 GB) exists, but from an uploader we can't vouch for |
 | **Docling Heron** 43M | FP32 (ONNX) | 170 MB | No | Already under a second per page. An INT8 version that quantizes only the image-reading part (a similar detector lost ~0.5 accuracy points that way) gets tested, and is used only if it matches FP32 on our PDFs *and* is actually faster |
 | **PaddleOCR-VL-1.6** | **Q4_K_M** language part + **BF16** vision part | ~0.3 + 0.88 GB | **Yes: Q8_0 (~0.5 GB)** | In one 4-bit test, 2 of 20 pages came out broken (0 of 20 at full precision), while intact pages were within ~1%. So pages are read at Q4, and any broken or garbled page is re-read with the Q8 copy. Both copies are made locally from one official download. The vision part breaks when quantized, so it stays full |
 | **LFM3-1.7B** | **QAD-Q4_0** | 1.05 GB | No (Q8_0, 1.85 GB, only if testing calls for it) | Trained by Liquid to recover 4-bit losses. Its keep/drop job is forgiving, and it can never retype text. We measure its drift from full precision with llama.cpp's KL-divergence tool |
 | MiniCPM5-2B (backup) | Q4_K_M | 1.56 GB | — | Only if LFM3 fails its tests |
+
+#### Kokoro on audio.cpp: what was measured ([#3](https://github.com/Kingskid2026/tomecast/issues/3), 2026-11-05)
+Real runs on the maintainer's machine, with audio.cpp 0.9.4 (CPU build) and the pinned Q8_0 file. The checks below were made from the signal and from eSpeak's phonemes; no one has listened to the files yet, so the by-ear judgment is still to do.
+
+- **Made-up words.** *Galadriel whispered, "Namárië," as the boats drifted toward Lothlórien.* produced a normal 5.03 s file (peak 0.44 of full scale, average level 0.05, about 14 characters per second, ends in the usual short pad of silence, and it passes Tomecast's own `audio_problem` check), so unknown words are not dropped or cut. Kokoro never sees the spelling: eSpeak NG 1.52 turns every word into phonemes first, and for unknown words it uses its English spelling rules. Called directly, the same library gives:
+  - *Galadriel* → `ɡælˈædɹiːəl` ("gal-AD-ree-ul": stress too late, and the first vowel is a short *a* instead of *uh*)
+  - *Namárië* → `nˈæmɚɹˌɪɛ` ("NAM-er-ih-eh": the accents are ignored and the vowels are English ones, not *nah-MAH-ree-eh*)
+  - *whispered* `wˈɪspɚd`, *drifted* `dɹˈɪftᵻd`, *Lothlórien* `ləθlˈɔːɹiən` ("luh-th-LOR-ee-un", close to *loth-LOR-ee-en*)
+
+  So made-up names come out as readable, plausible English guesses, and some need a fix. The server doesn't log the phonemes (its log only has start-up lines), so these come from calling eSpeak's own library with the same data folder. `tomecast names` and the pronunciation lists are the answer for the ones that are off.
+- **Exact phonetic spellings: not possible through audio.cpp 0.9.4's server or command line.**
+  - Kokoro has a `phonemes` request option that skips eSpeak ("Kokoro-vocabulary phonemes to synthesize directly", one list entry per chunk) in the model spec and the source.
+  - But it is a *list* option, and only the C library (`audiocpp_request_set_option_array`) can set a list. The server's `options` object and the command line's `--request-option` only fill string options, so `options.phonemes` is silently ignored. Tested: the audio with and without it is byte for byte identical, for both a valid and a deliberately broken phoneme string.
+  - eSpeak's inline `[[phonemes]]` markup doesn't work either: its phoneme call reads the brackets out as letters ("g, at, el...").
+  - So pronunciation lists use **respellings**, spoken through eSpeak like any other text. Findings that shaped the format: all-caps words are spelled letter by letter (so stress capitals are lowercased automatically), and a hyphen makes each piece its own stressed word (`her-my-oh-nee` → `hɜːmaɪˈoʊnˈiː`), so a respelling should be tried with `tomecast preview`, and `shi-vawn` for *Siobhan* works (`ʃivˈɔːn`). Supporting `/IPA/` later would need a way to pass a list (the C library through a small helper, or a future server version): not worth it yet.
+- **Q8_0 vs BF16.** The BF16 file (212 MB, from the same Hugging Face commit as the pinned Q8_0, SHA-256 `0d2c2afa...`) was downloaded into a scratch folder only, and the same sentences voiced with both (same voice, same seed). For two passages (14 s and 18 s), a numpy spectrum of each (4096-point FFT averaged over the file) showed:
+  - Average level in every band from 0 to 12 kHz within about 0.4 dB of each other.
+  - No narrow tone at 4.8 kHz in either (within about 1.5 dB of the surrounding spectrum), and only a faint, equal bump at 9.6 kHz in both (+4.3 dB for Q8_0 and +5.1 dB for BF16 on the first passage, +2.8 and +2.5 dB on the second), so it belongs to Kokoro's vocoder and not to the quantization. In the quietest 20% of frames (the pauses), Q8_0 showed no tone that BF16 lacked; if anything BF16's pauses had the stronger 9.6 kHz bump on the first passage (+9.2 dB against +1.2 dB, from only 32 frames, so noisy).
+  - The INT8 artefact comes from *activation* quantization in the ONNX file; Q8_0 GGUF quantizes only weights, which is why the rule of thumb at the top of this section holds here.
+
+  **Decision: keep Q8_0.** Switching to BF16 would cost 22 MB for no measured gain. (On this CPU, one run each: Q8_0 2.9× and BF16 3.3× faster than real time, so BF16 is not slower either, but that is a single noisy run and the speed checks are tracked separately.)
 
 Other ways it stays light:
 - **One model in memory at a time.** The AI pass finishes and unloads before the voice starts.
@@ -278,16 +364,16 @@ Rough totals for a **CPU-only machine** (estimates, to be measured in build step
 2. **Check the engines and the newest models on real hardware.**
    - **audio.cpp:**
      - Ming Q8_0 on the RTX PRO 1000 (Vulkan and CUDA builds) and on CPU: measure speed and memory.
-     - Kokoro: how it handles unknown words (the Elvish line), and whether it takes phonetic spellings.
+     - Kokoro: how it handles unknown words (the Elvish line), and whether it takes phonetic spellings. *Done: section 10.*
    - **LFM3-1.7B** on CPU only, with the GPU off and few threads, to stand in for an old laptop. Compare it against MiniCPM5-2B on the same tricky book sections, and measure QAD-Q4_0's drift from BF16 (llama.cpp KL divergence).
    - **Quantized vs full**, to confirm the section 10 picks hold up:
-     - Kokoro Q8_0 vs BF16: by ear, plus a spectrum check for the 4.8/9.6 kHz tone.
+     - Kokoro Q8_0 vs BF16: by ear, plus a spectrum check for the 4.8/9.6 kHz tone. *Spectrum check done: section 10.*
      - Heron: backbone-INT8 vs FP32 on the test PDFs.
      - PaddleOCR-VL: Q4_K_M vs Q8_0, counting broken pages and typos.
 
    *If either struggles on normal hardware, we find out here, before building around it.*
-3. Cleanup rules and the PDF reader, then DOCX, FB2, TXT and HTML.
-4. Text prep: numbers, abbreviations, pronunciation lists, name finder.
+3. Cleanup rules and the PDF reader. (The DOCX, FB2, TXT and HTML readers are done.)
+4. Text prep: numbers, abbreviations, pronunciation lists, name finder. *Done for the terminal command; the window's Pronunciation tab is still to do ([#10](https://github.com/Kingskid2026/tomecast/issues/10)).*
 5. Pause & resume and preview.
 6. Hardware scan, the GPU switch, and speed estimates.
 7. The desktop window.

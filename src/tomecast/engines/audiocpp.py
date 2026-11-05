@@ -20,6 +20,7 @@ import http.client
 import json
 import os
 import platform
+import re
 import signal
 import socket
 import subprocess
@@ -29,10 +30,12 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from types import TracebackType
+from typing import Literal
 
 from tomecast.audio import concatenate_wavs
 from tomecast.chunking import split_long
 from tomecast.downloads import Asset, local_path
+from tomecast.hardware import list_devices, pick_device, short_name
 
 AUDIOCPP_VERSION = "0.9.4"
 # Tomecast's own build of that release, published as a release of the Tomecast repo by
@@ -67,6 +70,17 @@ AUDIOCPP_CPU = engine_build(
     size=0,
 )
 
+# The same audio.cpp, built with Vulkan. It also contains the CPU backend, so a machine that
+# uses the graphics card downloads only this one. It loads the system's own Vulkan loader
+# (libvulkan.so.1) and graphics driver (NVIDIA's own, or Mesa for AMD and Intel), so it only
+# starts where a Vulkan loader is installed; Tomecast never manages drivers.
+AUDIOCPP_VULKAN = engine_build(
+    "vulkan",
+    "graphics card",
+    sha256="TBD",
+    size=0,
+)
+
 ESPEAK_NG = Asset(
     name="eSpeak NG 1.52 pronunciation rules",
     url=(
@@ -91,7 +105,16 @@ KOKORO_Q8 = Asset(
     path="models/kokoro-82m-q8_0.gguf",
 )
 
-REQUIRED_ASSETS = (AUDIOCPP_CPU, ESPEAK_NG, KOKORO_Q8)
+
+def engine_asset(use_gpu: bool) -> Asset:
+    """The engine build a run needs: the Vulkan one to use the graphics card, else the CPU one."""
+    return AUDIOCPP_VULKAN if use_gpu else AUDIOCPP_CPU
+
+
+def required_assets(use_gpu: bool) -> tuple[Asset, ...]:
+    """Everything a run needs installed: the engine build, eSpeak and the Kokoro model."""
+    return (engine_asset(use_gpu), ESPEAK_NG, KOKORO_Q8)
+
 
 # Kokoro's built-in voices. The first letter is the language, the second the voice's gender.
 VOICES = (
@@ -159,11 +182,21 @@ MAX_CHARS = 200
 _ESPEAK_PATH_LIMIT = 150  # bytes; eSpeak NG 1.52 has a 160-byte path buffer
 SAMPLE_RATE = 24_000  # Kokoro's output
 _MAX_RESTARTS = 2  # in a row, on the same text, before giving up
+# The port is picked free, then released for the engine to take, so on a busy machine another
+# program can grab it first. The engine then says so and exits; Tomecast tries a fresh port.
+_PORT_ATTEMPTS = 3
+_PORT_TAKEN = re.compile(
+    r"could not bind|failed to bind ip|failed to listen|address already in use", re.IGNORECASE
+)
 _PHONEME_LIMIT_MESSAGE = "exceeds 510"
 
 
 class EngineError(RuntimeError):
     """Raised when the voice engine can't start or can't voice a piece of text."""
+
+
+class GpuUnavailable(EngineError):
+    """The engine was asked to use the graphics card and couldn't (or used the CPU instead)."""
 
 
 class _ConnectionLost(EngineError):
@@ -239,6 +272,26 @@ def default_threads() -> int:
     return max(1, min(8, (logical or 2) // 2))
 
 
+MIN_SPEED, MAX_SPEED = 0.5, 3.0
+# Kokoro's own ``speed`` is linear up to about 1.5 and then saturates: measured on one
+# sentence, 2.0 only made it 1.87x faster and 3.0 only 2.12x. So the voice never goes past
+# this, and the rest of a faster request is a pitch-preserving time-stretch of the audiobook.
+VOICE_SPEED_LIMIT = 1.5
+
+
+def split_speed(speed: float) -> tuple[float, float]:
+    """Split a requested speed into ``(voice_speed, tempo)``, where
+    ``voice_speed * tempo == speed``. The one place this is decided."""
+    voice_speed = min(speed, VOICE_SPEED_LIMIT)
+    return voice_speed, speed / voice_speed
+
+
+def _checked_speed(speed: float) -> float:
+    if not MIN_SPEED <= speed <= MAX_SPEED:
+        raise EngineError(f"speed must be between {MIN_SPEED} and {MAX_SPEED}")
+    return speed
+
+
 class KokoroServer:
     """A running audio.cpp server with Kokoro loaded. Use it as a context manager."""
 
@@ -253,23 +306,48 @@ class KokoroServer:
         startup_timeout: float = 120.0,
         request_timeout: float = 300.0,
         executable: Path | None = None,
+        backend: Literal["cpu", "vulkan"] = "cpu",
+        device: int | None = None,
     ) -> None:
         if voice not in VOICES:
             raise EngineError(f"unknown voice {voice!r}; choose one of: {', '.join(VOICES)}")
-        if not 0.5 <= speed <= 2.0:
-            raise EngineError("speed must be between 0.5 and 2.0")
         self.voice = voice
-        self.speed = speed
+        self._speed = _checked_speed(speed)
         self.seed = seed
         self._root = root
         self._threads = threads or default_threads()
         self._startup_timeout = startup_timeout
         self._request_timeout = request_timeout
-        self._executable = executable or local_path(AUDIOCPP_CPU, root) / "audiocpp_server"
+        self.backend = backend
+        self.device = device
+        self._executable = executable or (
+            local_path(engine_asset(backend == "vulkan"), root) / "audiocpp_server"
+        )
+        self._reported_backend = ""
         self._process: subprocess.Popen[bytes] | None = None
         self._tempdir: tempfile.TemporaryDirectory[str] | None = None
         self._base_url = ""
         self._consecutive_restarts = 0
+
+    @property
+    def speed(self) -> float:
+        """The speed the listener asked for, from MIN_SPEED to MAX_SPEED."""
+        return self._speed
+
+    @speed.setter
+    def speed(self, value: float) -> None:
+        self._speed = _checked_speed(value)
+
+    @property
+    def voice_speed(self) -> float:
+        """The speed the voice itself speaks at: ``speed``, capped at VOICE_SPEED_LIMIT."""
+        return split_speed(self._speed)[0]
+
+    @property
+    def tempo(self) -> float:
+        """The time-stretch left over after the voice: ``speed / voice_speed``. The M4B is
+        stretched by this much when it is encoded."""
+        return split_speed(self._speed)[1]
 
     @property
     def label(self) -> str:
@@ -303,6 +381,14 @@ class KokoroServer:
         self._tempdir = tempfile.TemporaryDirectory(prefix="tomecast-audiocpp-")
         try:
             self._launch()
+        except GpuUnavailable:
+            self.close()
+            raise
+        except EngineError as error:
+            self.close()
+            if self.backend == "vulkan":
+                raise GpuUnavailable(str(error)) from error
+            raise
         except BaseException:  # including Ctrl-C while the model loads
             self.close()
             raise
@@ -370,9 +456,26 @@ class KokoroServer:
         return Path(self._tempdir.name) / "server.log"
 
     def _launch(self) -> None:
-        """Start the server process in the temp folder and wait until it's healthy."""
+        """Start the server process in the temp folder and wait until it's healthy.
+
+        If the port was taken in the moment between picking and binding it, try a new one.
+        """
+        for attempt in range(1, _PORT_ATTEMPTS + 1):
+            try:
+                self._launch_once()
+                return
+            except _PortTaken as taken:
+                self._process = None
+                if attempt == _PORT_ATTEMPTS:
+                    raise EngineError(
+                        "the voice engine couldn't get a free network port on this computer "
+                        f"after {_PORT_ATTEMPTS} tries:\n{taken}"
+                    ) from None
+
+    def _launch_once(self) -> None:
         assert self._tempdir is not None
         workdir = Path(self._tempdir.name)
+        log_start = self._log_path.stat().st_size if self._log_path.exists() else 0
         port = _free_port()
         self._base_url = f"http://127.0.0.1:{port}"
         config = workdir / "server.json"
@@ -389,10 +492,20 @@ class KokoroServer:
         deadline = time.monotonic() + self._startup_timeout
         while time.monotonic() < deadline:
             if self._process.poll() is not None:
+                with self._log_path.open("rb") as log_file:
+                    log_file.seek(log_start)
+                    this_start = log_file.read().decode("utf-8", "replace")
+                if _PORT_TAKEN.search(this_start):
+                    raise _PortTaken(this_start.strip()[-400:])
                 raise EngineError(
                     f"the voice engine stopped while starting:\n{_tail(self._log_path)}"
                 )
             if self._healthy():
+                if self.backend == "vulkan" and self._reported_backend != "vulkan":
+                    raise GpuUnavailable(
+                        f"the voice engine reported the {self._reported_backend or 'unknown'} "
+                        "backend, not the graphics card"
+                    )
                 return
             time.sleep(0.2)
         raise EngineError(
@@ -417,7 +530,7 @@ class KokoroServer:
                 "model": "kokoro",
                 "input": text,
                 "voice": self.voice,
-                "speed": self.speed,
+                "speed": self.voice_speed,
                 "response_format": "wav",
                 "options": {"seed": self.seed},
             }
@@ -443,13 +556,21 @@ class KokoroServer:
                 payload = json.loads(response.read())
         except (OSError, http.client.HTTPException, ValueError):
             return False
-        return isinstance(payload, dict) and payload.get("status") == "ok"
+        if not isinstance(payload, dict) or payload.get("status") != "ok":
+            return False
+        self._reported_backend = str(payload.get("backend", ""))
+        return True
 
     def _server_config(self, port: int) -> dict[str, object]:
         return {
             "host": "127.0.0.1",
             "port": port,
-            "backend": "cpu",  # the server defaults to CUDA
+            "backend": self.backend,  # the server defaults to CUDA, so always say
+            **(
+                {"device": self.device}
+                if self.backend == "vulkan" and self.device is not None
+                else {}
+            ),
             "threads": self._threads,
             "lazy_load": False,
             "ui": False,
@@ -461,7 +582,7 @@ class KokoroServer:
                     "task": "tts",
                     "mode": "offline",
                     "default_voice_preset": {"voice_id": self.voice},
-                    "default_request_options": {"speed": self.speed},
+                    "default_request_options": {"speed": self.voice_speed},
                 }
             ],
         }
@@ -512,6 +633,10 @@ def _has_exited(process: subprocess.Popen[bytes], grace: float = 2.0) -> bool:
     return True
 
 
+class _PortTaken(Exception):
+    """The engine exited at startup because its port was already in use."""
+
+
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -533,3 +658,57 @@ def _tail(path: Path, lines: int = 20) -> str:
         return "\n".join(path.read_text(errors="replace").splitlines()[-lines:])
     except OSError:
         return "(no log)"
+
+
+CPU_FALLBACK_NOTE = "The graphics card didn't work, so Tomecast used the CPU."
+NO_DEVICE_NOTE = "No usable graphics card was found, so Tomecast used the CPU."
+
+
+class AutoKokoro(KokoroServer):
+    """Kokoro that picks its own hardware: the graphics card if it can, else the CPU.
+
+    This is the one place the choice and the fallback live; the command line and the window
+    both use it. With ``use_gpu`` it runs the Vulkan build, asks it which devices the installed
+    drivers expose, and starts on the best one. If there is none, or the engine won't start on
+    it (or reports another backend), it starts again on the CPU with the same build and sets
+    :attr:`warning`. After :meth:`start`, :attr:`device_label` says what is in use ("CPU" or
+    the card's name) and :attr:`gpu_description` is the card's full description (or ``""``).
+    """
+
+    def __init__(self, root: Path, *, use_gpu: bool = True, **kwargs: object) -> None:
+        self.use_gpu = use_gpu
+        self.warning: str | None = None
+        self.device_label = "CPU"
+        self.gpu_description = ""
+        super().__init__(root, backend="vulkan" if use_gpu else "cpu", **kwargs)  # type: ignore[arg-type]
+
+    def __enter__(self) -> AutoKokoro:
+        self.start()
+        return self
+
+    def start(self) -> None:
+        if self._process is not None:
+            return
+        self.warning = None
+        self.device_label, self.gpu_description = "CPU", ""
+        if not self.use_gpu:
+            super().start()
+            return
+        device = pick_device(list_devices(self._executable))
+        if device is None:
+            self._use_cpu(NO_DEVICE_NOTE)
+            return
+        self.backend, self.device = "vulkan", device.index
+        try:
+            super().start()
+        except GpuUnavailable:
+            self._use_cpu(CPU_FALLBACK_NOTE)
+            return
+        self.device_label = short_name(device.description)
+        self.gpu_description = device.description
+
+    def _use_cpu(self, note: str) -> None:
+        """Run on the CPU backend of the same build, and say why."""
+        self.backend, self.device = "cpu", None
+        super().start()
+        self.warning = note

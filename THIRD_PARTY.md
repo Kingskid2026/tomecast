@@ -24,13 +24,15 @@ This list reflects the current design ([docs/architecture.md](docs/architecture.
 
 | Component | Used for | License | Source |
 |---|---|---|---|
-| audio.cpp | Running the voice models | Apache 2.0 | Built by Tomecast from [0xShug0/audio.cpp](https://github.com/0xShug0/audio.cpp), see below |
+| audio.cpp | Running the voice models: a CPU build, and a Vulkan build for graphics cards (through the installed driver; downloaded only when the graphics card is used) | Apache 2.0 | Built by Tomecast from [0xShug0/audio.cpp](https://github.com/0xShug0/audio.cpp), see [below](#audiocpp-builds-distributed-by-tomecast) |
 | llama.cpp | Running the text and OCR models | MIT | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) |
 | ONNX Runtime | Running Docling Heron | MIT | [microsoft/onnxruntime](https://github.com/microsoft/onnxruntime) |
-| pypdfium2 / PDFium | Reading PDFs | Apache 2.0 or BSD-3-Clause / BSD-3-Clause | [pypdfium2](https://github.com/pypdfium2-team/pypdfium2) |
+| python-docx | Reading DOCX documents (it also installs typing-extensions, PSF-2.0) | MIT | [python-openxml/python-docx](https://github.com/python-openxml/python-docx) |
+| pypdfium2 5.14+ / PDFium | Reading PDFs. A Python dependency, installed from PyPI; its wheel carries a PDFium build | pypdfium2: Apache 2.0 or BSD-3-Clause. PDFium: BSD-3-Clause. The PDFium build also includes FreeType (FreeType License), ICU (Unicode License v3), libjpeg-turbo, OpenJPEG, libpng, Little CMS, zlib, Abseil and others under permissive licences, listed in the wheel's `licenses` folder | [pypdfium2](https://github.com/pypdfium2-team/pypdfium2), [PDFium](https://pdfium.googlesource.com/pdfium/), [pdfium-binaries](https://github.com/bblanchon/pdfium-binaries) |
 | FFmpeg (via imageio-ffmpeg) | Building M4B/MP3 files; runs as a separate program | LGPL/GPL | [imageio-ffmpeg](https://github.com/imageio/imageio-ffmpeg) |
 | eSpeak NG 1.52 (from the espeakng-loader wheel) | Turning text into sounds for Kokoro, needed for every sentence. Downloaded as a runtime file and used by audio.cpp, not imported by Tomecast | GPL-3.0-or-later | [espeak-ng](https://github.com/espeak-ng/espeak-ng), [espeakng-loader](https://pypi.org/project/espeakng-loader/) |
 | uv | Installing Tomecast | Apache 2.0 or MIT | [astral-sh/uv](https://github.com/astral-sh/uv) |
+| Qt 6 / PySide6-Essentials | The desktop window | LGPL-3.0 (installed from PyPI as a separate library, not modified) | [PySide6-Essentials](https://pypi.org/project/PySide6-Essentials/), [qt.io](https://www.qt.io/licensing/open-source-lgpl-obligations) |
 
 ## audio.cpp builds distributed by Tomecast
 
@@ -39,3 +41,19 @@ audio.cpp's own Linux binaries need glibc 2.43, which most distros don't have ye
 - **What they are:** `audiocpp_server` from audio.cpp's tagged release, **built unmodified**: no patches, upstream's own release build options. The only changes are about where it runs: it's built on an older system (manylinux_2_28, glibc 2.28) with the C++ and OpenMP runtimes linked in, and for any CPU with AVX2 instead of for the build machine's own CPU. The CPU build and the Vulkan build come from the same source; the Vulkan build uses the computer's own Vulkan loader and graphics driver and includes no driver.
 - **How:** [`.github/workflows/engine-build.yml`](.github/workflows/engine-build.yml) and [`.github/scripts/build-audiocpp.sh`](.github/scripts/build-audiocpp.sh) do the whole build in GitHub Actions, from pinned sources (audio.cpp by commit, the build image by digest, everything else by SHA-256). Each tarball has a signed build provenance attestation, which `gh attestation verify FILE --repo Kingskid2026/tomecast` checks.
 - **License:** audio.cpp is Apache 2.0. Each tarball includes audio.cpp's `LICENSE`, a `licenses/` folder with the licenses of the code compiled into it (ggml, sentencepiece and its bundled libraries, cJSON, cpp-httplib, libyaml, utf8proc, BoringSSL, and for the Vulkan build the Vulkan and SPIR-V headers), and `BUILD-INFO.txt` with the exact source commit and build options. The GCC runtime libraries linked in (libstdc++, libgcc, libgomp) are covered by the GCC Runtime Library Exception.
+
+## Data files we generate
+
+| Item | Used for | License | Source |
+|---|---|---|---|
+| `src/tomecast/data/common_words.txt` | The name finder's list of ordinary English words, so it doesn't list them as names | Public domain: a list of words (every word that appears in lowercase at least 3 times) counted from 23 public-domain Project Gutenberg books | Rebuild with `scripts/make_wordlist.py`; book list in that script |
+
+## Bundled with the app
+
+These ship inside the Tomecast package itself (`src/tomecast/gui/`).
+
+| Item | Used for | License | Source |
+|---|---|---|---|
+| Doto (font) | Big numerals and timers | SIL Open Font License 1.1 | See `src/tomecast/gui/fonts/README.md` |
+| IBM Plex Sans, IBM Plex Mono (fonts) | Interface text, labels and data | SIL Open Font License 1.1 | See `src/tomecast/gui/fonts/README.md` |
+| Luca della Robbia, *Cantoria* (1431–38), photograph | Drop screen art, shown as dots | Public domain | See `src/tomecast/gui/assets/CREDITS.md` |

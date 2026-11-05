@@ -4,20 +4,32 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import fcntl
-import hashlib
+import os
+import platform
+import re
 import shutil
 import signal
 import sys
+import tempfile
 import time
 import wave
-from collections.abc import Iterator, Sequence
+from collections.abc import Sequence
 from pathlib import Path
-from typing import TextIO
+from typing import Literal, TextIO
 
-from tomecast import __version__
-from tomecast.chunking import CoverageError
-from tomecast.convert import ConversionProgress, MissingAudioError, convert_book, plan_chunks
+from tomecast import __version__, pronunciations
+from tomecast.audio import concatenate_wavs
+from tomecast.book import Book, Chapter
+from tomecast.chunking import CoverageError, chunk_paragraphs
+from tomecast.cleanup import RULES, CleanupOptions, Matter, Removal, clean
+from tomecast.convert import (
+    ConversionProgress,
+    MissingAudioError,
+    VoiceEngine,
+    audio_problem,
+    convert_book,
+    plan_chunks,
+)
 from tomecast.downloads import (
     Asset,
     DownloadError,
@@ -25,20 +37,31 @@ from tomecast.downloads import (
     data_dir,
     ensure,
     is_installed,
+    local_path,
 )
 from tomecast.engines.audiocpp import (
-    AUDIOCPP_VERSION,
-    DEFAULT_SEED,
+    AUDIOCPP_CPU,
+    AUDIOCPP_VULKAN,
     DEFAULT_VOICE,
+    ESPEAK_NG,
+    KOKORO_Q8,
     MAX_CHARS,
-    REQUIRED_ASSETS,
+    MAX_SPEED,
+    MIN_SPEED,
     VOICES,
+    AutoKokoro,
     EngineError,
-    KokoroServer,
     check_system,
+    glibc_version,
+    required_assets,
 )
+from tomecast.hardware import list_devices, vulkan_possible
+from tomecast.names import DEFAULT_MIN_COUNT, find_book_names
 from tomecast.packaging import PackagingError
-from tomecast.readers.epub import InvalidEbookError, read_epub
+from tomecast.playback import PLAYERS, find_player, play
+from tomecast.readers import FORMATS, InvalidEbookError, read_book
+from tomecast.textprep import TextPrep
+from tomecast.workdirs import WorkFolderBusy, exclusive, work_folder
 
 
 class CliError(Exception):
@@ -46,7 +69,6 @@ class CliError(Exception):
 
 
 # Unfinished conversions are kept so they can be resumed; after this long they're removed.
-STALE_WORK_DAYS = 14
 
 
 def _speed(value: str) -> float:
@@ -54,8 +76,8 @@ def _speed(value: str) -> float:
         speed = float(value)
     except ValueError:
         raise argparse.ArgumentTypeError(f"{value!r} isn't a number") from None
-    if not 0.5 <= speed <= 2.0:
-        raise argparse.ArgumentTypeError("must be between 0.5 and 2.0")
+    if not MIN_SPEED <= speed <= MAX_SPEED:
+        raise argparse.ArgumentTypeError(f"must be between {MIN_SPEED} and {MAX_SPEED}")
     return speed
 
 
@@ -70,26 +92,138 @@ def build_parser() -> argparse.ArgumentParser:
 
     convert = commands.add_parser(
         "convert",
-        help="turn an ebook into an M4B audiobook",
-        description="Turn an ebook into an M4B audiobook with chapters.",
+        help="turn an ebook into an M4B audiobook, or MP3s",
+        description="Turn an ebook into an M4B audiobook with chapters, or into one MP3 per "
+        "chapter (--format mp3).",
     )
-    convert.add_argument("book", type=Path, help="the ebook to convert (EPUB for now)")
+    convert.add_argument("book", type=Path, help=f"the ebook to convert ({', '.join(FORMATS)})")
     convert.add_argument(
-        "-o", "--output", type=Path, help="where to write the audiobook (default: BOOK.m4b)"
-    )
+        "-o", "--output", type=Path,
+        help="where to write the audiobook (default: BOOK.m4b, or a BOOK folder with --format mp3)",
+    )  # fmt: skip
+    convert.add_argument(
+        "--format", choices=("m4b", "mp3"), default="m4b",
+        help="m4b: one audiobook file with chapters (default); mp3: a folder, one MP3 per chapter",
+    )  # fmt: skip
     convert.add_argument(
         "--voice", default=DEFAULT_VOICE, choices=VOICES, metavar="VOICE",
         help=f"Kokoro voice (default: {DEFAULT_VOICE}; see `tomecast voices`)",
     )  # fmt: skip
     convert.add_argument(
-        "--speed", type=_speed, default=1.0, help="speaking speed, 0.5 to 2.0 (default: 1.0)"
+        "--speed",
+        type=_speed,
+        default=1.0,
+        help=f"speaking speed, {MIN_SPEED} to {MAX_SPEED} (default: 1.0)",
     )
     convert.add_argument(
         "-y", "--yes", action="store_true", help="download the voice engine without asking"
     )
-    convert.add_argument("-f", "--force", action="store_true", help="overwrite the output file")
+    convert.add_argument("-f", "--force", action="store_true", help="overwrite the output")
+    convert.add_argument(
+        "--gpu", action=argparse.BooleanOptionalAction, default=None,
+        help="use the graphics card through the driver already installed "
+        "(default: on when one is found); --no-gpu uses the CPU",
+    )  # fmt: skip
+    cleanup = convert.add_argument_group(
+        "cleanup", "What to leave out. By default Tomecast reads the book, not the page."
+    )
+    cleanup.add_argument(
+        "--keep-page-numbers",
+        action="store_true",
+        help="read page numbers and running headers and footers (PDF)",
+    )
+    cleanup.add_argument(
+        "--keep-front-matter",
+        action="store_true",
+        help="read the front and back matter too: title page, copyright, contents, index, "
+        '"Also by" lists and previews of other books',
+    )
+    cleanup.add_argument(
+        "--footnotes",
+        choices=("drop", "end"),
+        default="drop",
+        help="leave footnotes out (drop, the default) or read them at the end of their chapter",
+    )
 
     commands.add_parser("voices", help="list the available voices")
+
+    commands.add_parser(
+        "doctor",
+        help="print what Tomecast sees on this computer (for bug reports)",
+        description="Print the system, graphics and installed-file details a bug report needs.",
+    )
+    names = commands.add_parser(
+        "names",
+        help="list the names and unusual words in a book",
+        description=(
+            "List the capitalised words a book uses often that aren't ordinary English, "
+            "with how many times. Names and places are the ones a voice most often gets "
+            "wrong: check them with `tomecast preview`, then add fixes to a pronunciation "
+            "list (see the README)."
+        ),
+    )
+    names.add_argument("book", type=Path, help=f"the ebook to look through ({', '.join(FORMATS)})")
+    names.add_argument(
+        "--min-count", type=int, default=DEFAULT_MIN_COUNT, metavar="N",
+        help=f"only words used at least N times (default: {DEFAULT_MIN_COUNT})",
+    )  # fmt: skip
+    names.add_argument(
+        "--limit", type=int, default=100, metavar="N",
+        help="show at most N words, most frequent first (default: 100; 0 shows all)",
+    )  # fmt: skip
+
+    preview = commands.add_parser(
+        "preview",
+        help="hear how a word or sentence sounds",
+        description=(
+            "Voice some text and play it (or save it with -o). Your pronunciation lists "
+            "and the number and abbreviation rules are applied first, so you hear what the "
+            "book would sound like; --raw skips them."
+        ),
+    )
+    preview.add_argument("text", nargs="+", help="the word or sentence to say")
+    preview.add_argument(
+        "--voice", default=DEFAULT_VOICE, choices=VOICES, metavar="VOICE",
+        help=f"Kokoro voice (default: {DEFAULT_VOICE}; see `tomecast voices`)",
+    )  # fmt: skip
+    preview.add_argument(
+        "--speed", type=_speed, default=1.0,
+        help=f"speaking speed, {MIN_SPEED} to {MAX_SPEED} (default: 1.0)",
+    )  # fmt: skip
+    preview.add_argument(
+        "-o", "--output", type=Path, help="write a WAV file instead of playing the sound"
+    )
+    preview.add_argument(
+        "--book",
+        type=Path,
+        help="also use this book's pronunciation list (BOOK.pronunciations.txt)",
+    )
+    preview.add_argument(
+        "--raw", action="store_true",
+        help="say the text exactly as typed: no pronunciation lists, no number rules",
+    )  # fmt: skip
+    preview.add_argument(
+        "-y", "--yes", action="store_true", help="download the voice engine without asking"
+    )
+    preview.add_argument("-f", "--force", action="store_true", help="overwrite the output file")
+    preview.add_argument(
+        "--gpu", action=argparse.BooleanOptionalAction, default=None,
+        help="use the graphics card (default: on when one is found); --no-gpu uses the CPU",
+    )  # fmt: skip
+
+    gui = commands.add_parser(
+        "gui",
+        help="open the desktop window",
+        description="Open the Tomecast desktop window, optionally with a book already loaded.",
+    )
+    gui.add_argument("book", nargs="?", type=Path, help="a book to open in the window")
+
+    entry = commands.add_parser(
+        "desktop-entry",
+        help="add or remove Tomecast in your app launcher",
+        description="Add Tomecast to (or remove it from) your app launcher and EPUB 'Open with'.",
+    )
+    entry.add_argument("action", choices=("install", "uninstall"), help="what to do")
     return parser
 
 
@@ -104,6 +238,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _convert(args)
         if args.command == "voices":
             return _voices()
+        if args.command == "doctor":
+            return _doctor()
+        if args.command == "names":
+            return _names(args)
+        if args.command == "preview":
+            return _preview(args)
+        if args.command == "gui":
+            return _gui(args)
+        if args.command == "desktop-entry":
+            return _desktop_entry(args)
     except CliError as error:
         print(f"tomecast: error: {error}", file=sys.stderr)
         return 1
@@ -129,45 +273,98 @@ def _voices() -> int:
     return 0
 
 
+def _gui(args: argparse.Namespace) -> int:
+    book: Path | None = args.book
+    try:
+        # Imported here so the other commands never load Qt.
+        from tomecast.gui import run
+
+        return run([str(book)] if book else [])
+    except ImportError as error:
+        raise CliError(
+            f"the desktop window can't start: {error}. The window needs the graphics libraries "
+            "every Linux desktop has (libEGL, libxkbcommon, fontconfig). On a machine without "
+            "a desktop, use 'tomecast convert' instead."
+        ) from error
+
+
+def _desktop_entry(args: argparse.Namespace) -> int:
+    from tomecast import desktop
+
+    try:
+        messages = desktop.install() if args.action == "install" else desktop.uninstall()
+    except (OSError, desktop.ForeignEntryError) as error:
+        raise CliError(str(error)) from error
+    print("\n".join(messages))
+    return 0
+
+
 def _convert(args: argparse.Namespace) -> int:
     book_path: Path = args.book
     if not book_path.is_file():
         raise CliError(f"{book_path} doesn't exist")
-    if book_path.suffix.lower() != ".epub":
-        raise CliError("only EPUB books are supported so far (PDF and other formats are coming)")
-    output: Path = args.output or book_path.with_suffix(".m4b")
-    if output.exists() and not args.force:
+    output_format: Literal["m4b", "mp3"] = args.format
+    output: Path = args.output or (
+        book_path.with_suffix("") if output_format == "mp3" else book_path.with_suffix(".m4b")
+    )
+    if (output.exists() or output.is_symlink()) and not args.force:
         raise CliError(f"{output} already exists (use --force to overwrite it)")
     if not output.parent.is_dir():
         raise CliError(f"the folder {output.parent} doesn't exist")
 
     try:
-        book = read_epub(book_path)
+        book = read_book(book_path)
         check_system()
     except (InvalidEbookError, EngineError, OSError) as error:
         raise CliError(str(error)) from error
-    if not book.chapters:
+    cleaned = clean(book, _cleanup_options(args))
+    book = cleaned.book
+    chapters = cleaned.kept
+    if not chapters:
         raise CliError(f"no readable text found in {book_path.name}")
+    for line in _cleanup_notes(cleaned.removed, book.chapters):
+        print(line)
 
+    use_gpu = _wants_gpu(args.gpu)
     root = data_dir()
+    prep, warnings = _text_prep(book, book_path, root)
+    for warning in warnings:
+        print(f"Note: {warning}", file=sys.stderr)
     try:
-        _install(REQUIRED_ASSETS, root, assume_yes=args.yes)
-        workdir = _work_folder(root, book_path, args.voice, args.speed)
+        _install(required_assets(use_gpu), root, assume_yes=args.yes)
+        workdir = work_folder(root, book_path, args.voice, args.speed, use_gpu=use_gpu)
     except OSError as error:
         raise CliError(str(error)) from error
 
-    chunk_count = sum(len(chunks) for chunks in plan_chunks(book, MAX_CHARS))
+    chunk_count = sum(len(chunks) for chunks in plan_chunks(book, MAX_CHARS, chapters, prep=prep))
     print(
-        f"Converting “{book.title}”: {_plural(len(book.chapters), 'chapter')}, "
+        f"Converting “{book.title}”: {_plural(len(chapters), 'chapter')}, "
         f"{_plural(chunk_count, 'piece')} of text, voice {args.voice}."
     )
+    if prep.pronunciations:
+        count = len(prep.pronunciations)
+        print(f"Using {count} pronunciation {'fix' if count == 1 else 'fixes'}.")
     progress = _ProgressPrinter(sys.stderr)
     started = time.monotonic()
-    with _exclusive(workdir):
+    with contextlib.ExitStack() as stack:
         try:
-            with KokoroServer(root, voice=args.voice, speed=args.speed) as engine:
+            stack.enter_context(exclusive(workdir))
+        except WorkFolderBusy as error:
+            raise CliError(str(error)) from None
+        try:
+            with AutoKokoro(root, voice=args.voice, speed=args.speed, use_gpu=use_gpu) as engine:
+                print(_hardware_line(engine, args.gpu))
+                if engine.warning:
+                    print(f"Note: {engine.warning}")
                 result = convert_book(
-                    book, engine, output, workdir=workdir, progress=progress.update
+                    book,
+                    engine,
+                    output,
+                    workdir=workdir,
+                    progress=progress.update,
+                    format=output_format,
+                    prep=prep,
+                    chapters=chapters,
                 )
         except KeyboardInterrupt:
             progress.finish()
@@ -188,51 +385,220 @@ def _convert(args: argparse.Namespace) -> int:
         print(f"Picked up where the last run stopped ({_plural(result.reused_chunks, 'piece')}).")
     length = result.chapters[-1].end_seconds if result.chapters else 0.0
     print(
-        f"Done: {output} ({_duration(length)} of audio, "
+        f"Done: {result.output} ({_duration(length)} of audio, "
         f"{_plural(len(result.chapters), 'chapter')}, "
         f"made in {_duration(time.monotonic() - started)})."
     )
     return 0
 
 
+NO_VULKAN_NOTE = (
+    "No usable Vulkan graphics driver was found, so Tomecast will use the CPU. To use the "
+    "graphics card, install your distro's Vulkan loader (vulkan-icd-loader, libvulkan1 or "
+    "vulkan-loader); Tomecast never installs drivers."
+)
+
+
+def _wants_gpu(requested: bool | None) -> bool:
+    """``--gpu`` / ``--no-gpu``, else on when a Vulkan driver and graphics device are there."""
+    possible = vulkan_possible()
+    if requested and not possible:
+        print(f"Note: {NO_VULKAN_NOTE}")
+        return False
+    return possible if requested is None else requested
+
+
+def _hardware_line(engine: AutoKokoro, requested: bool | None) -> str:
+    if engine.gpu_description:
+        return f"Using the graphics card: {engine.gpu_description}."
+    if not engine.use_gpu:
+        why = "turned off with --no-gpu" if requested is False else "no graphics card found"
+        return f"Using the CPU ({why})."
+    return "Using the CPU."
+
+
+def _doctor() -> int:
+    """Print what a bug report needs: system, graphics and installed files."""
+    root = data_dir()
+    print(f"Tomecast {__version__}")
+    print(f"Distro: {_distro()}")
+    glibc = glibc_version()
+    print(f"glibc: {f'{glibc[0]}.{glibc[1]}' if glibc else 'not found'}")
+    threads = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count()
+    print(f"CPU threads: {threads}")
+    print(f"Python: {platform.python_version()}")
+    print(f"Vulkan possible: {'yes' if vulkan_possible() else 'no'}")
+    vulkan = local_path(AUDIOCPP_VULKAN, root)
+    if is_installed(AUDIOCPP_VULKAN, root):
+        devices = list_devices(vulkan / "audiocpp_server")
+        if devices:
+            print("Vulkan devices:")
+            for device in devices:
+                free = (
+                    f"{device.free_bytes / 2**30:.1f} of {device.total_bytes / 2**30:.1f} GiB free"
+                )
+                print(f"  {device.index}: {device.description} ({device.kind}, {free})")
+        else:
+            print("Vulkan devices: none found")
+    else:
+        print("Vulkan devices: not checked (the graphics-card engine isn't installed yet)")
+    print(f"Data folder: {root}")
+    print("Installed:")
+    for asset in (AUDIOCPP_CPU, AUDIOCPP_VULKAN, ESPEAK_NG, KOKORO_Q8):
+        state = "yes" if is_installed(asset, root) else "no"
+        print(f"  {asset.name}: {state}")
+    return 0
+
+
+def _distro() -> str:
+    try:
+        text = Path("/etc/os-release").read_text(errors="replace")
+    except OSError:
+        return "unknown"
+    match = re.search(r'^PRETTY_NAME=(?:"([^"]*)"|(\S*))\s*$', text, re.MULTILINE)
+    return (match.group(1) or match.group(2)) if match else "unknown"
+
+
+def _text_prep(book: Book, book_path: Path | None, root: Path) -> tuple[TextPrep, list[str]]:
+    """The text prep for ``book``: its language's rules plus the pronunciation lists (the
+    global one, then the one next to the book file), and warnings about any bad list lines."""
+    fixes, warnings = pronunciations.load_for_book(root, book_path)
+    return TextPrep.for_language(book.language, fixes), warnings
+
+
+def _names(args: argparse.Namespace) -> int:
+    book_path: Path = args.book
+    if not book_path.is_file():
+        raise CliError(f"{book_path} doesn't exist")
+    try:
+        book = read_book(book_path)
+    except (InvalidEbookError, OSError) as error:
+        raise CliError(str(error)) from error
+    if not book.chapters:
+        raise CliError(f"no readable text found in {book_path.name}")
+
+    root = data_dir()
+    fixes, warnings = pronunciations.load_for_book(root, book_path)
+    for warning in warnings:
+        print(f"Note: {warning}", file=sys.stderr)
+    found = find_book_names(book, min_count=max(1, args.min_count), skip=fixes.written_words())
+    if not found:
+        print("No unusual names found.")
+        return 0
+    shown = found if args.limit <= 0 else found[: args.limit]
+    width = max(len(name.word) for name in shown)
+    for name in shown:
+        print(f"{name.word:<{width}}  {name.count:>5}")
+    if len(shown) < len(found):
+        print(f"\n…and {len(found) - len(shown)} more (use --limit 0 to see them all).")
+    print(
+        f"\nHear one with `tomecast preview NAME`. To fix one, add a line like "
+        f"`Name → say-it-like-this` to {pronunciations.book_list_path(book_path)} "
+        f"(this book) or {pronunciations.global_list_path(root)} (every book)."
+    )
+    return 0
+
+
+def _preview(args: argparse.Namespace) -> int:
+    text = " ".join(args.text).strip()
+    output: Path | None = args.output
+    if output is not None:
+        if output.exists() and not args.force:
+            raise CliError(f"{output} already exists (use --force to overwrite it)")
+        if not output.parent.is_dir():
+            raise CliError(f"the folder {output.parent} doesn't exist")
+    elif find_player() is None:
+        raise CliError(
+            f"no audio player found ({', '.join(PLAYERS)}). Use -o FILE.wav to save the sound "
+            "instead."
+        )
+    try:
+        check_system()
+    except EngineError as error:
+        raise CliError(str(error)) from error
+
+    root = data_dir()
+    spoken = text
+    if not args.raw:
+        book_path: Path | None = args.book
+        fixes, warnings = pronunciations.load_for_book(root, book_path)
+        for warning in warnings:
+            print(f"Note: {warning}", file=sys.stderr)
+        spoken = TextPrep.for_language(None, fixes).body(text)
+    if not any(character.isalnum() for character in spoken):
+        raise CliError("there's nothing to say: give it a word or a sentence")
+    if spoken != text:
+        print(f"Saying: {spoken}")
+
+    use_gpu = _wants_gpu(args.gpu)
+    _install(required_assets(use_gpu), root, assume_yes=args.yes)
+    with tempfile.TemporaryDirectory(prefix="tomecast-preview-") as folder:
+        wav = Path(folder) / "preview.wav"
+        try:
+            with AutoKokoro(root, voice=args.voice, speed=args.speed, use_gpu=use_gpu) as engine:
+                if engine.warning:
+                    print(f"Note: {engine.warning}", file=sys.stderr)
+                _voice_text(engine, spoken, wav)
+            if problem := audio_problem(wav, spoken):
+                raise CliError(f"the voice made no usable audio: {problem}")
+            if output is not None:
+                shutil.copyfile(wav, output)
+                print(f"Saved {output}")
+            else:
+                play(wav)
+        except (EngineError, OSError, wave.Error, RuntimeError) as error:
+            raise CliError(str(error)) from error
+    return 0
+
+
+def _voice_text(engine: VoiceEngine, text: str, output: Path) -> None:
+    """Voice ``text`` into ``output``, in pieces if it is longer than the engine takes."""
+    pieces = [c.text for c in chunk_paragraphs(0, [text], engine.max_chars) if c.speakable]
+    if len(pieces) == 1:
+        engine.synthesize(pieces[0], output)
+        return
+    with tempfile.TemporaryDirectory(dir=output.parent, prefix=".pieces-") as folder:
+        parts = []
+        for index, piece in enumerate(pieces):
+            part = Path(folder) / f"{index}.wav"
+            engine.synthesize(piece, part)
+            parts.append(part)
+        concatenate_wavs(parts, output, gap_seconds=0.2)
+
+
+def _cleanup_options(args: argparse.Namespace) -> CleanupOptions:
+    return CleanupOptions(
+        page_numbers=not args.keep_page_numbers,
+        footnotes="end" if args.footnotes == "end" else "drop",
+        skip=frozenset() if args.keep_front_matter else frozenset(Matter),
+    )
+
+
+def _cleanup_notes(removed: Sequence[Removal], chapters: Sequence[Chapter]) -> list[str]:
+    """What cleanup left out, in a few lines: sections skipped, then counts per rule."""
+    sections = [r for r in removed if r.rule in set(Matter)]
+    counts: dict[str, int] = {}
+    for removal in removed:
+        if removal.rule not in set(Matter):
+            counts[removal.rule] = counts.get(removal.rule, 0) + 1
+    lines = []
+    if sections:
+        names = ", ".join(f"“{_display_name(r, chapters)}”" for r in sections)
+        lines.append(f"Skipping {_plural(len(sections), 'section')}: {names}.")
+    if counts:
+        parts = ", ".join(f"{RULES[rule]} ({count:,})" for rule, count in counts.items())
+        lines.append(f"Left out: {parts}.")
+    return lines
+
+
+def _display_name(removal: Removal, chapters: Sequence[Chapter]) -> str:
+    if removal.chapter is not None and chapters[removal.chapter].title:
+        return chapters[removal.chapter].title
+    return removal.text
+
+
 def _interrupt(signum: int, frame: object) -> None:
     raise KeyboardInterrupt
-
-
-def _work_folder(root: Path, book: Path, voice: str, speed: float) -> Path:
-    """The folder for this book's chunk audio: the same book and settings resume in it."""
-    cache = root / "cache"
-    cache.mkdir(parents=True, exist_ok=True)
-    cutoff = time.time() - STALE_WORK_DAYS * 86400
-    for old in cache.glob("convert-*"):
-        if old.is_dir() and old.stat().st_mtime < cutoff:
-            shutil.rmtree(old, ignore_errors=True)
-    digest = hashlib.sha256()
-    with book.open("rb") as f:
-        while block := f.read(1024 * 1024):
-            digest.update(block)
-    # Anything that changes how the audio sounds goes in the key, so a resumed book never
-    # mixes two voices, speeds or model versions.
-    settings = [voice, str(speed), f"seed={DEFAULT_SEED}", f"audiocpp-{AUDIOCPP_VERSION}"]
-    settings += [asset.sha256 for asset in REQUIRED_ASSETS]
-    digest.update("|".join(settings).encode())
-    folder = cache / f"convert-{digest.hexdigest()[:16]}"
-    folder.mkdir(exist_ok=True)
-    folder.touch()  # counts as recently used
-    return folder
-
-
-@contextlib.contextmanager
-def _exclusive(workdir: Path) -> Iterator[None]:
-    """Hold a lock on ``workdir`` so two runs can't convert the same book at once."""
-    with (workdir / ".lock").open("w") as handle:
-        try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise CliError(
-                "this book is already being converted with the same settings (in another terminal?)"
-            ) from None
-        yield
 
 
 def _saved_note(workdir: Path) -> str:
@@ -283,6 +649,8 @@ class _ProgressPrinter:
         self._shown = False
 
     def update(self, progress: ConversionProgress) -> None:
+        if progress.chunks_done == 0 or progress.stage == "packaging":
+            return
         percent = 100 * progress.chunks_done // max(1, progress.chunks_total)
         elapsed = time.monotonic() - self._started
         remaining = elapsed / progress.chunks_done * (progress.chunks_total - progress.chunks_done)

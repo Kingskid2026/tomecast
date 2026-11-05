@@ -136,7 +136,9 @@ jobs:
   smoke:
     # Start each build on old and new systems, and list the devices it can use. The Vulkan
     # build gets Mesa's software Vulkan driver (lavapipe), so it has a Vulkan device to find
-    # through each system's own libvulkan.so.1. Real voicing is tested by integration.yml.
+    # through each system's own libvulkan.so.1. ggml skips CPU-type Vulkan devices like
+    # lavapipe unless they're named in GGML_VK_VISIBLE_DEVICES, so the test names device 0.
+    # Real voicing is tested by integration.yml.
     name: Smoke test (${{ matrix.variant }}, ${{ matrix.image }})
     needs: build
     runs-on: ubuntu-24.04
@@ -147,15 +149,17 @@ jobs:
       matrix:
         variant: [cpu, vulkan]
         image: [almalinux:8, debian:11, ubuntu:22.04, archlinux:latest]
+        exclude:
+          # Debian 11's package archive has moved, so its Vulkan packages can't be installed.
+          # The CPU build still runs there, which covers glibc 2.31.
+          - variant: vulkan
+            image: debian:11
         include:
           # How to install each system's Vulkan loader and Mesa's software driver, and
           # whether that driver includes lavapipe (Mesa 21.1+), so a Vulkan device must show.
           - image: almalinux:8
             vulkan: dnf install -y -q vulkan-loader mesa-vulkan-drivers
             expect_device: true
-          - image: debian:11
-            vulkan: apt-get update -qq && apt-get install -y -qq libvulkan1 mesa-vulkan-drivers >/dev/null
-            expect_device: false
           - image: ubuntu:22.04
             vulkan: apt-get update -qq && apt-get install -y -qq libvulkan1 mesa-vulkan-drivers >/dev/null
             expect_device: true
@@ -189,7 +193,8 @@ jobs:
             if /engine/audiocpp_server --version; then exit 1; fi
             eval "$VULKAN_PREP"
             /engine/audiocpp_server --version
-            /engine/audiocpp_server --backend vulkan --list-devices --json | tee /tmp/devices.json
+            GGML_VK_VISIBLE_DEVICES=0 /engine/audiocpp_server --backend vulkan --list-devices --json \
+              | tee /tmp/devices.json
             if [ "$EXPECT_DEVICE" = true ]; then
               grep -q "\"backend\":\"vulkan\"" /tmp/devices.json
             fi

@@ -4,11 +4,12 @@ name: Integration
 # this checkout with install.sh, turns a tiny public-domain EPUB into an M4B with the real
 # voice engine and Kokoro model, and checks the audiobook: it plays, and has one spoken
 # chapter per section. The engine and model are downloaded once per change of their pinned
-# SHA-256s and cached, so the distro jobs don't each fetch about 270 MB.
+# SHA-256s and cached, so the distro jobs don't each fetch about 230 MB. It also runs every
+# week, because fedora and archlinux images move on without a change here.
 
 on:
   pull_request:
-    paths:
+    paths: &paths
       - src/tomecast/engines/**
       - src/tomecast/downloads.py
       - src/tomecast/convert.py
@@ -18,6 +19,11 @@ on:
       - .github/workflows/integration.yml
       - .github/scripts/make_test_book.py
       - .github/scripts/check_audiobook.py
+  push:
+    branches: [main]
+    paths: *paths
+  schedule:
+    - cron: "17 6 * * 1" # Mondays, 06:17 UTC
   workflow_dispatch:
 
 permissions:
@@ -42,7 +48,7 @@ jobs:
       - name: Name the cache after the pinned files
         id: key
         run: |
-          key=$(uv run python -c 'from tomecast.engines.audiocpp import REQUIRED_ASSETS as A; print("-".join(a.sha256[:12] for a in A))')
+          key=$(uv run python -c 'from tomecast.engines.audiocpp import required_assets as r; print("-".join(a.sha256[:12] for a in r(use_gpu=False)))')
           echo "key=tomecast-engine-$key" >> "$GITHUB_OUTPUT"
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: cache
@@ -56,8 +62,8 @@ jobs:
         run: |
           uv run python -c '
           from tomecast.downloads import data_dir, ensure
-          from tomecast.engines.audiocpp import REQUIRED_ASSETS
-          for asset in REQUIRED_ASSETS:
+          from tomecast.engines.audiocpp import required_assets
+          for asset in required_assets(use_gpu=False):
               print(asset.name, "->", ensure(asset, data_dir()))
           '
 
