@@ -1,4 +1,5 @@
-"""Package voiced chapters into one M4B audiobook with chapter markers, tags and a cover.
+"""Package voiced chapters into one M4B audiobook with chapter markers, tags and a cover, or
+into a folder of MP3 files, one per chapter (:func:`write_mp3s`, at the end of the M4B notes).
 
 This is the packager from docs/architecture.md ("7. Packager"). Its input is the WAV files the
 voice engine made, in reading order, plus how much silence goes after each one. Its output is
@@ -26,9 +27,11 @@ encode is gapless, and the MP4 edit list trims its one priming delay at the star
 from __future__ import annotations
 
 import contextlib
+import errno
 import math
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import uuid
@@ -45,6 +48,12 @@ from tomecast.book import Cover
 _SAMPLE_WIDTH = 2  # bytes per sample: 16-bit PCM
 _BLOCK_FRAMES = 32_768  # frames copied per step: 64 KiB of mono 16-bit audio
 _STDERR_TAIL_LINES = 20
+# MP3 speech: 64 kbps constant bit rate, mono, at the voice's own sample rate (24 kHz).
+# CBR rather than VBR because it is predictable (about 28.8 MB per hour, the same as the
+# M4B), every player and car stereo seeks and shows the time correctly with it, and speech
+# gains little from VBR. MPEG-2 Layer III at 24 kHz supports 64 kbps mono.
+_MP3_BITRATE = "64k"
+_MP3_TITLE_BYTES = 100  # the chapter-title part of an MP3 file name, in UTF-8 bytes
 _COVER_SUFFIXES = {"image/jpeg": ".jpg", "image/png": ".png"}
 # Characters the FFmetadata format needs escaped with a backslash.
 _FFMETADATA_SPECIAL = re.compile(r"[=;#\\\n]")
@@ -204,6 +213,196 @@ def write_m4b(
             for c in planned
         ],
     )
+
+
+def write_mp3s(
+    chapters: Sequence[ChapterAudio],
+    info: AudiobookInfo,
+    folder: Path,
+    *,
+    workdir: Path,
+    tempo: float = 1.0,
+    overwrite: bool = True,
+    ffmpeg: str | None = None,
+) -> PackagedBook:
+    """Encode ``chapters`` as one MP3 file each, in a folder at ``folder``.
+
+    Files are named ``NN - Chapter title.mp3`` (NN zero-padded to the number of chapters,
+    and the title made safe for a file name), so any player sorts them in reading order.
+    Each is mono MP3 at 64 kbps (about 28.8 MB per hour) at the voice's sample rate, with
+    ID3v2.3 tags: title (the chapter), album (the book), artist and album artist (the
+    authors), track ``n/total``, composer (the narrator), genre "Audiobook", and the cover,
+    if there is one, as the front cover picture.
+
+    The audio of each chapter is exactly what the M4B has for it (same segments, gaps,
+    titles and ``tempo``). The returned chapters carry cumulative start and end times, so
+    ``end - start`` is each file's length, and ``output`` is the folder.
+
+    The files are first written to a hidden temporary folder next to ``folder``, so a
+    failed run leaves nothing behind. With ``overwrite=False`` an existing ``folder`` is
+    never touched: the finished folder is moved into place under the first free name
+    ("Title (2)", "Title (3)"...), claimed atomically, and the returned ``output`` is the
+    name used. With ``overwrite=True`` an existing folder keeps any files that aren't
+    numbered MP3s, and its old numbered MP3s are replaced.
+
+    Raises:
+        PackagingError: for the same reasons as :func:`write_m4b`, or if ``folder`` exists
+            and isn't a folder.
+    """
+    if not 0.5 <= tempo <= 2.0:
+        raise PackagingError(f"tempo must be between 0.5 and 2.0, not {tempo!r}")
+    sample_rate, planned = _plan(chapters)
+    cover_suffix = _cover_suffix(info.cover)
+    if not folder.parent.is_dir():
+        raise PackagingError(f"output folder does not exist: {folder.parent}")
+    if overwrite and (folder.exists() or folder.is_symlink()) and not folder.is_dir():
+        raise PackagingError(f"{folder} exists and isn't a folder")
+    executable = ffmpeg or _bundled_ffmpeg()
+
+    workdir.mkdir(parents=True, exist_ok=True)
+    partial = folder.with_name(f".{folder.name}.{uuid.uuid4().hex[:8]}.partial")
+    names = [mp3_file_name(n, len(planned), c.title) for n, c in enumerate(planned, start=1)]
+    try:
+        partial.mkdir()
+        with tempfile.TemporaryDirectory(prefix="tomecast-mp3-", dir=workdir) as scratch:
+            scratch_dir = Path(scratch)
+            cover: Path | None = None
+            if info.cover is not None:
+                cover = scratch_dir / f"cover{cover_suffix}"
+                cover.write_bytes(info.cover.data)
+            for number, (chapter, name) in enumerate(zip(planned, names, strict=True), start=1):
+                command = _mp3_command(
+                    executable,
+                    sample_rate=sample_rate,
+                    tags=_id3_tags(info, chapter.title, number, len(planned)),
+                    cover=cover,
+                    tempo=tempo,
+                    output=partial / name,
+                )
+                _encode(command, [chapter], log_path=scratch_dir / f"ffmpeg-{number}.log")
+        if overwrite:
+            _replace_folder(partial, folder)
+        else:
+            folder = _publish_folder_without_overwriting(partial, folder)
+    finally:
+        shutil.rmtree(partial, ignore_errors=True)  # only still there if something failed
+
+    return PackagedBook(
+        folder,
+        [
+            PackagedChapter(
+                c.title, c.start_frame / sample_rate / tempo, c.end_frame / sample_rate / tempo
+            )
+            for c in planned
+        ],
+    )
+
+
+def mp3_file_name(number: int, count: int, title: str) -> str:
+    """``NN - Title.mp3``, with NN zero-padded to the width of ``count``. Slashes, control
+    characters and a leading dot in the title are replaced, and a long title is trimmed."""
+    text = re.sub(r"[\x00-\x1f\x7f]", " ", title).replace("/", "-")
+    text = " ".join(text.split()).lstrip(".").strip()
+    encoded = text.encode()
+    if len(encoded) > _MP3_TITLE_BYTES:
+        text = encoded[:_MP3_TITLE_BYTES].decode(errors="ignore")
+    text = text.rstrip(" .")
+    width = len(str(count))
+    return f"{number:0{width}d} - {text}.mp3" if text else f"{number:0{width}d}.mp3"
+
+
+def _id3_tags(info: AudiobookInfo, title: str, number: int, count: int) -> dict[str, str]:
+    authors = ", ".join(info.authors)
+    tags = {
+        "title": title,
+        "album": info.title,
+        "artist": authors,
+        "album_artist": authors,
+        "composer": info.narrator,
+        "genre": "Audiobook",
+        "track": f"{number}/{count}",
+        "language": info.language or "",
+    }
+    return {key: value for key, value in tags.items() if value}
+
+
+def _mp3_command(
+    executable: str,
+    *,
+    sample_rate: int,
+    tags: dict[str, str],
+    cover: Path | None,
+    output: Path,
+    tempo: float = 1.0,
+) -> list[str]:
+    """The ffmpeg command that encodes one chapter's PCM from stdin into an MP3 file."""
+    command = [
+        executable,
+        "-hide_banner",
+        "-nostats",
+        "-loglevel", "warning",
+        "-y",
+        "-f", "s16le", "-ar", str(sample_rate), "-ch_layout", "mono", "-i", "pipe:0",
+    ]  # fmt: skip
+    if cover is not None:
+        command += ["-i", _ffmpeg_path(cover)]
+    command += ["-map", "0:a", "-map_metadata", "-1"]
+    if cover is not None:
+        command += [
+            "-map", "1:v", "-c:v", "copy", "-disposition:v", "attached_pic",
+            "-metadata:s:v", "title=Cover", "-metadata:s:v", "comment=Cover (front)",
+        ]  # fmt: skip
+    for key, value in tags.items():
+        command += ["-metadata", f"{key}={value}"]
+    if tempo != 1.0:
+        assert 0.5 <= tempo <= 2.0
+        command += ["-af", f"atempo={tempo:.6f}"]
+    command += [
+        "-c:a", "libmp3lame", "-b:a", _MP3_BITRATE, "-ac", "1", "-ar", str(sample_rate),
+        "-id3v2_version", "3",  # ID3v2.3: the version every player and car stereo reads
+        "-f", "mp3",
+        _ffmpeg_path(output),
+    ]  # fmt: skip
+    return command
+
+
+def _replace_folder(partial: Path, target: Path) -> None:
+    """Move the finished files in ``partial`` into ``target``, replacing its numbered MP3s
+    (and nothing else), then remove ``partial``."""
+    target.mkdir(exist_ok=True)
+    for old in target.iterdir():
+        if re.fullmatch(r"\d+(?: - .*)?\.mp3", old.name) and old.is_file():
+            old.unlink()
+    for new in sorted(partial.iterdir()):
+        new.replace(target / new.name)
+    shutil.rmtree(partial, ignore_errors=True)
+
+
+def _publish_folder_without_overwriting(partial: Path, target: Path) -> Path:
+    """Give the folder ``partial`` its final name: ``target``, or the first free
+    "<name> (N)". The name is claimed with ``mkdir``, which fails if it exists (a symlink
+    too), and the folder is then renamed over that empty claim; if somebody put something
+    in the claimed folder meanwhile, the rename fails and the next name is tried."""
+    number = 1
+    candidate = target
+    while True:
+        try:
+            candidate.mkdir()
+        except FileExistsError:
+            number += 1
+            candidate = target.with_name(f"{target.name} ({number})")
+            continue
+        try:
+            partial.rename(candidate)
+        except OSError as error:
+            if error.errno not in {errno.ENOTEMPTY, errno.EEXIST}:
+                with contextlib.suppress(OSError):
+                    candidate.rmdir()
+                raise
+            number += 1
+            candidate = target.with_name(f"{target.name} ({number})")
+            continue
+        return candidate
 
 
 def _publish_without_overwriting(partial: Path, target: Path) -> Path:

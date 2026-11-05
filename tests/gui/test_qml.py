@@ -621,7 +621,8 @@ def test_backend_property_list_matches_the_contract(backend: DemoBackend) -> Non
         "gpuAvailable", "useGpu", "gpuName",
         "bookLoaded", "loading", "bookTitle", "bookAuthors", "coverSource", "artSource",
         "formatsLabel", "chapters", "skipFrontMatter", "selectionSummary",
-        "voiceGroups", "voice", "voiceLabel", "speed", "previewText", "previewPlaying",
+        "voiceGroups", "voice", "voiceLabel", "speed", "outputFormat", "previewText",
+        "previewPlaying",
         "previewAvailable", "downloadNote", "stage", "downloadLabel", "chunksDone", "chunksTotal",
         "chapterLabel", "timeLeft", "progressLabel", "speedLabel", "nowSpeaking", "paused",
         "outputPath", "audioLength", "doneSummary", "warnings",
@@ -634,7 +635,8 @@ def test_backend_property_list_matches_the_contract(backend: DemoBackend) -> Non
         assert meta.property(meta.indexOfProperty(name)).hasNotifySignal(), name
     slots = {
         "setThemeSetting", "goTo", "chooseBookFolder", "dismissError", "openBook",
-        "setChapterSelected", "setSkipFrontMatter", "setVoice", "setSpeed", "setUseGpu",
+        "setChapterSelected", "setSkipFrontMatter", "setVoice", "setSpeed", "setOutputFormat",
+        "setUseGpu",
         "togglePreview",
         "startConversion", "pauseConversion", "resumeConversion", "cancelConversion",
         "openOutputFolder", "convertAnother",
@@ -762,6 +764,34 @@ def test_start_is_disabled_while_a_book_is_being_read(
     app_window.backend.set_loading(False)
     app_window.settle()
     assert start.property("enabled") is True
+    assert_clean(messages)
+
+
+@pytest.mark.parametrize("width", [1200, 520])
+def test_output_format_choice(app_window: Window, messages: Messages, width: int) -> None:
+    app_window.window.resize(width, 780)
+    app_window.show("voice")
+    m4b, mp3 = app_window.get("format_m4b"), app_window.get("format_mp3")
+    assert (m4b.property("text"), mp3.property("text")) == (
+        "AUDIOBOOK · M4B",
+        "MP3 · ONE PER CHAPTER",
+    )
+    assert (m4b.property("chosen"), mp3.property("chosen")) == (True, False)
+    # Next to Start converting, and wholly inside the window.
+    start = app_window.get("startConvertingButton")
+    choice = app_window.get("outputFormatChoice")
+    assert choice.mapToScene(QPointF(0, 0)).y() < start.mapToScene(QPointF(0, 0)).y()
+    for pill in (m4b, mp3):
+        left = pill.mapToScene(QPointF(0, 0)).x()
+        assert left >= 0 and left + pill.width() <= width
+        assert pill.height() == 44
+
+    app_window.click("format_mp3")
+    assert ("setOutputFormat", ("mp3",)) in app_window.backend.calls
+    assert (m4b.property("chosen"), mp3.property("chosen")) == (False, True)
+    app_window.click("format_m4b")
+    assert app_window.backend.property("outputFormat") == "m4b"
+    assert m4b.property("chosen") is True
     assert_clean(messages)
 
 

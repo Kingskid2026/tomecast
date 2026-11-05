@@ -63,6 +63,7 @@ from tomecast.readers import FORMATS, SUFFIXES
 
 SCREENS = ("drop", "chapters", "voice", "converting", "done")
 THEME_SETTINGS = ("system", "dark", "light")
+OUTPUT_FORMATS = ("m4b", "mp3")
 MIN_SPEED, MAX_SPEED, SPEED_STEP = 0.5, 3.0, 0.25  # 11 meter dots; 1.00x is the third
 PLAYERS = ("pw-play", "paplay", "aplay")  # the first one found plays previews
 
@@ -139,14 +140,16 @@ def safe_file_name(title: str) -> str:
     return text.rstrip(" .")
 
 
-def unique_output(folder: Path, title: str) -> Path:
-    """``<folder>/<title>.m4b``, with " (2)", " (3)"… added so nothing is ever overwritten."""
+def unique_output(folder: Path, title: str, output_format: str = "m4b") -> Path:
+    """``<folder>/<title>.m4b`` (or the folder ``<folder>/<title>`` for ``"mp3"``), with
+    " (2)", " (3)"… added so nothing is ever overwritten."""
     name = safe_file_name(title) or "Audiobook"
-    candidate = folder / f"{name}.m4b"
+    suffix = ".m4b" if output_format == "m4b" else ""
+    candidate = folder / f"{name}{suffix}"
     for number in itertools.count(2):
         if not (candidate.exists() or candidate.is_symlink()):
             return candidate
-        candidate = folder / f"{name} ({number}).m4b"
+        candidate = folder / f"{name} ({number}){suffix}"
     raise AssertionError("unreachable")  # pragma: no cover
 
 
@@ -252,6 +255,7 @@ class Backend(QObject):
     pausedChanged = Signal()
 
     outputPathChanged = Signal()
+    outputFormatChanged = Signal()
     audioLengthChanged = Signal()
     doneSummaryChanged = Signal()
     warningsChanged = Signal()
@@ -328,6 +332,9 @@ class Backend(QObject):
         saved_voice = str(self._settings.value("voice", DEFAULT_VOICE))
         self._voice = saved_voice if saved_voice in self._voice_ids() else DEFAULT_VOICE
         self._speed = self._valid_speed(self._settings.value("speed", 1.0))
+        saved_format = str(self._settings.value("outputFormat", "m4b"))
+        self._outputFormat = saved_format if saved_format in OUTPUT_FORMATS else "m4b"
+        self._convert_format = self._outputFormat  # the format of the run in progress
         self._previewText = ""
         self._previewPlaying = False
         self._downloadNote = ""
@@ -433,6 +440,7 @@ class Backend(QObject):
 
     voiceLabel = _property(str, _get_voice_label, voiceLabelChanged)
     speed: float = _field(float, "speed", speedChanged)
+    outputFormat: str = _field(str, "outputFormat", outputFormatChanged)
     # The meter's range, so QML never hard-codes it. Constants: no notify signal.
     minSpeed = cast(float, Property(float, lambda self: MIN_SPEED, constant=True))
     maxSpeed = cast(float, Property(float, lambda self: MAX_SPEED, constant=True))
@@ -586,6 +594,15 @@ class Backend(QObject):
         self._settings.setValue("speed", speed)
         self._settings.sync()
 
+    @Slot(str)
+    def setOutputFormat(self, name: str) -> None:
+        """``"m4b"`` (one audiobook file) or ``"mp3"`` (a folder, one file per chapter)."""
+        if name not in OUTPUT_FORMATS or name == self._outputFormat:
+            return
+        self._update("outputFormat", name)
+        self._settings.setValue("outputFormat", name)
+        self._settings.sync()
+
     @Slot()
     def togglePreview(self) -> None:
         """Voice ``previewText`` with the chosen voice and speed and play it; again to stop."""
@@ -609,7 +626,8 @@ class Backend(QObject):
 
     @Slot()
     def startConversion(self) -> None:
-        """Write ``<book folder>/<book title>.m4b`` (never overwriting) on the worker."""
+        """Write ``<book folder>/<book title>.m4b`` (or, for MP3, the folder ``<book title>``),
+        never overwriting, on the worker."""
         if (
             self._screen == "converting"
             or self._loading  # a book is being read: the result would replace this one
@@ -634,7 +652,9 @@ class Backend(QObject):
         # The whole book plus the ticked indices, so chunk IDs (and the resume folder) are the
         # same whichever sections are ticked, and match a run from the command line.
         book = self._book
-        output = unique_output(folder, self._book.title or self._book_path.stem)
+        output_format: Literal["m4b", "mp3"] = "mp3" if self._outputFormat == "mp3" else "m4b"
+        output = unique_output(folder, self._book.title or self._book_path.stem, output_format)
+        self._convert_format = output_format
         self._chapter_labels = [sections[r].label for r in rows]
         self._control = TimedControl()
         self._convert_job = next(self._jobs)
@@ -645,7 +665,7 @@ class Backend(QObject):
         self._jobRequested.emit(
             ConvertJob(
                 self._convert_job, book, tuple(rows), self._book_path, output, self._voice,
-                self._speed, self._control, self._using_gpu,
+                self._speed, self._control, self._using_gpu, output_format,
             )
         )  # fmt: skip
 
@@ -683,7 +703,10 @@ class Backend(QObject):
     @Slot()
     def openOutputFolder(self) -> None:
         if self._outputPath:
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(self._outputPath).parent)))
+            output = Path(self._outputPath)
+            # An MP3 run's output is the folder holding the files: open that one.
+            folder = output if output.is_dir() else output.parent
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
 
     @Slot()
     def convertAnother(self) -> None:
@@ -798,7 +821,8 @@ class Backend(QObject):
         self._end_conversion()
         if result.speedup is not None:
             self._measured(result.speedup)
-        chapters = f"{result.chapters} CHAPTER{'' if result.chapters == 1 else 'S'}"
+        noun = "MP3 FILE" if self._convert_format == "mp3" else "CHAPTER"
+        chapters = f"{result.chapters} {noun}{'' if result.chapters == 1 else 'S'}"
         self._update("outputPath", str(result.output))  # the name actually used
         self._update("audioLength", _length(result.audio_seconds))
         self._update(

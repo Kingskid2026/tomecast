@@ -97,6 +97,7 @@ Front matter is guessed until the real cleanup lands (issue #4): sections before
 | `voiceGroups` | list | `[{label: "AMERICAN · FEMALE", voices: [{id: "af_heart", name: "Heart"}, …]}, …]` for American and British English |
 | `voice` | string | the chosen voice id (saved between runs) |
 | `voiceLabel` | string | `"HEART · AMERICAN · FEMALE"` |
+| `outputFormat` | string | `"m4b"` (one audiobook file, the default) or `"mp3"` (a folder with one MP3 per chapter), saved between runs (`QSettings` key `outputFormat`; anything else falls back to `"m4b"`). `VoiceScreen.qml` shows it as two `ChoicePill`s (the pills the voice list uses), "AUDIOBOOK · M4B" (`format_m4b`) and "MP3 · ONE PER CHAPTER" (`format_mp3`), in a `Flow` (`outputFormatChoice`) above the Start converting button |
 | `speed` | real | 0.5–3.0 in steps of 0.25 on the meter, 11 dots with 1.00× the third (saved between runs; an older saved value such as 1.05 snaps to the nearest step) |
 | `minSpeed`, `maxSpeed`, `speedStep` | real | the meter's range (`MIN_SPEED`, `MAX_SPEED`, `SPEED_STEP` in `backend.py`). Constants, so no notify signal. `VoiceScreen.qml` reads its end labels ("0.5×", "3×") and dot values from them instead of hard-coding the range |
 | `previewText` | string | the first sentence of the first selected chapter |
@@ -107,8 +108,9 @@ Front matter is guessed until the real cleanup lands (issue #4): sections before
 | Slot | Does |
 |---|---|
 | `setVoice(id)`, `setSpeed(value)` | |
+| `setOutputFormat(name)` | `"m4b"` or `"mp3"`; anything else is ignored. Saved |
 | `togglePreview()` | voice `previewText` with the chosen voice and speed, then play it; again to stop. Above 1.5× the preview is also time-stretched, so it sounds like the book will (see the architecture notes on speed) |
-| `startConversion()` | write `<book folder>/<book title>.m4b` and go to `"converting"`. It does nothing while `loading` is true (Start is disabled then), because the book being read would replace this one. The job carries the **whole book** plus `chapters`, the indices of the ticked rows (see "Ticked sections and resuming" below). |
+| `startConversion()` | write `<book folder>/<book title>.m4b` (with `outputFormat == "mp3"`: the folder `<book folder>/<book title>/`) and go to `"converting"`. It does nothing while `loading` is true (Start is disabled then), because the book being read would replace this one. The job carries the **whole book** plus `chapters`, the indices of the ticked rows (see "Ticked sections and resuming" below). |
 
 ### Converting
 
@@ -148,20 +150,20 @@ A book that finishes reading while a conversion runs (a drop that started before
 
 ### Where the book is written
 
-The window passes `overwrite=False`. `startConversion` picks `<title>.m4b` (or `<title> (2).m4b`…) if the name is free then, and `write_m4b` checks again when it publishes: it hard-links the finished file to the wanted name (which fails if the name exists), and tries `(2)`, `(3)`… if somebody saved a file there meanwhile. The file that was written is `ConversionResult.output`, which becomes `ConvertResult.output` and so `outputPath`. The command line keeps `overwrite=True`: `--force` decides there.
+The window passes `overwrite=False` and `format=outputFormat`. For MP3, `startConversion` picks the folder `<title>` (or `<title> (2)`…) and `write_mp3s` claims the name with `mkdir` when it publishes, trying `(2)`, `(3)`… if somebody made it meanwhile; the folder is `ConversionResult.output`, and `ConvertResult.size_bytes` is the size of all its files. For M4B, `startConversion` picks `<title>.m4b` (or `<title> (2).m4b`…) if the name is free then, and `write_m4b` checks again when it publishes: it hard-links the finished file to the wanted name (which fails if the name exists), and tries `(2)`, `(3)`… if somebody saved a file there meanwhile. The file that was written is `ConversionResult.output`, which becomes `ConvertResult.output` and so `outputPath`. The command line keeps `overwrite=True`: `--force` decides there.
 
 ### Done
 
 | Property | Type | Meaning |
 |---|---|---|
-| `outputPath` | string | the file that was written, taken from `ConversionResult.output` (it may be `<title> (2).m4b` if the name was taken while converting) |
+| `outputPath` | string | the file that was written (for MP3, the folder), taken from `ConversionResult.output` (it may be `<title> (2).m4b` if the name was taken while converting) |
 | `audioLength` | string | `"2:47:00"` |
-| `doneSummary` | string | `"OF AUDIO · 12 CHAPTERS · 79 MB · MADE IN 36 MIN"` |
+| `doneSummary` | string | `"OF AUDIO · 12 CHAPTERS · 79 MB · MADE IN 36 MIN"`; for MP3, `"OF AUDIO · 12 MP3 FILES · …"` |
 | `warnings` | list of string | e.g. a damaged cover was left out |
 
 | Slot | Does |
 |---|---|
-| `openOutputFolder()` | open the folder in the file manager |
+| `openOutputFolder()` | open the folder in the file manager (for an MP3 run, the folder of MP3 files itself; for an M4B, the folder holding the file) |
 | `convertAnother()` | back to `"drop"`, keeping voice and speed |
 
 ### The graphics card

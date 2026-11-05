@@ -29,6 +29,7 @@ from tomecast.packaging import (
     PackagedChapter,
     cover_is_usable,
     write_m4b,
+    write_mp3s,
 )
 
 # Seconds of silence after each kind of chunk.
@@ -169,7 +170,7 @@ class ConversionResult:
     chapters: list[PackagedChapter]
     reused_chunks: int
     warnings: tuple[str, ...]
-    output: Path  # where the audiobook was written (not ``output`` if that name was taken)
+    output: Path  # the audiobook file, or the MP3 folder (not ``output`` if that name was taken)
 
 
 def select_chapters(book: Book, chapters: Sequence[int] | None) -> list[int]:
@@ -208,6 +209,7 @@ def convert_book(
     retries: int = 1,
     chapters: Sequence[int] | None = None,
     overwrite: bool = True,
+    format: Literal["m4b", "mp3"] = "m4b",
 ) -> ConversionResult:
     """Voice ``book`` with ``engine`` and write an M4B audiobook to ``output``.
 
@@ -223,6 +225,9 @@ def convert_book(
     ``overwrite=False`` never replaces an existing file: if ``output`` is taken, even by a
     file that appeared while voicing, the book is written to "name (2).m4b" and so on. The
     path used is in the result.
+
+    ``format="mp3"`` writes a folder of MP3 files, one per chapter, at ``output`` (which is
+    then the folder's name) instead of an M4B file. Everything else is the same.
     """
     warnings: list[str] = []
     cover = book.cover
@@ -295,7 +300,8 @@ def convert_book(
         cover=cover,
     )
     tempo = getattr(engine, "tempo", 1.0)
-    packaged = write_m4b(audio, info, output, workdir=workdir, overwrite=overwrite, tempo=tempo)
+    write = write_mp3s if format == "mp3" else write_m4b
+    packaged = write(audio, info, output, workdir=workdir, overwrite=overwrite, tempo=tempo)
     return ConversionResult(packaged.chapters, reused, tuple(warnings), packaged.output)
 
 

@@ -568,3 +568,40 @@ def test_a_chapter_that_isnt_in_the_book_is_refused(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="no such chapter index 9"):
         convert_book(_four_chapters(), FakeEngine(), tmp_path / "b.m4b", workdir=tmp_path / "w",
                      chapters=[1, 9])  # fmt: skip
+
+
+# --- MP3 output -----------------------------------------------------------------------------
+
+
+def test_mp3_format_writes_a_folder_with_every_sentence(tmp_path: Path) -> None:
+    book = _book()
+    engine = FakeEngine()
+    target = tmp_path / "A Test Book"
+
+    result = convert_book(book, engine, target, workdir=tmp_path / "work", format="mp3")
+
+    assert result.output == target
+    assert sorted(p.name for p in target.iterdir()) == [
+        "1 - Chapter One.mp3",
+        "2 - Chapter Two.mp3",
+    ]
+    assert [c.title for c in result.chapters] == ["Chapter One", "Chapter Two"]
+    spoken = "".join("".join(t.split()) for t in engine.texts)
+    source = "".join(
+        "".join(p.split()) for chapter in book.chapters for p in chapter.spoken_paragraphs()
+    )
+    assert spoken == source
+
+
+def test_mp3_format_never_overwrites_a_folder_that_appears_meanwhile(tmp_path: Path) -> None:
+    target = tmp_path / "Book"
+
+    def folder_appears(p: ConversionProgress) -> None:
+        if p.stage == "packaging":
+            target.mkdir()
+
+    result = convert_book(_book(), FakeEngine(), target, workdir=tmp_path / "w",
+                          progress=folder_appears, overwrite=False, format="mp3")  # fmt: skip
+
+    assert result.output == tmp_path / "Book (2)"
+    assert list(target.iterdir()) == []
