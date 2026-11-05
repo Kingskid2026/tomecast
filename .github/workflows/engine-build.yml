@@ -179,12 +179,16 @@ jobs:
           docker run --rm -e VARIANT -e VULKAN_PREP -e EXPECT_DEVICE \
             -v "$PWD/engine:/engine:ro" "$IMAGE" sh -euc '
             ldd --version | head -n1
-            /engine/audiocpp_server --version
             if [ "$VARIANT" = cpu ]; then
+              /engine/audiocpp_server --version
               /engine/audiocpp_server --list-devices --json
               exit 0
             fi
+            # Without a Vulkan loader the Vulkan build must not start (Tomecast then uses
+            # the CPU build); with the system one installed, it must.
+            if /engine/audiocpp_server --version; then exit 1; fi
             eval "$VULKAN_PREP"
+            /engine/audiocpp_server --version
             /engine/audiocpp_server --backend vulkan --list-devices --json | tee /tmp/devices.json
             if [ "$EXPECT_DEVICE" = true ]; then
               grep -q "\"backend\":\"vulkan\"" /tmp/devices.json
