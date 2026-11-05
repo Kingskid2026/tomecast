@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import signal
+import socket
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 
-from PySide6.QtCore import QUrl
+from PySide6.QtCore import QSocketNotifier, QUrl
 from PySide6.QtGui import QFontDatabase, QGuiApplication
 from PySide6.QtQml import (
     QQmlApplicationEngine,
@@ -52,6 +55,41 @@ def _image_provider() -> tuple[QQmlImageProviderBase | None, CoverSink | None]:
     return provider, provider.set_cover
 
 
+@contextlib.contextmanager
+def quit_on_signals(app: QGuiApplication) -> Iterator[None]:
+    """Quit cleanly on SIGTERM (logout, ``kill``) and Ctrl-C while the window is open.
+
+    Python only runs signal handlers between bytecodes, and Qt's event loop keeps it inside C++,
+    so without this the signals would be ignored until the system gave up and killed Tomecast
+    (leaving no chance to stop the voice engine tidily). Python's C-level handler writes a byte
+    to a socket that Qt watches; reading that byte runs Python again, and so the handler.
+    """
+    reader, writer = socket.socketpair()
+    reader.setblocking(False)
+    writer.setblocking(False)
+    notifier = QSocketNotifier(reader.fileno(), QSocketNotifier.Type.Read)
+
+    def drain() -> None:
+        with contextlib.suppress(OSError):
+            while reader.recv(256):
+                pass
+
+    notifier.activated.connect(drain)
+    previous_fd = signal.set_wakeup_fd(writer.fileno(), warn_on_full_buffer=False)
+    previous = {
+        sig: signal.signal(sig, lambda *_: app.quit()) for sig in (signal.SIGTERM, signal.SIGINT)
+    }
+    try:
+        yield
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+        signal.set_wakeup_fd(previous_fd)
+        notifier.setEnabled(False)
+        reader.close()
+        writer.close()
+
+
 def run(argv: Sequence[str] | None = None) -> int:
     """Open the window (optionally with a book) and return the exit code."""
     parser = argparse.ArgumentParser(prog="tomecast gui", description="Open Tomecast's window.")
@@ -83,7 +121,8 @@ def run(argv: Sequence[str] | None = None) -> int:
         return 1
     if args.book is not None:
         backend.openBook(QUrl.fromLocalFile(str(args.book.expanduser().resolve())))
-    code = app.exec()
+    with quit_on_signals(app):
+        code = app.exec()
     del engine  # the QML engine goes first, while the backend it uses still exists
     backend.shutdown()
     return code
