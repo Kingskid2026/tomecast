@@ -12,7 +12,7 @@
 | Inspiration | The maintainer's own earlier "blueprint" site (one blue accent on near-black); Gradium Phonon's dot-matrix player; the print discipline of Nous Research's work. Tomecast is *inspired by* these, not a copy: it doesn't use Phonon's lime accent or the same artworks. |
 | Themes | **Light and dark, following the desktop's setting**, with a manual switch in the app. Each is designed as its own palette, not an automatic inversion. |
 | Motion | **One living element:** the sentence-dot grid while converting. Everything else animates only on state changes. |
-| Artwork | **The book's own cover**, rendered in dots on the chapter, converting and done screens. **The drop screen**, where no book is loaded yet, shows **Luca della Robbia's *Cantoria*** (1431–38, marble children singing: a Renaissance image of voices) in the same dots,. |
+| Artwork | **The book's own cover**, rendered in dots on the chapter, converting and done screens. **The drop screen**, where no book is loaded yet, shows **Luca della Robbia's *Cantoria*** (1431–38, marble children singing: a Renaissance image of voices) in the same dots. |
 
 ## Palette
 
