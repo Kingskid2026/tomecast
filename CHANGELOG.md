@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.3](https://github.com/Kingskid2026/tomecast/compare/v0.1.2...v0.1.3) (2026-11-05)
+
+
+### Documentation
+
+* drop the code of conduct, and the 'paused' note ([#42](https://github.com/Kingskid2026/tomecast/issues/42)) ([02493a1](https://github.com/Kingskid2026/tomecast/commit/02493a17d90581b48763d44147a545f88a9ed96b))
+
 ## [0.1.2](https://github.com/Kingskid2026/tomecast/compare/v0.1.1...v0.1.2) (2026-11-05)
 
 
