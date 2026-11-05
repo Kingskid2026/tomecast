@@ -48,7 +48,7 @@ All three are open-licensed (SIL OFL) and get bundled with the app.
 - **Dot meters** for amounts, like speed as an 11-dot meter.
 - **A round play/pause** for the voice preview, with a row of dots as its waveform.
 - **Crop-mark corners** on panels instead of boxes.
-- **Images in dots (covers and art):** a square grid of round dots whose size follows brightness, at **2.4 px per dot**, keeping the image's own shape. The image is sharpened, then its tones are spread out (histogram equalization) so similar shades don't merge. Dots are capped below half a cell so they never touch. Dark theme: light dots on near-black, never inverted (inverted faces look like ghosts). Light theme: dark dots on paper. Baked once with Pillow when a book is opened, not drawn live. Fine line engravings don't survive this (their hatching is smaller than a dot), so artwork should be paintings or sculpture.
+- **Images in dots (covers and art):** a classic halftone, drawn the same way as the art on the maintainer's site: round dots on a grid turned about 29° (so they never line up into rows and columns like a pixel screen), **3.4 px apart**, with each dot's *area* following the ink (radius = half the spacing × √ink). The biggest dots just touch, so every dot stays a whole circle. Each dot shows the average tone of its whole cell, after an autocontrast so dull covers still use every dot size. The image keeps its own shape. Dark theme: light dots on near-black, never inverted (inverted faces look like ghosts). Light theme: dark dots on paper. Drawn with Qt (no Pillow) once per book and size, not live. Fine line engravings don't survive this (their hatching is smaller than a dot), so artwork should be paintings or sculpture.
 
 ## Screens
 
