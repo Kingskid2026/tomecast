@@ -109,13 +109,17 @@ ScreenPage {
         }
     }
 
-    // SPEED, the 11-dot meter from 0.75x to 1.25x, and its end labels.
+    // SPEED, the 11-dot meter over Backend.minSpeed..maxSpeed, and its end labels.
     component SpeedControl: ColumnLayout {
         id: speed
-        readonly property int index: Math.round((Backend.speed - 0.75) / 0.05)
+        readonly property int index: Math.round((Backend.speed - Backend.minSpeed) / Backend.speedStep)
+
+        function valueAt(i) {
+            return Math.round((Backend.minSpeed + i * Backend.speedStep) * 100) / 100
+        }
 
         function label(i) {
-            return (0.75 + i * 0.05).toFixed(2) + "×"
+            return valueAt(i).toFixed(2) + "×"
         }
 
         spacing: 8
@@ -149,7 +153,7 @@ ScreenPage {
             cellHeight: Theme.controlHeight
             Accessible.name: "Speaking speed " + speed.label(speed.index)
             labelAt: function(i) { return "Speed " + speed.label(i) }
-            onPicked: (i) => Backend.setSpeed(Math.round((0.75 + i * 0.05) * 100) / 100)
+            onPicked: (i) => Backend.setSpeed(speed.valueAt(i))
         }
 
         RowLayout {
@@ -157,13 +161,15 @@ ScreenPage {
 
             MonoLabel {
                 Layout.fillWidth: true
-                text: "0.75×"
+                objectName: "speedMinLabel"
+                text: Backend.minSpeed + "×"
                 size: 10
                 tracking: 0
             }
 
             MonoLabel {
-                text: "1.25×"
+                objectName: "speedMaxLabel"
+                text: Backend.maxSpeed + "×"
                 size: 10
                 tracking: 0
             }

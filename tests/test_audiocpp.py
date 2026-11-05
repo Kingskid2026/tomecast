@@ -163,8 +163,41 @@ def test_synthesize_needs_a_running_server(tmp_path: Path, fake_server: Path) ->
 def test_rejects_unknown_voices_and_bad_speeds(tmp_path: Path) -> None:
     with pytest.raises(EngineError, match="unknown voice"):
         KokoroServer(tmp_path, voice="xx_nobody")
+    for bad in (0.4, 3.1, 5.0):
+        with pytest.raises(EngineError, match="speed"):
+            KokoroServer(tmp_path, speed=bad)
+    for good in (0.5, 3.0):
+        assert KokoroServer(tmp_path, speed=good).speed == good
+
+
+@pytest.mark.parametrize(
+    ("speed", "voice_speed", "tempo"),
+    [(0.5, 0.5, 1.0), (1.0, 1.0, 1.0), (1.5, 1.5, 1.0), (2.0, 1.5, 4 / 3), (3.0, 1.5, 2.0)],
+)
+def test_speed_is_split_into_a_voice_speed_and_a_tempo(
+    tmp_path: Path, speed: float, voice_speed: float, tempo: float
+) -> None:
+    engine = KokoroServer(tmp_path, speed=speed)
+    assert engine.voice_speed == pytest.approx(voice_speed)
+    assert engine.tempo == pytest.approx(tempo)
+    assert engine.voice_speed * engine.tempo == pytest.approx(speed)
+    assert audiocpp.split_speed(speed) == (engine.voice_speed, engine.tempo)
+    engine.speed = 3.0  # the window changes the speed of a running preview engine
+    assert (engine.voice_speed, engine.tempo) == (1.5, 2.0)
     with pytest.raises(EngineError, match="speed"):
-        KokoroServer(tmp_path, speed=5.0)
+        engine.speed = 3.5
+    with pytest.raises(AttributeError):
+        engine.tempo = 1.0  # type: ignore[misc]
+
+
+def test_the_server_is_only_asked_for_the_voice_speed(tmp_path: Path, fake_server: Path) -> None:
+    with _server(tmp_path, fake_server, speed=3.0) as engine:
+        engine.synthesize("Hello there.", tmp_path / "out.wav")
+    start, request = _events(tmp_path)[:2]
+    config = start["config"]
+    assert isinstance(config, dict)
+    assert config["models"][0]["default_request_options"] == {"speed": 1.5}
+    assert request["body"]["speed"] == 1.5  # type: ignore[index]
 
 
 @pytest.mark.parametrize(

@@ -230,6 +230,7 @@ def convert_book(
         warnings.append("The book's cover image is damaged, so the audiobook has no cover.")
         cover = None
 
+    voice_speed = getattr(engine, "voice_speed", 1.0)  # test fakes may not have one
     selected = select_chapters(book, chapters)
     plan = plan_chunks(book, engine.max_chars, selected)
     total = sum(len(chunks) for chunks in plan)
@@ -263,10 +264,10 @@ def convert_book(
             if control:
                 control.checkpoint()
             wav = chunk_dir / _chunk_file_name(chunk)
-            if _is_reusable(wav, chunk):
+            if _is_reusable(wav, chunk, voice_speed):
                 reused += 1
             elif chunk.speakable:
-                _voice_chunk(engine, chunk, wav, retries)
+                _voice_chunk(engine, chunk, wav, retries, voice_speed)
             else:
                 partial = wav.with_name(wav.name + ".partial")
                 write_silence(partial, SCENE_BREAK_SECONDS, engine.sample_rate)
@@ -293,7 +294,8 @@ def convert_book(
         language=book.language,
         cover=cover,
     )
-    packaged = write_m4b(audio, info, output, workdir=workdir, overwrite=overwrite)
+    tempo = getattr(engine, "tempo", 1.0)
+    packaged = write_m4b(audio, info, output, workdir=workdir, overwrite=overwrite, tempo=tempo)
     return ConversionResult(packaged.chapters, reused, tuple(warnings), packaged.output)
 
 
@@ -303,13 +305,13 @@ def _chunk_file_name(chunk: Chunk) -> str:
     return f"{chunk.id}-{digest}.wav"
 
 
-def _is_reusable(wav: Path, chunk: Chunk) -> bool:
+def _is_reusable(wav: Path, chunk: Chunk, speed: float = 1.0) -> bool:
     """True if a previous run already made good audio for exactly this chunk."""
     if not wav.is_file():
         return False
     if not chunk.speakable:
         return True
-    return not audio_problem(wav, chunk.text)
+    return not audio_problem(wav, chunk.text, speed)
 
 
 def _gap_after(chunk: Chunk, *, is_title: bool, is_last: bool) -> float:
@@ -320,7 +322,9 @@ def _gap_after(chunk: Chunk, *, is_title: bool, is_last: bool) -> float:
     return GAP_AFTER[chunk.boundary]
 
 
-def _voice_chunk(engine: VoiceEngine, chunk: Chunk, wav: Path, retries: int) -> None:
+def _voice_chunk(
+    engine: VoiceEngine, chunk: Chunk, wav: Path, retries: int, speed: float = 1.0
+) -> None:
     """Voice ``chunk`` into ``wav``. The file only appears once its audio passed the checks."""
     partial = wav.with_name(wav.name + ".partial")
     problem = ""
@@ -331,7 +335,7 @@ def _voice_chunk(engine: VoiceEngine, chunk: Chunk, wav: Path, retries: int) -> 
         except RuntimeError as error:
             problem = str(error)
             continue
-        problem = audio_problem(partial, chunk.text)
+        problem = audio_problem(partial, chunk.text, speed)
         if not problem:
             partial.replace(wav)
             return
@@ -339,8 +343,12 @@ def _voice_chunk(engine: VoiceEngine, chunk: Chunk, wav: Path, retries: int) -> 
     raise MissingAudioError(f"no usable audio for {chunk.id} ({chunk.text[:80]!r}): {problem}")
 
 
-def audio_problem(wav: Path, text: str) -> str:
-    """Describe what's wrong with ``wav`` as audio for ``text``, or return "" if it's fine."""
+def audio_problem(wav: Path, text: str, speed: float = 1.0) -> str:
+    """Describe what's wrong with ``wav`` as audio for ``text``, or return "" if it's fine.
+
+    ``speed`` is how fast the voice was asked to speak: faster narration is allowed to be
+    proportionally shorter. Slower than 1.0 gets no extra allowance, so the check never
+    weakens below its strength at normal speed."""
     if not wav.is_file():
         return "the engine wrote no file"
     try:
@@ -351,7 +359,7 @@ def audio_problem(wav: Path, text: str) -> str:
         return "expected mono 16-bit audio"
     if info.frames == 0:
         return "the audio is empty"
-    shortest = len(text) / MAX_CHARS_PER_SECOND
+    shortest = len(text) / MAX_CHARS_PER_SECOND / max(1.0, speed)
     if info.seconds < shortest:
         return f"only {info.seconds:.2f}s of audio for {len(text)} characters (text was cut off?)"
     if peak_level(wav) < SILENCE_LEVEL:

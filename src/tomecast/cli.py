@@ -27,6 +27,8 @@ from tomecast.downloads import (
 from tomecast.engines.audiocpp import (
     DEFAULT_VOICE,
     MAX_CHARS,
+    MAX_SPEED,
+    MIN_SPEED,
     REQUIRED_ASSETS,
     VOICES,
     EngineError,
@@ -50,8 +52,8 @@ def _speed(value: str) -> float:
         speed = float(value)
     except ValueError:
         raise argparse.ArgumentTypeError(f"{value!r} isn't a number") from None
-    if not 0.5 <= speed <= 2.0:
-        raise argparse.ArgumentTypeError("must be between 0.5 and 2.0")
+    if not MIN_SPEED <= speed <= MAX_SPEED:
+        raise argparse.ArgumentTypeError(f"must be between {MIN_SPEED} and {MAX_SPEED}")
     return speed
 
 
@@ -78,7 +80,10 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Kokoro voice (default: {DEFAULT_VOICE}; see `tomecast voices`)",
     )  # fmt: skip
     convert.add_argument(
-        "--speed", type=_speed, default=1.0, help="speaking speed, 0.5 to 2.0 (default: 1.0)"
+        "--speed",
+        type=_speed,
+        default=1.0,
+        help=f"speaking speed, {MIN_SPEED} to {MAX_SPEED} (default: 1.0)",
     )
     convert.add_argument(
         "-y", "--yes", action="store_true", help="download the voice engine without asking"

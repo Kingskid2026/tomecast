@@ -122,6 +122,7 @@ def write_m4b(
     bitrate: str = "64k",
     ffmpeg: str | None = None,
     overwrite: bool = True,
+    tempo: float = 1.0,
 ) -> PackagedBook:
     """Encode ``chapters`` into an M4B audiobook at ``output`` and return where it ended up
     and its chapter list.
@@ -142,6 +143,10 @@ def write_m4b(
     fails if the name is taken, and the next free name ("Title (2).m4b", "Title (3).m4b"...)
     is used instead. The returned ``output`` is the name actually used.
 
+    ``tempo`` speeds the finished audio up (or slows it down) without changing its pitch,
+    using ffmpeg's ``atempo`` filter in the same single encode. It must be from 0.5 to 2.0.
+    Every chapter's start and end time, and so the returned chapters, are divided by it.
+
     ``ffmpeg`` is the ffmpeg executable to use. It defaults to the one bundled with
     imageio-ffmpeg.
 
@@ -151,6 +156,8 @@ def write_m4b(
             isn't JPEG or PNG, or ffmpeg fails (the message ends with ffmpeg's last lines
             of output).
     """
+    if not 0.5 <= tempo <= 2.0:  # the range atempo handles in one step
+        raise PackagingError(f"tempo must be between 0.5 and 2.0, not {tempo!r}")
     sample_rate, planned = _plan(chapters)
     cover_suffix = _cover_suffix(info.cover)
     if not output.parent.is_dir():
@@ -165,7 +172,7 @@ def write_m4b(
         with tempfile.TemporaryDirectory(prefix="tomecast-m4b-", dir=workdir) as scratch:
             scratch_dir = Path(scratch)
             metadata = scratch_dir / "chapters.ffmetadata"
-            metadata.write_text(_ffmetadata(info, planned, sample_rate), encoding="utf-8")
+            metadata.write_text(_ffmetadata(info, planned, sample_rate, tempo), encoding="utf-8")
             cover: Path | None = None
             if info.cover is not None:
                 cover = scratch_dir / f"cover{cover_suffix}"
@@ -177,6 +184,7 @@ def write_m4b(
                 metadata=metadata,
                 cover=cover,
                 bitrate=bitrate,
+                tempo=tempo,
                 output=partial,
             )
             _encode(command, planned, log_path=scratch_dir / "ffmpeg.log")
@@ -190,7 +198,9 @@ def write_m4b(
     return PackagedBook(
         output,
         [
-            PackagedChapter(c.title, c.start_frame / sample_rate, c.end_frame / sample_rate)
+            PackagedChapter(
+                c.title, c.start_frame / sample_rate / tempo, c.end_frame / sample_rate / tempo
+            )
             for c in planned
         ],
     )
@@ -319,7 +329,9 @@ def _cover_suffix(cover: Cover | None) -> str:
     return suffix
 
 
-def _ffmetadata(info: AudiobookInfo, chapters: Sequence[_PlannedChapter], sample_rate: int) -> str:
+def _ffmetadata(
+    info: AudiobookInfo, chapters: Sequence[_PlannedChapter], sample_rate: int, tempo: float = 1.0
+) -> str:
     """Build the FFmetadata file that carries the tags and chapter markers into ffmpeg."""
     authors = ", ".join(info.authors)
     tags = {
@@ -339,8 +351,8 @@ def _ffmetadata(info: AudiobookInfo, chapters: Sequence[_PlannedChapter], sample
         lines += [
             "[CHAPTER]",
             "TIMEBASE=1/1000",
-            f"START={_frames_to_ms(chapter.start_frame, sample_rate)}",
-            f"END={_frames_to_ms(chapter.end_frame, sample_rate)}",
+            f"START={_frames_to_ms(chapter.start_frame, sample_rate, tempo)}",
+            f"END={_frames_to_ms(chapter.end_frame, sample_rate, tempo)}",
             f"title={_escape(chapter.title)}",
         ]
     return "\n".join(lines) + "\n"
@@ -351,9 +363,12 @@ def _escape(value: str) -> str:
     return _FFMETADATA_SPECIAL.sub(lambda match: "\\" + match.group(), value)
 
 
-def _frames_to_ms(frames: int, sample_rate: int) -> int:
-    """Convert a frame position to whole milliseconds, rounding to the nearest one."""
-    return (frames * 1000 + sample_rate // 2) // sample_rate
+def _frames_to_ms(frames: int, sample_rate: int, tempo: float = 1.0) -> int:
+    """Convert a frame position to whole milliseconds, rounding to the nearest one. With a
+    ``tempo`` other than 1.0 the position is where it lands after the time-stretch."""
+    if tempo == 1.0:
+        return (frames * 1000 + sample_rate // 2) // sample_rate
+    return round(frames * 1000 / sample_rate / tempo)
 
 
 def _bundled_ffmpeg() -> str:
@@ -372,6 +387,7 @@ def _ffmpeg_command(
     cover: Path | None,
     bitrate: str,
     output: Path,
+    tempo: float = 1.0,
 ) -> list[str]:
     """The ffmpeg command that encodes PCM from stdin into the finished M4B."""
     command = [
@@ -391,6 +407,9 @@ def _ffmpeg_command(
     if cover is not None:
         # Copy the image unchanged, stored as cover art rather than as a video track.
         command += ["-map", "2:v", "-c:v", "copy", "-disposition:v", "attached_pic"]
+    if tempo != 1.0:
+        assert 0.5 <= tempo <= 2.0  # atempo's single-step range
+        command += ["-af", f"atempo={tempo:.6f}"]
     command += [
         "-c:a", "aac", "-b:a", bitrate, "-ac", "1",
         "-f", "ipod",  # the MP4 flavour ffmpeg uses for .m4a/.m4b
@@ -408,6 +427,26 @@ def _ffmpeg_path(path: Path) -> str:
     starting with ``-`` as options; ``file:`` plus an absolute path avoids both.
     """
     return f"file:{path.absolute()}"
+
+
+def stretch_wav(source: Path, output: Path, tempo: float, ffmpeg: str | None = None) -> None:
+    """Write ``source`` to ``output`` (a WAV file) played ``tempo`` times as fast, with the
+    pitch unchanged. ``tempo`` must be from 0.5 to 2.0. Used for voice previews, so they
+    sound the way the audiobook will."""
+    if not 0.5 <= tempo <= 2.0:
+        raise PackagingError(f"tempo must be between 0.5 and 2.0, not {tempo!r}")
+    command = [
+        ffmpeg or _bundled_ffmpeg(), "-hide_banner", "-nostats", "-loglevel", "error", "-y",
+        "-i", _ffmpeg_path(source), "-af", f"atempo={tempo:.6f}",
+        "-c:a", "pcm_s16le", "-f", "wav", _ffmpeg_path(output),
+    ]  # fmt: skip
+    try:
+        result = subprocess.run(command, capture_output=True, check=False, timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise PackagingError(f"couldn't run ffmpeg: {error}") from error
+    if result.returncode != 0:
+        detail = result.stderr.decode(errors="replace").strip()[-500:]
+        raise PackagingError(f"ffmpeg couldn't speed up the preview: {detail}")
 
 
 def cover_is_usable(cover: Cover, ffmpeg: str | None = None) -> bool:

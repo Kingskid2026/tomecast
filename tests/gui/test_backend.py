@@ -19,14 +19,15 @@ import pytest
 from PySide6.QtCore import QSettings, QUrl
 from pytestqt.qtbot import QtBot
 
+from tomecast.audio import wav_info
 from tomecast.book import Book, Chapter
 from tomecast.convert import plan_chunks
 from tomecast.downloads import Asset, is_installed
-from tomecast.engines.audiocpp import EngineError
+from tomecast.engines.audiocpp import EngineError, split_speed
 from tomecast.gui import backend as backend_module
 from tomecast.gui.backend import STOPPED_MESSAGE, Backend, safe_file_name, unique_output
 from tomecast.gui.models import ChapterModel, display_title, is_numbered_chapter, summarize
-from tomecast.gui.worker import TimedControl
+from tomecast.gui.worker import TimedControl, preview_file
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # for epub_factory
 from epub_factory import NavPoint, Page, build_epub, tiny_png
@@ -83,6 +84,14 @@ class FakeEngine:
         self.started = False
         self.closed = False
         self.thread_id: int | None = None  # the OS thread that started it
+
+    @property
+    def voice_speed(self) -> float:
+        return split_speed(self.speed)[0]
+
+    @property
+    def tempo(self) -> float:
+        return split_speed(self.speed)[1]
 
     def start(self) -> None:
         self.thread_id = threading.get_ident()
@@ -403,6 +412,36 @@ def test_the_summary_formats_hours_and_tiny_amounts() -> None:
     assert summarize(1, 1, 2, 4.7)["words"] == "1 WORD"
 
 
+def test_the_summary_follows_the_speed() -> None:
+    # 26,371 words is 2 h 47 min at 1x. Audio shrinks with the speed; making it takes as
+    # long as the voice's own audio (capped at 1.5x) divided by the measured speed.
+    slow = summarize(26371, 12, 15, 4.7, 0.5)
+    assert slow["audio"] == "ABOUT 5 H 34 MIN OF AUDIO"
+    assert slow["make"] == "ABOUT 1 H 11 MIN TO MAKE HERE"
+    assert summarize(26371, 12, 15, 4.7, 1.0)["make"] == "ABOUT 36 MIN TO MAKE HERE"
+    assert summarize(26371, 12, 15, 4.7, 2.0)["audio"] == "ABOUT 1 H 23 MIN OF AUDIO"
+    fast = summarize(26371, 12, 15, 4.7, 3.0)
+    assert fast["audio"] == "ABOUT 56 MIN OF AUDIO"
+    assert fast["make"] == summarize(26371, 12, 15, 4.7, 1.5)["make"] == "ABOUT 24 MIN TO MAKE HERE"
+
+
+def test_changing_the_speed_updates_the_estimates(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    backend = make_backend()
+    backend.openBook(_url(_book_with_front_matter(tmp_path)))
+    qtbot.waitUntil(lambda: backend.screen == "chapters")
+    seen: list[dict[str, str]] = []
+    backend.selectionSummaryChanged.connect(lambda: seen.append(backend.selectionSummary))
+    assert backend.selectionSummary["audio"] == "ABOUT 4 MIN OF AUDIO"  # 674 words at 1x
+
+    backend.setSpeed(0.5)
+    assert seen[-1] == backend.selectionSummary == backend.chapters.summary(4.7, 0.5)
+    assert backend.selectionSummary["audio"] == "ABOUT 9 MIN OF AUDIO"
+    backend.setSpeed(3.0)
+    assert backend.selectionSummary["audio"] == "ABOUT 1 MIN OF AUDIO"
+
+
 @pytest.mark.parametrize(
     ("name", "message"),
     [
@@ -466,7 +505,7 @@ def test_voice_speed_and_theme_are_saved_between_runs(make_backend: MakeBackend)
     assert first.themeSetting == "system"
 
     first.setVoice("bm_george")
-    first.setSpeed(1.1)
+    first.setSpeed(2.25)
     first.setThemeSetting("light")
     first.setVoice("zf_xiaobei")  # not offered: ignored
     first.setThemeSetting("purple")  # ignored
@@ -474,12 +513,14 @@ def test_voice_speed_and_theme_are_saved_between_runs(make_backend: MakeBackend)
     second = make_backend()
     assert second.voice == "bm_george"
     assert second.voiceLabel == "GEORGE · BRITISH · MALE"
-    assert second.speed == pytest.approx(1.1)
+    assert second.speed == pytest.approx(2.25)
     assert second.themeSetting == "light"
     assert second.theme == "light"
 
 
-@pytest.mark.parametrize(("value", "speed"), [(1.12, 1.1), (1.13, 1.15), (0.2, 0.75), (3, 1.25)])
+@pytest.mark.parametrize(
+    ("value", "speed"), [(1.05, 1.0), (1.12, 1.0), (1.13, 1.25), (1.5, 1.5), (0.2, 0.5), (9, 3.0)]
+)
 def test_speed_snaps_to_the_meter(make_backend: MakeBackend, value: float, speed: float) -> None:
     backend = make_backend()
     backend.setSpeed(value)
@@ -790,6 +831,31 @@ def test_previews_need_an_audio_player(
 
     assert backend.previewPlaying is False
     assert engines.made == []
+
+
+def test_a_fast_preview_is_time_stretched_like_the_book(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    player = shutil.which("true")
+    if player is None:
+        pytest.skip("needs the `true` command as a stand-in audio player")
+    engines = Engines()
+    backend = make_backend(engines, player=player)
+    _open(qtbot, backend, _short_book(tmp_path))
+    backend.goTo("voice")
+    text = backend.previewText
+    seconds: dict[float, float] = {}
+    for speed in (1.0, 3.0):  # 3x is voiced at 1.5x and stretched by 2
+        backend.setSpeed(speed)
+        backend.togglePreview()
+        qtbot.waitUntil(lambda: not backend.previewPlaying)
+        assert backend.errorMessage == ""
+        assert backend._preview_cache is not None
+        seconds[speed] = wav_info(
+            preview_file(backend._preview_cache, "af_heart", speed, text)
+        ).seconds
+    assert seconds[3.0] == pytest.approx(seconds[1.0] / 2, rel=0.05)
+    assert engines.texts == [text, text]  # the whole sentence was voiced both times
 
 
 def test_a_preview_is_voiced_once_and_the_engine_stops_at_shutdown(

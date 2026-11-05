@@ -74,7 +74,7 @@ Every property has a `<name>Changed` notify signal. Lists are plain JS arrays of
 | `formatsLabel` | string | the formats Tomecast can read today, from `tomecast.readers.FORMATS` joined with `" · "` (just `"EPUB"` for now) |
 | `chapters` | ChapterModel | one row per section of the book. A section with no title is called `"Untitled section"` (its accessible name is "Include untitled section") |
 | `skipFrontMatter` | bool | ticks and unticks the rows marked front matter |
-| `selectionSummary` | object | `{sections, words, audio, make}`: ready-to-show uppercase strings, as in the mockup ("12 OF 15 SECTIONS", "26,371 WORDS", "ABOUT 2 H 47 MIN OF AUDIO", "ABOUT 36 MIN TO MAKE HERE") |
+| `selectionSummary` | object | `{sections, words, audio, make}`: ready-to-show uppercase strings, as in the mockup. `audio` is the length of the finished book, so it shrinks as the speed goes up; `make` is the time to voice it, which stops shrinking above 1.5× because the voice never speaks faster than that. It is recomputed when the speed changes ("12 OF 15 SECTIONS", "26,371 WORDS", "ABOUT 2 H 47 MIN OF AUDIO", "ABOUT 36 MIN TO MAKE HERE") |
 
 `ChapterModel` roles: `title` (without a leading "Chapter N."; rows show titles only, no index numbers), `wordsLabel` (`"2,181"`), `minutesLabel` (`"14 min"`, `"<1 min"`), `meterLit` (0–17 dots), `frontMatter` (bool), `selected` (bool, editable).
 
@@ -93,7 +93,8 @@ Front matter is guessed until the real cleanup lands (issue #4): sections before
 | `voiceGroups` | list | `[{label: "AMERICAN · FEMALE", voices: [{id: "af_heart", name: "Heart"}, …]}, …]` for American and British English |
 | `voice` | string | the chosen voice id (saved between runs) |
 | `voiceLabel` | string | `"HEART · AMERICAN · FEMALE"` |
-| `speed` | real | 0.75–1.25 in steps of 0.05 on the meter (saved between runs) |
+| `speed` | real | 0.5–3.0 in steps of 0.25 on the meter, 11 dots with 1.00× the third (saved between runs; an older saved value such as 1.05 snaps to the nearest step) |
+| `minSpeed`, `maxSpeed`, `speedStep` | real | the meter's range (`MIN_SPEED`, `MAX_SPEED`, `SPEED_STEP` in `backend.py`). Constants, so no notify signal. `VoiceScreen.qml` reads its end labels ("0.5×", "3×") and dot values from them instead of hard-coding the range |
 | `previewText` | string | the first sentence of the first selected chapter |
 | `previewPlaying` | bool | |
 | `previewAvailable` | bool | false when no system audio player was found (the button explains) |
@@ -102,7 +103,7 @@ Front matter is guessed until the real cleanup lands (issue #4): sections before
 | Slot | Does |
 |---|---|
 | `setVoice(id)`, `setSpeed(value)` | |
-| `togglePreview()` | voice `previewText` with the chosen voice and speed, then play it; again to stop |
+| `togglePreview()` | voice `previewText` with the chosen voice and speed, then play it; again to stop. Above 1.5× the preview is also time-stretched, so it sounds like the book will (see the architecture notes on speed) |
 | `startConversion()` | write `<book folder>/<book title>.m4b` and go to `"converting"`. It does nothing while `loading` is true (Start is disabled then), because the book being read would replace this one. The job carries the **whole book** plus `chapters`, the indices of the ticked rows (see "Ticked sections and resuming" below). |
 
 ### Converting

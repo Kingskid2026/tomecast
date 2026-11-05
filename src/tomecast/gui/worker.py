@@ -40,7 +40,7 @@ from tomecast.convert import (
 )
 from tomecast.downloads import Asset, DownloadError, ensure, is_installed
 from tomecast.engines.audiocpp import EngineError, KokoroServer
-from tomecast.packaging import PackagingError
+from tomecast.packaging import PackagingError, stretch_wav
 from tomecast.readers.epub import InvalidEbookError, read_epub
 from tomecast.workdirs import WorkFolderBusy, exclusive, work_folder
 
@@ -319,7 +319,14 @@ class ConversionWorker(QObject):
                 return
             engine = self._preview_engine_for(job.voice, job.speed)
             self._voice_text(engine, job.text, job.output)
-        except (EngineError, MissingAudioError, CoverageError, OSError, wave.Error) as error:
+        except (
+            EngineError,
+            MissingAudioError,
+            CoverageError,
+            PackagingError,
+            OSError,
+            wave.Error,
+        ) as error:
             self._close_preview_engine()  # start afresh next time
             self.failed.emit(job.job, _as_sentence(f"The preview failed: {error}"))
             return
@@ -345,11 +352,16 @@ class ConversionWorker(QObject):
             for index, chunk in enumerate(chunks):
                 part = Path(tmp) / f"{index}.wav"
                 engine.synthesize(chunk.text, part)
-                if problem := audio_problem(part, chunk.text):
+                if problem := audio_problem(part, chunk.text, getattr(engine, "voice_speed", 1.0)):
                     raise MissingAudioError(problem)
                 parts.append(part)
             joined = Path(tmp) / "preview.wav"
             concatenate_wavs(parts, joined, gap_seconds=0.3)
+            tempo = getattr(engine, "tempo", 1.0)
+            if tempo != 1.0:  # the same time-stretch the audiobook gets
+                stretched = Path(tmp) / "stretched.wav"
+                stretch_wav(joined, stretched, tempo)
+                joined = stretched
             joined.replace(output)
 
     def _close_preview_engine(self) -> None:

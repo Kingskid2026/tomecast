@@ -193,6 +193,64 @@ def test_audio_problem_accepts_good_audio(tmp_path: Path) -> None:
     assert audio_problem(wav, text) == ""
 
 
+@pytest.mark.parametrize("speed", [1.0, 1.25, 1.5])
+def test_audio_problem_allows_fast_audio_at_a_fast_speed(tmp_path: Path, speed: float) -> None:
+    wav = tmp_path / "x.wav"
+    text = "x" * 60
+    _write_speech_like(wav, text, chars_per_second=40.0 * speed * 0.95)  # a little under the limit
+    assert audio_problem(wav, text, speed) == ""
+    if speed > 1.0:  # the same audio is too short for normal speed
+        assert "cut off" in audio_problem(wav, text)
+
+
+@pytest.mark.parametrize("speed", [0.5, 1.0, 1.5, 3.0])
+def test_audio_problem_still_catches_truncated_audio_at_every_speed(
+    tmp_path: Path, speed: float
+) -> None:
+    wav = tmp_path / "x.wav"
+    text = "A sentence long enough that five characters of audio cannot be all of it."
+    _write_speech_like(wav, text[:5])
+    assert "cut off" in audio_problem(wav, text, speed)
+
+
+def test_slow_speeds_do_not_weaken_the_audio_check(tmp_path: Path) -> None:
+    wav = tmp_path / "x.wav"
+    text = "x" * 60
+    _write_speech_like(wav, text, chars_per_second=60.0)  # 1.0 s: too short for 60 characters
+    assert audio_problem(wav, text, 0.5) == audio_problem(wav, text, 1.0) != ""
+
+
+class FastEngine(FakeEngine):
+    """Voices at 1.5x and asks for a 2x tempo, as KokoroServer does at speed 3.0."""
+
+    voice_speed = 1.5
+    tempo = 2.0
+
+    def synthesize(self, text: str, output: Path) -> None:
+        self.texts.append(text)
+        _write_speech_like(output, text, chars_per_second=CHARS_PER_SECOND * 3.0)  # 45 > 40
+
+
+def test_a_fast_speed_loses_no_text_and_halves_the_book(tmp_path: Path) -> None:
+    book = _book()
+    unstretched = FastEngine()
+    unstretched.tempo = 1.0
+    normal = convert_book(book, unstretched, tmp_path / "a.m4b", workdir=tmp_path / "wa")
+    fast_engine = FastEngine()
+    fast = convert_book(book, fast_engine, tmp_path / "b.m4b", workdir=tmp_path / "wb")
+
+    spoken = "".join("".join(t.split()) for t in fast_engine.texts)
+    source = "".join(
+        "".join(p.split()) for chapter in book.chapters for p in chapter.spoken_paragraphs()
+    )
+    assert spoken == source  # every character still reached the voice (and passed its check)
+    assert [c.title for c in fast.chapters] == ["Chapter One", "Chapter Two"]
+    assert _chapter_titles(tmp_path / "b.m4b") == ["Chapter One", "Chapter Two"]
+    # The tempo halves everything, silences included; chapter 2 starts at the halved time.
+    assert fast.chapters[-1].end_seconds == pytest.approx(normal.chapters[-1].end_seconds / 2)
+    assert fast.chapters[1].start_seconds == pytest.approx(normal.chapters[1].start_seconds / 2)
+
+
 class CountingEngine(FakeEngine):
     """Fails once it has voiced ``limit`` chunks, like a run that gets interrupted."""
 

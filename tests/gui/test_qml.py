@@ -271,7 +271,9 @@ def test_voice_screen_texts(app_window: Window, messages: Messages) -> None:
     assert app_window.get("voice_af_heart").property("chosen") is True
     assert app_window.get("voice_bm_george").property("chosen") is False
     assert app_window.text("previewText").startswith("Alice was beginning to get very tired")
-    assert app_window.get("speedMeter").property("current") == 5
+    assert app_window.get("speedMeter").property("current") == 2  # 1.00x is the third dot
+    assert app_window.text("speedMinLabel") == "0.5×"
+    assert app_window.text("speedMaxLabel") == "3×"
     assert_clean(messages)
 
 
@@ -340,11 +342,11 @@ def test_voice_and_speed_controls(app_window: Window, messages: Messages) -> Non
     assert app_window.text("previewVoiceLabel") == "PREVIEW · EMMA · BRITISH · FEMALE"
 
     meter = app_window.get("speedMeter")
-    # Eleven 28 px targets spread across the meter: click the eighth (speed 1.10).
+    # Eleven 28 px targets spread across the meter: click the eighth (speed 2.25).
     step = (meter.width() - 28) / 10
     app_window.click(meter, QPointF(14 + 7 * step, meter.height() / 2))
-    assert app_window.backend.property("speed") == pytest.approx(1.10)
-    assert app_window.text("speedValue") == "1.10×"
+    assert app_window.backend.property("speed") == pytest.approx(2.25)
+    assert app_window.text("speedValue") == "2.25×"
 
     preview = app_window.get("previewButton")
     assert preview.property("glyph") == "play"
@@ -363,9 +365,11 @@ def test_speed_meter_follows_the_keyboard(app_window: Window, messages: Messages
     meter = app_window.get("speedMeter")
     meter.forceActiveFocus()
     QTest.keyClick(app_window.window, Qt.Key.Key_Right)
-    assert app_window.backend.property("speed") == pytest.approx(1.05)
+    assert app_window.backend.property("speed") == pytest.approx(1.25)
     QTest.keyClick(app_window.window, Qt.Key.Key_Home)
-    assert app_window.backend.property("speed") == pytest.approx(0.75)
+    assert app_window.backend.property("speed") == pytest.approx(0.5)
+    QTest.keyClick(app_window.window, Qt.Key.Key_End)
+    assert app_window.backend.property("speed") == pytest.approx(3.0)
     assert_clean(messages)
 
 
@@ -624,6 +628,7 @@ def test_backend_property_list_matches_the_contract(backend: DemoBackend) -> Non
     meta = backend.metaObject()
     names = {meta.property(i).name() for i in range(meta.propertyCount())}
     assert contract <= names
+    assert {"minSpeed", "maxSpeed", "speedStep"} <= names  # constants: no notify signal
     for name in contract:
         assert meta.property(meta.indexOfProperty(name)).hasNotifySignal(), name
     slots = {

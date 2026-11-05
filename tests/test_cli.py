@@ -174,7 +174,7 @@ def test_voices_lists_every_language(capsys: pytest.CaptureFixture[str]) -> None
     assert "Default: af_heart" in out
 
 
-@pytest.mark.parametrize("speed", ["3", "0.1", "fast"])
+@pytest.mark.parametrize("speed", ["3.5", "0.1", "fast"])
 def test_a_bad_speed_is_rejected_before_anything_happens(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], speed: str
 ) -> None:

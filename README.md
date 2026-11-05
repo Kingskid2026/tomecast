@@ -13,7 +13,7 @@
 ```sh
 uv tool install tomecast                      # or: pipx install tomecast
 tomecast convert book.epub                    # writes book.m4b next to the book
-tomecast convert book.epub --voice bm_george --speed 1.1
+tomecast convert book.epub --voice bm_george --speed 1.1   # speed: 0.5 to 3.0 (default 1.0)
 tomecast voices                               # list the 54 built-in voices
 ```
 

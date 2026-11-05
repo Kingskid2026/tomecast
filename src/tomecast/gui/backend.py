@@ -59,7 +59,7 @@ from tomecast.readers import FORMATS
 
 SCREENS = ("drop", "chapters", "voice", "converting", "done")
 THEME_SETTINGS = ("system", "dark", "light")
-MIN_SPEED, MAX_SPEED, SPEED_STEP = 0.75, 1.25, 0.05
+MIN_SPEED, MAX_SPEED, SPEED_STEP = 0.5, 3.0, 0.25  # 11 meter dots; 1.00x is the third
 PLAYERS = ("pw-play", "paplay", "aplay")  # the first one found plays previews
 
 FORMATS_LABEL = " · ".join(FORMATS)  # only what Tomecast can read today
@@ -388,7 +388,7 @@ class Backend(QObject):
     skipFrontMatter: bool = _field(bool, "skipFrontMatter", skipFrontMatterChanged)
 
     def _get_selection_summary(self) -> dict[str, str]:
-        return self._chapters.summary(self._speedup or DEFAULT_SPEEDUP)
+        return self._chapters.summary(self._speedup or DEFAULT_SPEEDUP, self._speed)
 
     selectionSummary = _property(dict, _get_selection_summary, selectionSummaryChanged)
 
@@ -402,6 +402,10 @@ class Backend(QObject):
 
     voiceLabel = _property(str, _get_voice_label, voiceLabelChanged)
     speed: float = _field(float, "speed", speedChanged)
+    # The meter's range, so QML never hard-codes it. Constants: no notify signal.
+    minSpeed = cast(float, Property(float, lambda self: MIN_SPEED, constant=True))
+    maxSpeed = cast(float, Property(float, lambda self: MAX_SPEED, constant=True))
+    speedStep = cast(float, Property(float, lambda self: SPEED_STEP, constant=True))
     previewText: str = _field(str, "previewText", previewTextChanged)
     previewPlaying: bool = _field(bool, "previewPlaying", previewPlayingChanged)
     downloadNote: str = _field(str, "downloadNote", downloadNoteChanged)
@@ -531,6 +535,7 @@ class Backend(QObject):
             return
         self._stop_preview()
         self._update("speed", speed)
+        self.selectionSummaryChanged.emit()  # the estimates follow the speed
         self._settings.setValue("speed", speed)
         self._settings.sync()
 

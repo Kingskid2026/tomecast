@@ -24,6 +24,7 @@ from PySide6.QtCore import (
 )
 
 from tomecast.book import Book, Chapter
+from tomecast.engines.audiocpp import split_speed
 
 # Narration speed used for estimates (Kokoro at speed 1.0 reads about this fast).
 WORDS_PER_MINUTE = 158
@@ -131,10 +132,18 @@ def _hours_minutes(minutes: int) -> str:
     return f"{hours} H {rest:02d} MIN" if hours else f"{rest} MIN"
 
 
-def summarize(words: int, sections: int, total_sections: int, speedup: float) -> dict[str, str]:
-    """The four summary lines under the chapter list, as ready-to-show uppercase strings."""
-    audio_minutes = words / WORDS_PER_MINUTE
-    make_minutes = audio_minutes / speedup if speedup > 0 else 0.0
+def summarize(
+    words: int, sections: int, total_sections: int, speedup: float, speed: float = 1.0
+) -> dict[str, str]:
+    """The four summary lines under the chapter list, as ready-to-show uppercase strings.
+
+    ``speed`` is the chosen speaking speed. The audio ends up that much shorter. Making it
+    takes as long as voicing it takes (``speedup`` is measured on the voice's own audio, so
+    the voice's speed counts), and the time-stretch on top is quick.
+    """
+    audio_minutes = words / WORDS_PER_MINUTE / speed
+    voiced_minutes = words / WORDS_PER_MINUTE / split_speed(speed)[0]
+    make_minutes = voiced_minutes / speedup if speedup > 0 else 0.0
     if words == 0:
         audio, make = "NO AUDIO", "NOTHING TO MAKE"
     else:
@@ -246,11 +255,15 @@ class ChapterModel(QAbstractListModel):
     def selected_rows(self) -> list[int]:
         return [row for row, section in enumerate(self._sections) if section.selected]
 
-    def summary(self, speedup: float) -> dict[str, str]:
+    def summary(self, speedup: float, speed: float = 1.0) -> dict[str, str]:
         """``{sections, words, audio, make}`` for the rows that are ticked."""
         chosen = [section for section in self._sections if section.selected]
         return summarize(
-            sum(section.words for section in chosen), len(chosen), len(self._sections), speedup
+            sum(section.words for section in chosen),
+            len(chosen),
+            len(self._sections),
+            speedup,
+            speed,
         )
 
     def meter_lit(self, row: int) -> int:

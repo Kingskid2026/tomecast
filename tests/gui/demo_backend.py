@@ -34,6 +34,8 @@ from PySide6.QtGui import QColor, QImage
 from PySide6.QtQml import QQmlEngine, qmlRegisterSingletonInstance, qmlRegisterType
 from PySide6.QtQuick import QQuickImageProvider
 
+MIN_SPEED, MAX_SPEED, SPEED_STEP = 0.5, 3.0, 0.25  # as in tomecast.gui.backend
+
 QML_URI = "TomecastNative"
 DATA_PATH = Path(__file__).resolve().parent / "data" / "alice_demo.json"
 SCREENS = ("drop", "chapters", "voice", "converting", "done")
@@ -363,8 +365,12 @@ class DemoBackend(QObject):
         sections = self._chapters.sections
         chosen = [s for s in sections if s.selected]
         words = sum(s.words for s in chosen)
-        minutes = words / float(self._data["wpm"])
-        make = _half_up(minutes / float(self._data["speedup"]))
+        speed = float(self._values.get("speed", 1.0))
+        voice_speed = min(speed, 1.5)  # Kokoro's own speed saturates past this
+        minutes = words / float(self._data["wpm"]) / speed
+        make = _half_up(
+            words / float(self._data["wpm"]) / voice_speed / float(self._data["speedup"])
+        )
         hours, mins = divmod(_half_up(minutes), 60)
         return {
             "sections": f"{len(chosen)} OF {len(sections)} SECTIONS",
@@ -503,8 +509,9 @@ class DemoBackend(QObject):
     @Slot(float)
     def setSpeed(self, value: float) -> None:
         self._record("setSpeed", value)
-        steps = round((min(1.25, max(0.75, value)) - 0.75) / 0.05)
-        self._set("speed", round(0.75 + steps * 0.05, 2))
+        steps = round((min(MAX_SPEED, max(MIN_SPEED, value)) - MIN_SPEED) / SPEED_STEP)
+        self._set("speed", round(MIN_SPEED + steps * SPEED_STEP, 2))
+        self._set("selectionSummary", self._summary())
 
     @Slot()
     def togglePreview(self) -> None:
@@ -589,6 +596,9 @@ class DemoBackend(QObject):
     voice = Property(str, lambda self: self._get("voice"), notify=voiceChanged)
     voiceLabel = Property(str, lambda self: self._get("voiceLabel"), notify=voiceLabelChanged)
     speed = Property(float, lambda self: self._get("speed"), notify=speedChanged)
+    minSpeed = Property(float, lambda self: MIN_SPEED, constant=True)
+    maxSpeed = Property(float, lambda self: MAX_SPEED, constant=True)
+    speedStep = Property(float, lambda self: SPEED_STEP, constant=True)
     previewText = Property(str, lambda self: self._get("previewText"), notify=previewTextChanged)
     previewPlaying = Property(
         bool, lambda self: self._get("previewPlaying"), notify=previewPlayingChanged
