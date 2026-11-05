@@ -12,7 +12,7 @@
 | Inspiration | The maintainer's own earlier "blueprint" site (one blue accent on near-black); Gradium Phonon's dot-matrix player; the print discipline of Nous Research's work. Tomecast is *inspired by* these, not a copy: it doesn't use Phonon's lime accent or the same artworks. |
 | Themes | **Light and dark, following the desktop's setting**, with a manual switch in the app. Each is designed as its own palette, not an automatic inversion. |
 | Motion | **One living element:** the sentence-dot grid while converting. Everything else animates only on state changes. |
-| Artwork | **For now, only the book's own cover**, rendered as a square-grid dither in the Night Studio style. Museum sculpture is an option to revisit after the first build. |
+| Artwork | **The book's own cover**, rendered in dots on the chapter, converting and done screens. **The drop screen**, where no book is loaded yet, shows **Luca della Robbia's *Cantoria*** (1431–38, marble children singing: a Renaissance image of voices) in the same dots, with a small credit line. |
 
 ## Palette
 
@@ -48,15 +48,23 @@ All three are open-licensed (SIL OFL) and get bundled with the app.
 - **Dot meters** for amounts, like speed as an 11-dot meter.
 - **A round play/pause** for the voice preview, with a row of dots as its waveform.
 - **Crop-mark corners** on panels instead of boxes.
-- **The book cover in dots:** square-grid dither, baked once when the book is opened (Pillow), not drawn live.
+- **Images in dots (covers and art):** a square grid of round dots whose size follows brightness, at **2.4 px per dot**, keeping the image's own shape. The image is sharpened, then its tones are spread out (histogram equalization) so similar shades don't merge. Dots are capped below half a cell so they never touch. Dark theme: light dots on near-black, never inverted (inverted faces look like ghosts). Light theme: dark dots on paper. Baked once with Pillow when a book is opened, not drawn live. Fine line engravings don't survive this (their hatching is smaller than a dot), so artwork should be paintings or sculpture.
 
 ## Screens
 
-1. **Drop:** a near-black field with a dotted outline that brightens when a book is dragged over it. The hardware result sits quietly in a corner ("CPU · about 4× real time").
+1. **Drop:** a near-black field with a dotted outline that brightens when a book is dragged over it. Inside: the *Cantoria* in dots with its credit ("LUCA DELLA ROBBIA · CANTORIA · 1431–38"), "DROP A BOOK HERE", the formats (EPUB · PDF · DOCX · FB2 · HTML · TXT) and Choose a book. The hardware result sits quietly in a corner ("CPU · about 4.7× real time").
 2. **Chapters:** a spec-table layout (`[ 03 ]`, title, words, estimated minutes) with checkboxes and a dot meter for each chapter's length. The skip switches (page numbers, footnotes, front matter…) appear as toggles.
 3. **Voice:** a voice menu grouped by language and gender ("American · female"), speed as a dot meter, and Preview with the round player.
 4. **Converting:** time left in Doto, "4.7× real time", the sentence grid, the live caption, Pause, and the dotted cover.
 5. **Done:** the full grid lit, the file name, length and size, and Open folder.
+
+## Artwork sources
+
+| Work | Where it's used | Source and license |
+|---|---|---|
+| Luca della Robbia, *Cantoria*, 1431–38 (Museo dell'Opera del Duomo, Florence) | Drop screen | [Wikimedia Commons: Cantoria Della Robbia OPA Florence 1.jpg](https://commons.wikimedia.org/wiki/File:Cantoria_Della_Robbia_OPA_Florence_1.jpg), public domain |
+
+When the image ships with the app, add it to `THIRD_PARTY.md` too.
 
 ## Building it (Qt)
 
