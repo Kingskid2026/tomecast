@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.1.2](https://github.com/Kingskid2026/tomecast/compare/v0.1.1...v0.1.2) (2026-11-05)
+
+
+### Features
+
+* MP3 output, one file per chapter ([#35](https://github.com/Kingskid2026/tomecast/issues/35)) ([7086ca2](https://github.com/Kingskid2026/tomecast/commit/7086ca2dbbef1b219a264e7653ffd8c079a14dff))
+* read PDF books and clean up the page furniture ([#37](https://github.com/Kingskid2026/tomecast/issues/37)) ([2f8e3d0](https://github.com/Kingskid2026/tomecast/commit/2f8e3d02f43d702adff20c32a93ee37ecc4eaab9))
+* say numbers, abbreviations and names right ([#36](https://github.com/Kingskid2026/tomecast/issues/36)) ([861927e](https://github.com/Kingskid2026/tomecast/commit/861927e7dc3864a0a70da729961ced26e4bc8a29))
+
+
+### Documentation
+
+* mark Tomecast as a preview and lay out the roadmap to 1.0 ([#41](https://github.com/Kingskid2026/tomecast/issues/41)) ([86c5bd2](https://github.com/Kingskid2026/tomecast/commit/86c5bd26ab25e881bbc5b87e2a436d47973c3deb))
+
 ## [0.1.1](https://github.com/Kingskid2026/tomecast/compare/v0.1.0...v0.1.1) (2026-11-05)
 
 
