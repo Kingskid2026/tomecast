@@ -100,6 +100,35 @@ def test_later_entries_win_over_earlier_ones() -> None:
     assert first.then(second).apply("Rowan") == "row-an"
 
 
+def test_a_later_capitalised_entry_beats_an_earlier_any_case_one() -> None:
+    # The global list has "alice", the book's own list has "Alice": the book's wins where
+    # its spelling matches, and the any-case entry still covers the other spellings.
+    combined = fixes(("alice", "global")).then(fixes(("Alice", "book")))
+    assert combined.apply("Alice, ALICE and alice.") == "book, book and global."
+
+
+def test_a_later_any_case_entry_beats_an_earlier_capitalised_one() -> None:
+    combined = fixes(("Alice", "global")).then(fixes(("alice", "book")))
+    assert combined.apply("Alice, ALICE and alice.") == "book, book and book."
+
+
+def test_an_entry_written_in_capitals_beats_another_entrys_all_caps_form() -> None:
+    fix = fixes(("HERMIONE", "heading"), ("Hermione", "name"))
+    assert fix.apply("HERMIONE met Hermione.") == "heading met name."
+
+
+def test_the_longest_entry_wins_whichever_case_rule_it_has() -> None:
+    fix = fixes(("new", "nyoo"), ("New Zealand", "noo zee-lund"))
+    assert fix.apply("New Zealand, new shoes, NEW ZEALAND") == (
+        "noo zee-lund, nyoo shoes, noo zee-lund"
+    )
+
+
+def test_a_capitalised_entry_never_matches_lowercase_even_inside_a_longer_match() -> None:
+    fix = fixes(("Mark", "marc"), ("mark twain", "twain"))
+    assert fix.apply("Mark and mark and Mark Twain.") == "marc and mark and twain."
+
+
 def test_regex_characters_in_entries_are_taken_literally() -> None:
     fix = fixes(("St. John's", "saint jonz"), ("a+b", "a plus b"))
     assert fix.apply("At St. John's we saw a+b.") == "At saint jonz we saw a plus b."
