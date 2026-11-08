@@ -23,11 +23,11 @@ from PySide6.QtCore import (
 
 from tomecast.book import Book, Chapter
 from tomecast.cleanup import NUMBER_PATTERN, Matter, find_matter
-from tomecast.engines.audiocpp import split_speed
+from tomecast.speed import WORDS_PER_MINUTE, audio_minutes, make_minutes
+from tomecast.speed import word_count as word_count
 
-# Narration speed used for estimates (Kokoro at speed 1.0 reads about this fast).
-WORDS_PER_MINUTE = 158
-# How much faster than real time voicing runs, until this session has measured it.
+# How much faster than real time voicing runs, until the speed test (or a conversion) has
+# measured it on this computer.
 DEFAULT_SPEEDUP = 4.7
 # Dots in each row's length meter.
 METER_DOTS = 17
@@ -57,11 +57,6 @@ def display_title(title: str) -> str:
         if stripped != title:
             return stripped.strip() or UNTITLED
     return title.strip() or UNTITLED
-
-
-def word_count(chapter: Chapter) -> int:
-    """Words in the chapter's text (the title isn't counted)."""
-    return sum(len(paragraph.split()) for paragraph in chapter.paragraphs)
 
 
 def matter_labels(matter: Sequence[Matter | None]) -> list[str]:
@@ -99,21 +94,20 @@ def summarize(
     takes as long as voicing it takes (``speedup`` is measured on the voice's own audio, so
     the voice's speed counts), and the time-stretch on top is quick.
     """
-    audio_minutes = words / WORDS_PER_MINUTE / speed
-    voiced_minutes = words / WORDS_PER_MINUTE / split_speed(speed)[0]
-    make_minutes = voiced_minutes / speedup if speedup > 0 else 0.0
+    listening = audio_minutes(words, speed)
+    making = make_minutes(words, speed, speedup)
     if words == 0:
         audio, make = "NO AUDIO", "NOTHING TO MAKE"
     else:
         audio = (
             "UNDER 1 MIN OF AUDIO"
-            if _round(audio_minutes) < 1
-            else f"ABOUT {_hours_minutes(_round(audio_minutes))} OF AUDIO"
+            if _round(listening) < 1
+            else f"ABOUT {_hours_minutes(_round(listening))} OF AUDIO"
         )
         make = (
             "UNDER 1 MIN TO MAKE HERE"
-            if _round(make_minutes) < 1
-            else f"ABOUT {_hours_minutes(_round(make_minutes))} TO MAKE HERE"
+            if _round(making) < 1
+            else f"ABOUT {_hours_minutes(_round(making))} TO MAKE HERE"
         )
     noun = "SECTION" if total_sections == 1 else "SECTIONS"
     return {

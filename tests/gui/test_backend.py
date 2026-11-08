@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import array
 import hashlib
+import io
 import json
 import math
 import os
 import re
 import shutil
 import sys
+import tarfile
 import threading
 import wave
 from collections.abc import Callable, Iterator
@@ -24,7 +26,7 @@ from tomecast.audio import wav_info
 from tomecast.book import Book, Chapter
 from tomecast.cleanup import is_numbered_chapter
 from tomecast.convert import plan_chunks
-from tomecast.downloads import Asset, is_installed
+from tomecast.downloads import UPDATE_FAILED_NOTE, Asset, build_in_use, is_installed
 from tomecast.engines.audiocpp import (
     AUDIOCPP_CPU,
     AUDIOCPP_VULKAN,
@@ -36,9 +38,10 @@ from tomecast.engines.audiocpp import (
 from tomecast.gui import backend as backend_module
 from tomecast.gui import fixes as fixes_module
 from tomecast.gui.backend import STOPPED_MESSAGE, Backend, safe_file_name, unique_output
-from tomecast.gui.models import ChapterModel, display_title, summarize
-from tomecast.gui.worker import BookRead, TimedControl, preview_file
+from tomecast.gui.models import DEFAULT_SPEEDUP, ChapterModel, display_title, summarize
+from tomecast.gui.worker import BookRead, SelfCheckFor, TimedControl, preview_file
 from tomecast.names import Name
+from tomecast.speed import Speeds
 from tomecast.textprep import TextPrep
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # for epub_factory, pdf_factory
@@ -191,6 +194,7 @@ def _speakable_chunks(book: Book) -> int:
 
 
 MakeBackend = Callable[..., Backend]
+NO_SPEEDS = Speeds()  # nothing installed, so nothing measured
 
 
 @pytest.fixture
@@ -214,11 +218,15 @@ def make_backend(
         system_check: Callable[[], None] = lambda: None,
         gpu: bool = False,  # pretend a graphics driver is installed
         scan: str = "",  # the card the start-up scan finds
+        speeds: Speeds = NO_SPEEDS,  # what the start-up speed test finds
+        engine_check: SelfCheckFor | None = None,
     ) -> Backend:
         backend = Backend(
             engine_factory=engines if engines is not None else Engines(),
             gpu_check=lambda: gpu,
             device_scanner=lambda root: scan,
+            speed_probe=lambda root, card: speeds,
+            engine_check=engine_check,
             assets=assets,
             data_root=tmp_path / "data",
             player=player,
@@ -717,12 +725,13 @@ def test_the_selection_estimate_uses_the_measured_speed(
 ) -> None:
     backend = make_backend()
     _open(qtbot, backend, _short_book(tmp_path))
-    assert backend._speedup is None
+    assert backend._speeds == {}
+    assert backend.selectionSummary == backend.chapters.summary(DEFAULT_SPEEDUP)
 
     _convert(qtbot, backend)
 
-    speedup = backend._speedup
-    assert speedup is not None and speedup > 0
+    speedup = backend._speeds["CPU"]
+    assert speedup > 0
     assert backend.selectionSummary == backend.chapters.summary(speedup)
 
 
@@ -1118,7 +1127,7 @@ def test_pause_works_only_while_voicing(
         release.wait(timeout=10)
         return real_ensure(*args, **kwargs)  # type: ignore[arg-type]
 
-    monkeypatch.setattr("tomecast.gui.worker.ensure", slow_ensure)
+    monkeypatch.setattr("tomecast.downloads.ensure", slow_ensure)
     asset = _test_asset(tmp_path, "model.bin", b"model weights")
     backend = make_backend(assets=(asset,))
     _open(qtbot, backend, _short_book(tmp_path))
@@ -1581,10 +1590,9 @@ def test_without_a_driver_the_cpu_engine_is_what_gets_downloaded(
 
 
 def test_an_installed_engine_build_is_not_downloaded_again(
-    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
 ) -> None:
-    installed = {AUDIOCPP_VULKAN.path}
-    monkeypatch.setattr(backend_module, "is_installed", lambda a, root: a.path in installed)
+    _fake_build(AUDIOCPP_VULKAN, tmp_path / "data")
     backend = make_backend(gpu=True, assets=None)
     _open(qtbot, backend, _short_book(tmp_path))
 
@@ -1592,6 +1600,37 @@ def test_an_installed_engine_build_is_not_downloaded_again(
     assert backend.downloadNote == _note_for((ESPEAK_NG, KOKORO_Q8))
     backend.setUseGpu(False)  # the CPU build is a separate download
     assert backend.downloadNote == _note_for(CPU_DOWNLOADS)
+
+
+def _fake_build(asset: Asset, root: Path, sha256: str | None = None) -> Path:
+    """Put an extracted build of ``asset`` (the pinned one, or another) where it goes."""
+    sha = sha256 or asset.sha256
+    folder = root / asset.path / sha[:12]
+    folder.mkdir(parents=True)
+    (folder / ".tomecast-sha256").write_text(sha + "\n")
+    return folder
+
+
+def test_an_engine_update_says_so_in_the_download_note(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    root = tmp_path / "data"
+    # Tomecast 0.1.x left upstream's Vulkan build here; eSpeak and Kokoro are current.
+    legacy = root / "engines" / "audiocpp-0.9.4-vulkan"
+    legacy.mkdir(parents=True)
+    (legacy / ".tomecast-sha256").write_text("e" * 64 + "\n")
+    _fake_build(ESPEAK_NG, root)
+    model = root / KOKORO_Q8.path
+    model.parent.mkdir(parents=True)
+    model.write_bytes(b"")
+    backend = make_backend(gpu=True, assets=None)
+    backend._verified[model] = (0, model.stat().st_mtime_ns)  # as if hashed already
+    _open(qtbot, backend, _short_book(tmp_path))
+
+    backend.goTo("voice")
+
+    mb = math.ceil(AUDIOCPP_VULKAN.size / 1_000_000)
+    assert backend.downloadNote == f"STARTING DOWNLOADS A VOICE ENGINE UPDATE · {mb} MB"
 
 
 def test_a_conversion_on_the_card_reports_its_name_and_speed(
@@ -1664,8 +1703,8 @@ def test_switching_hardware_forgets_the_speed_measured_on_the_other(
     backend.setUseGpu(False)
 
     assert re.fullmatch(r"CPU · \d+ THREADS?", backend.hardwareLabel)
-    backend.setUseGpu(True)
-    assert backend.hardwareLabel == "NVIDIA RTX PRO 1000"
+    backend.setUseGpu(True)  # the card's own speed is still known
+    assert re.fullmatch(r"NVIDIA RTX PRO 1000 · ABOUT [\d,]+\.\d× REAL TIME", backend.hardwareLabel)
 
 
 def test_the_work_folder_keeps_graphics_card_and_cpu_audio_apart(
@@ -2092,3 +2131,155 @@ def test_the_voice_preview_uses_the_fixes_too(
     backend.togglePreview()
     qtbot.waitUntil(lambda: not backend.previewPlaying)
     assert engines.texts == ["zawrp walked to Glimmerdale with Mira."]  # spoken with the fix
+
+
+# --- Engine updates, and the speed test -------------------------------------------------------
+
+
+def _engine_update(tmp_path: Path) -> tuple[Asset, Path]:
+    """An engine with an older build in use (from 0.1.x), and a newer one pinned."""
+    legacy = tmp_path / "data" / "engines" / "engine-0.1"
+    legacy.mkdir(parents=True)
+    (legacy / ".tomecast-sha256").write_text("e" * 64 + "\n")
+    archive = tmp_path / "source" / "engine.tar.gz"
+    archive.parent.mkdir(exist_ok=True)
+    with tarfile.open(archive, "w:gz") as tar:
+        data = b"new build"
+        info = tarfile.TarInfo("audiocpp_server")
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+    blob = archive.read_bytes()
+    asset = Asset(
+        name="Test engine", url=archive.as_uri(), sha256=hashlib.sha256(blob).hexdigest(),
+        size=len(blob), path="engines/engine", archive="tar.gz",
+        replaces=("engines/engine-0.1",), id="engine",
+    )  # fmt: skip
+    return asset, legacy
+
+
+def test_an_update_that_fails_its_check_is_a_note_and_the_old_build_stays(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    asset, legacy = _engine_update(tmp_path)
+    checked: list[bool] = []
+
+    def failing(root: Path, gpu: bool) -> Callable[..., str]:
+        checked.append(gpu)
+        return lambda new, old: "illegal instruction"
+
+    backend = make_backend(assets=(asset,), engine_check=failing)
+    labels: list[str] = []
+    backend.downloadLabelChanged.connect(lambda: labels.append(backend.downloadLabel))
+    _open(qtbot, backend, _short_book(tmp_path))
+
+    _convert(qtbot, backend)
+
+    assert backend.screen == "done"  # the book is made anyway, with the build that works
+    assert backend.warnings[0] == UPDATE_FAILED_NOTE
+    assert checked == [False]
+    assert any(label.startswith("DOWNLOADING AN UPDATE · TEST ENGINE") for label in labels)
+    assert build_in_use(asset, tmp_path / "data") == legacy
+
+
+def test_an_update_that_passes_is_used_without_a_note(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    asset, legacy = _engine_update(tmp_path)
+    backend = make_backend(assets=(asset,), engine_check=lambda root, gpu: lambda n, o: None)
+    _open(qtbot, backend, _short_book(tmp_path))
+
+    _convert(qtbot, backend)
+
+    assert backend.warnings == []
+    assert build_in_use(asset, tmp_path / "data") != legacy
+    assert legacy.is_dir()  # kept to go back to
+
+
+def test_the_start_up_speed_test_fills_the_estimates(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    backend = make_backend(speeds=Speeds(cpu=4.6))
+    qtbot.waitUntil(lambda: "REAL TIME" in backend.hardwareLabel)
+
+    assert backend.hardwareLabel == "CPU · ABOUT 4.6× REAL TIME"  # the drop screen's corner
+    _open(qtbot, backend, _short_book(tmp_path))
+    assert backend.selectionSummary == backend.chapters.summary(4.6)
+
+
+def test_a_conversion_measures_better_than_the_speed_test(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    backend = make_backend(speeds=Speeds(cpu=4.6))
+    qtbot.waitUntil(lambda: "REAL TIME" in backend.hardwareLabel)
+    _open(qtbot, backend, _short_book(tmp_path))
+
+    _convert(qtbot, backend)
+
+    assert backend._speeds["CPU"] != 4.6  # the fake engine is far faster than that
+    assert "4.6×" not in backend.hardwareLabel
+
+
+def test_the_graphics_card_note_shows_the_measured_speed_up(
+    qtbot: QtBot, make_backend: MakeBackend
+) -> None:
+    backend = make_backend(
+        gpu=True, scan=NVIDIA, speeds=Speeds(cpu=4.6, gpu=19.8, gpu_description=NVIDIA)
+    )
+    qtbot.waitUntil(lambda: "REAL TIME" in backend.hardwareLabel)
+
+    assert backend.hardwareLabel == "NVIDIA RTX PRO 1000 · ABOUT 19.8× REAL TIME"
+    assert backend.gpuNote == "ABOUT 4.3× FASTER HERE · USES THE DRIVER ALREADY INSTALLED"
+    backend.setUseGpu(False)
+    assert backend.hardwareLabel == "CPU · ABOUT 4.6× REAL TIME"
+    assert backend.gpuNote == "USING THE CPU · THE GRAPHICS CARD IS ABOUT 4.3× FASTER HERE"
+
+
+def test_the_graphics_card_note_is_honest_about_a_slow_card(
+    qtbot: QtBot, make_backend: MakeBackend
+) -> None:
+    backend = make_backend(
+        gpu=True, scan=NVIDIA, speeds=Speeds(cpu=4.6, gpu=4.7, gpu_description=NVIDIA)
+    )
+    qtbot.waitUntil(lambda: "REAL TIME" in backend.hardwareLabel)
+
+    assert backend.gpuNote == "NO FASTER THAN THE CPU HERE · USES THE DRIVER ALREADY INSTALLED"
+    backend.setUseGpu(False)
+    assert backend.gpuNote == "USING THE CPU · THE GRAPHICS CARD WAS NO FASTER HERE"
+
+
+def test_without_measurements_the_graphics_card_note_is_the_general_one(
+    qtbot: QtBot, make_backend: MakeBackend
+) -> None:
+    backend = make_backend(gpu=True, scan=NVIDIA)
+    qtbot.waitUntil(lambda: backend.gpuName != "")
+
+    assert backend.gpuNote == "FASTER · USES THE DRIVER ALREADY INSTALLED"
+    backend.setUseGpu(False)
+    assert backend.gpuNote == "USING THE CPU · THE GRAPHICS CARD IS USUALLY SEVERAL TIMES FASTER"
+
+
+def test_the_start_up_scan_looks_at_the_card_only_when_a_driver_is_there(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    asked: list[bool] = []
+
+    def probe(root: Path, gpu: bool) -> Speeds:
+        asked.append(gpu)
+        return Speeds()
+
+    for gpu in (False, True):
+        backend = Backend(
+            engine_factory=Engines(),
+            gpu_check=lambda gpu=gpu: gpu,  # type: ignore[misc]
+            device_scanner=lambda root: "",
+            speed_probe=probe,
+            assets=(),
+            data_root=tmp_path / "data",
+            player=None,
+            settings=QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat),
+            system_check=lambda: None,
+        )
+        qtbot.waitUntil(lambda gpu=gpu: len(asked) == (2 if gpu else 1))  # type: ignore[misc]
+        backend.shutdown()
+
+    assert asked == [False, True]

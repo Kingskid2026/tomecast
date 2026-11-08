@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import math
 import os
 import platform
 import re
@@ -34,17 +35,18 @@ from tomecast.downloads import (
     Asset,
     DownloadError,
     ProgressCallback,
+    build_in_use,
     data_dir,
-    ensure,
+    failure,
+    forget_failures,
+    installed_sha256,
     is_installed,
-    local_path,
+    waiting_check,
 )
 from tomecast.engines.audiocpp import (
-    AUDIOCPP_CPU,
     AUDIOCPP_VULKAN,
     DEFAULT_VOICE,
-    ESPEAK_NG,
-    KOKORO_Q8,
+    EXECUTABLE,
     MAX_CHARS,
     MAX_SPEED,
     MIN_SPEED,
@@ -52,14 +54,24 @@ from tomecast.engines.audiocpp import (
     AutoKokoro,
     EngineError,
     check_system,
+    default_threads,
     glibc_version,
-    required_assets,
+    prepare_voice,
 )
 from tomecast.hardware import list_devices, vulkan_possible
+from tomecast.manifest import ASSETS
 from tomecast.names import DEFAULT_MIN_COUNT, find_book_names
 from tomecast.packaging import PackagingError
 from tomecast.playback import PLAYERS, find_player, play
 from tomecast.readers import FORMATS, InvalidEbookError, read_book
+from tomecast.speed import (
+    audio_minutes,
+    engine_speed,
+    forget_speeds,
+    make_minutes,
+    probe,
+    words_in,
+)
 from tomecast.textprep import TextPrep
 from tomecast.workdirs import WorkFolderBusy, exclusive, work_folder
 
@@ -152,6 +164,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="print what Tomecast sees on this computer (for bug reports)",
         description="Print the system, graphics and installed-file details a bug report needs.",
     )
+    scan = commands.add_parser(
+        "scan",
+        help="check this computer again: engine updates and speed",
+        description=(
+            "Check this computer again: try any voice engine update that didn't work here "
+            "before (after installing a graphics driver, say), and measure how fast it voices "
+            "on the CPU and the graphics card."
+        ),
+    )
+    scan.add_argument(
+        "--gpu", action=argparse.BooleanOptionalAction, default=None,
+        help="check the graphics card too (default: on when one is found); --no-gpu skips it",
+    )  # fmt: skip
+    scan.add_argument(
+        "-y", "--yes", action="store_true", help="download the voice engine without asking"
+    )
     names = commands.add_parser(
         "names",
         help="list the names and unusual words in a book",
@@ -240,6 +268,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _voices()
         if args.command == "doctor":
             return _doctor()
+        if args.command == "scan":
+            return _scan(args)
         if args.command == "names":
             return _names(args)
         if args.command == "preview":
@@ -331,7 +361,7 @@ def _convert(args: argparse.Namespace) -> int:
     for warning in warnings:
         print(f"Note: {warning}", file=sys.stderr)
     try:
-        _install(required_assets(use_gpu), root, assume_yes=args.yes)
+        _prepare(use_gpu, root, assume_yes=args.yes)
         workdir = work_folder(root, book_path, args.voice, args.speed, use_gpu=use_gpu)
     except OSError as error:
         raise CliError(str(error)) from error
@@ -356,6 +386,9 @@ def _convert(args: argparse.Namespace) -> int:
                 print(_hardware_line(engine, args.gpu))
                 if engine.warning:
                     print(f"Note: {engine.warning}")
+                speedup = engine_speed(root, engine, measuring=_measuring)
+                if speedup is not None:
+                    print(_estimate_line(words_in(book, chapters), args.speed, speedup))
                 result = convert_book(
                     book,
                     engine,
@@ -417,6 +450,27 @@ def _hardware_line(engine: AutoKokoro, requested: bool | None) -> str:
     return "Using the CPU."
 
 
+def _measuring() -> None:
+    print("Measuring how fast this computer voices (once, a few seconds)…")
+
+
+def _estimate_line(words: int, speed: float, speedup: float) -> str:
+    """``"About 2 h 47 min of audio, about 9 min to make here (19.8x real time)."``"""
+    audio = _rough_minutes(audio_minutes(words, speed))
+    make = _rough_minutes(make_minutes(words, speed, speedup))
+    return f"{audio.capitalize()} of audio, {make} to make here ({speedup:.1f}\u00d7 real time)."
+
+
+def _rough_minutes(minutes: float) -> str:
+    """``"under 1 min"``, ``"about 9 min"`` or ``"about 2 h 47 min"`` (rounded as the
+    window rounds)."""
+    whole = math.floor(minutes + 0.5)
+    if whole < 1:
+        return "under 1 min"
+    hours, rest = divmod(whole, 60)
+    return f"about {hours} h {rest:02d} min" if hours else f"about {rest} min"
+
+
 def _doctor() -> int:
     """Print what a bug report needs: system, graphics and installed files."""
     root = data_dir()
@@ -428,9 +482,9 @@ def _doctor() -> int:
     print(f"CPU threads: {threads}")
     print(f"Python: {platform.python_version()}")
     print(f"Vulkan possible: {'yes' if vulkan_possible() else 'no'}")
-    vulkan = local_path(AUDIOCPP_VULKAN, root)
-    if is_installed(AUDIOCPP_VULKAN, root):
-        devices = list_devices(vulkan / "audiocpp_server")
+    vulkan = build_in_use(AUDIOCPP_VULKAN, root)
+    if vulkan is not None:
+        devices = list_devices(vulkan / EXECUTABLE)
         if devices:
             print("Vulkan devices:")
             for device in devices:
@@ -444,9 +498,52 @@ def _doctor() -> int:
         print("Vulkan devices: not checked (the graphics-card engine isn't installed yet)")
     print(f"Data folder: {root}")
     print("Installed:")
-    for asset in (AUDIOCPP_CPU, AUDIOCPP_VULKAN, ESPEAK_NG, KOKORO_Q8):
-        state = "yes" if is_installed(asset, root) else "no"
-        print(f"  {asset.name}: {state}")
+    for asset in ASSETS:
+        print(f"  {asset.name}{' (opt-in)' if asset.opt_in else ''}: {_install_state(asset, root)}")
+    return 0
+
+
+def _install_state(asset: Asset, root: Path) -> str:
+    """``yes``, ``no``, or which older build is in use and why."""
+    if is_installed(asset, root):
+        return "yes"
+    if not asset.archive or build_in_use(asset, root) is None:
+        return "no"
+    older = f"an older build ({(installed_sha256(asset, root) or '?')[:12]})"
+    if (reason := failure(asset, root)) is not None:
+        first_line = reason.strip().splitlines()[0] if reason.strip() else "no reason given"
+        return f"{older}; the update failed its check here: {first_line}"
+    if waiting_check(asset, root):
+        return f"{older}; the update is downloaded and will be checked on the next run"
+    return f"{older}; the update isn't downloaded yet"
+
+
+def _scan(args: argparse.Namespace) -> int:
+    """Try failed engine updates again, and measure the speed on the CPU and the card."""
+    try:
+        check_system()
+    except EngineError as error:
+        raise CliError(str(error)) from error
+    root = data_dir()
+    use_gpu = _wants_gpu(args.gpu)
+    forget_failures(root)
+    forget_speeds(root)
+    _prepare(use_gpu, root, assume_yes=args.yes)
+    print("Measuring how fast this computer voices (a few seconds each)…")
+    speeds = probe(root, gpu=use_gpu)
+    threads = default_threads()
+    if speeds.cpu is not None:
+        print(f"CPU, {_plural(threads, 'thread')}: about {speeds.cpu:.1f}\u00d7 real time.")
+    else:
+        print("CPU: the speed test didn't work (see `tomecast doctor`).")
+    if use_gpu:
+        if speeds.gpu is None:
+            print("Graphics card: not usable, so Tomecast uses the CPU.")
+        else:
+            faster = (
+                f", {speeds.gpu / speeds.cpu:.1f}\u00d7 as fast as the CPU" if speeds.cpu else ""
+            )
+            print(f"{speeds.gpu_description}: about {speeds.gpu:.1f}\u00d7 real time{faster}.")
     return 0
 
 
@@ -531,7 +628,7 @@ def _preview(args: argparse.Namespace) -> int:
         print(f"Saying: {spoken}")
 
     use_gpu = _wants_gpu(args.gpu)
-    _install(required_assets(use_gpu), root, assume_yes=args.yes)
+    _prepare(use_gpu, root, assume_yes=args.yes)
     with tempfile.TemporaryDirectory(prefix="tomecast-preview-") as folder:
         wav = Path(folder) / "preview.wav"
         try:
@@ -607,32 +704,61 @@ def _saved_note(workdir: Path) -> str:
     return ""
 
 
-def _install(assets: Sequence[Asset], root: Path, *, assume_yes: bool) -> None:
-    missing = [asset for asset in assets if not is_installed(asset, root)]
-    if not missing:
-        return
-    total = sum(asset.size for asset in missing)
-    print("Tomecast needs to download these once:")
-    for asset in missing:
-        print(f"  • {asset.name} ({_megabytes(asset.size)})")
-    print(f"Total: {_megabytes(total)}, saved in {root}")
-    if not assume_yes:
+def _prepare(use_gpu: bool, root: Path, *, assume_yes: bool) -> None:
+    """Download what a run needs (after asking), and switch to new engine builds only once
+    they pass their self-check. Prints a note when an update was kept back."""
+
+    def consent(missing: Sequence[Asset], updates: bool) -> bool:
+        total = sum(asset.size for asset in missing)
+        print(
+            "Tomecast has an update to download:"
+            if updates
+            else "Tomecast needs to download these once:"
+        )
+        for asset in missing:
+            print(f"  • {asset.name} ({_megabytes(asset.size)})")
+        print(f"Total: {_megabytes(total)}, saved in {root}")
+        if assume_yes:
+            return True
         if not sys.stdin.isatty():
+            if updates:
+                print(
+                    "Note: Tomecast will keep using the version it has; run again with --yes "
+                    "to download the update."
+                )
+                return False
             raise CliError("downloads are needed; run again with --yes to allow them")
-        if input("Download now? [y/N] ").strip().lower() not in {"y", "yes"}:
-            raise CliError("nothing was downloaded, so the book can't be converted")
-    for asset in missing:
-        try:
-            ensure(asset, root, progress=_download_printer(asset.name, sys.stderr))
-        except DownloadError as error:
-            raise CliError(str(error)) from error
-        print(file=sys.stderr)
+        if input("Download now? [y/N] ").strip().lower() in {"y", "yes"}:
+            return True
+        if updates:
+            print("Tomecast will keep using the version it has.")
+            return False
+        raise CliError("nothing was downloaded, so the book can't be converted")
+
+    def checking() -> None:
+        print("Checking the new voice engine on this computer (a few seconds)…")
+
+    try:
+        prepared = prepare_voice(
+            root, use_gpu, consent=consent, on_download=_download_printer, on_check=checking
+        )
+    except DownloadError as error:
+        raise CliError(str(error)) from error
+    for note in prepared.notes:
+        print(f"Note: {note}")
 
 
-def _download_printer(name: str, stream: TextIO) -> ProgressCallback:
+def _download_printer(asset: Asset, number: int, count: int) -> ProgressCallback:
+    stream: TextIO = sys.stderr
+    finished = False
+
     def show(done: int, total: int) -> None:
+        nonlocal finished
         percent = 100 * done // total if total else 100
-        stream.write(f"\r  Downloading {name}: {percent}% of {_megabytes(total)}")
+        stream.write(f"\r  Downloading {asset.name}: {percent}% of {_megabytes(total)}")
+        if done >= total and not finished:
+            finished = True
+            stream.write("\n")
         stream.flush()
 
     return show

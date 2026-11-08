@@ -1,6 +1,9 @@
 import array
 import fcntl
+import hashlib
+import io
 import math
+import tarfile
 import wave
 from collections.abc import Sequence
 from pathlib import Path
@@ -13,9 +16,11 @@ from format_factory import book_in_format
 from pdf_factory import PageBuilder, build_pdf
 
 from tomecast import __version__, cli
-from tomecast.downloads import Asset
+from tomecast.downloads import Asset, build_in_use
+from tomecast.engines import audiocpp
 from tomecast.engines.audiocpp import EngineError
 from tomecast.hardware import GpuDevice
+from tomecast.speed import Speeds
 from tomecast.workdirs import work_folder
 
 
@@ -74,7 +79,8 @@ class FakeKokoro:
 def no_real_engine(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(cli, "AutoKokoro", FakeKokoro)
     monkeypatch.setattr(cli, "check_system", lambda: None)
-    monkeypatch.setattr(cli, "required_assets", lambda use_gpu: ())
+    monkeypatch.setattr(audiocpp, "required_assets", lambda use_gpu: ())
+    monkeypatch.setattr(cli, "engine_speed", lambda root, engine, measuring=None: None)
     monkeypatch.setattr(cli, "vulkan_possible", lambda: False)
     monkeypatch.setattr(cli, "data_dir", lambda: tmp_path / "data")
     FakeKokoro.fail_with = None
@@ -209,7 +215,7 @@ def test_downloads_need_permission_when_not_interactive(
     asset = Asset(
         "Kokoro voice model", "https://example.invalid/m.gguf", "0" * 64, 190_000_000, "m"
     )
-    monkeypatch.setattr(cli, "required_assets", lambda use_gpu: (asset,))
+    monkeypatch.setattr(audiocpp, "required_assets", lambda use_gpu: (asset,))
     monkeypatch.setattr("sys.stdin.isatty", lambda: False)
 
     assert cli.main(["convert", str(_epub(tmp_path))]) == 1
@@ -411,6 +417,11 @@ def test_doctor_lists_devices_when_the_vulkan_engine_is_installed(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setattr(cli, "is_installed", lambda asset, root: "graphics" in asset.name)
+    monkeypatch.setattr(
+        cli,
+        "build_in_use",
+        lambda asset, root: root / "engines" / "vulkan" if "graphics" in asset.name else None,
+    )
     monkeypatch.setattr(
         cli,
         "list_devices",
@@ -759,3 +770,168 @@ def test_convert_rejects_an_unknown_footnote_choice(
     with pytest.raises(SystemExit):
         cli.main(["convert", str(_pdf(tmp_path)), "--footnotes", "inline"])
     assert "invalid choice: 'inline'" in capsys.readouterr().err
+
+
+# --- engine updates, speed and estimates ------------------------------------------------------
+
+
+def _engine_update(tmp_path: Path) -> tuple[Asset, Path]:
+    """An engine whose 0.1.x build is installed, with a newer build pinned (downloadable from
+    a local file). Returns the asset and the old build's folder."""
+    root = tmp_path / "data"
+    legacy = root / "engines" / "engine-0.1"
+    legacy.mkdir(parents=True)
+    (legacy / ".tomecast-sha256").write_text("e" * 64 + "\n")
+    archive = tmp_path / "new-engine.tar.gz"
+    with tarfile.open(archive, "w:gz") as tar:
+        data = b"new build"
+        info = tarfile.TarInfo("audiocpp_server")
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+    blob = archive.read_bytes()
+    asset = Asset(
+        "audio.cpp voice engine (CPU)", archive.as_uri(), hashlib.sha256(blob).hexdigest(),
+        len(blob), "engines/engine", archive="tar.gz", replaces=("engines/engine-0.1",),
+        id="audiocpp-cpu",
+    )  # fmt: skip
+    return asset, legacy
+
+
+def test_convert_shows_the_estimate_before_converting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    measured: list[object] = []
+
+    def speed(root: Path, engine: object, measuring: object = None) -> float:
+        measured.append(engine)
+        return 4.0
+
+    monkeypatch.setattr(cli, "engine_speed", speed)
+
+    assert cli.main(["convert", str(_epub(tmp_path))]) == 0
+
+    out = capsys.readouterr().out
+    assert "Under 1 min of audio, under 1 min to make here (4.0× real time)." in out
+    assert measured == FakeKokoro.made  # measured on the engine that converts
+    assert out.index("real time).") < out.index("Done:")
+
+
+def test_the_estimate_line_rounds_like_the_window() -> None:
+    hour = 158 * 60
+    assert cli._estimate_line(hour * 3, 1.0, 4.5) == (
+        "About 3 h 00 min of audio, about 40 min to make here (4.5× real time)."
+    )
+    assert cli._rough_minutes(0.4) == "under 1 min"
+    assert cli._rough_minutes(9.5) == "about 10 min"
+    assert cli._rough_minutes(167) == "about 2 h 47 min"
+
+
+def test_an_update_isnt_downloaded_without_permission_and_the_old_build_is_used(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    asset, legacy = _engine_update(tmp_path)
+    monkeypatch.setattr(audiocpp, "required_assets", lambda use_gpu: (asset,))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+
+    assert cli.main(["convert", str(_epub(tmp_path))]) == 0  # a script keeps working
+
+    out = capsys.readouterr().out
+    assert "Tomecast has an update to download:" in out
+    assert "run again with --yes to download the update" in out
+    assert build_in_use(asset, tmp_path / "data") == legacy
+
+
+def test_an_update_that_fails_its_check_is_reported_and_the_old_build_kept(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    asset, legacy = _engine_update(tmp_path)
+    monkeypatch.setattr(audiocpp, "required_assets", lambda use_gpu: (asset,))
+    monkeypatch.setattr(audiocpp, "self_check", lambda root, gpu: lambda new, old: "crashed")
+
+    assert cli.main(["convert", str(_epub(tmp_path)), "--yes"]) == 0
+
+    out = capsys.readouterr().out
+    assert "Checking the new voice engine on this computer" in out
+    assert (
+        "Note: The voice engine update didn't work on this computer, so Tomecast kept using "
+        "the previous version."
+    ) in out
+    assert build_in_use(asset, tmp_path / "data") == legacy
+    assert (tmp_path / "story.m4b").is_file()  # and the book was still made
+
+
+def test_an_update_that_passes_is_switched_to(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    asset, legacy = _engine_update(tmp_path)
+    monkeypatch.setattr(audiocpp, "required_assets", lambda use_gpu: (asset,))
+    monkeypatch.setattr(audiocpp, "self_check", lambda root, gpu: lambda new, old: None)
+
+    assert cli.main(["convert", str(_epub(tmp_path)), "--yes"]) == 0
+
+    assert "Note:" not in capsys.readouterr().out
+    in_use = build_in_use(asset, tmp_path / "data")
+    assert in_use is not None and in_use.parent.name == "engine"
+    assert legacy.is_dir()  # kept as the fallback
+
+
+def test_doctor_says_when_an_update_failed_here(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    asset, _ = _engine_update(tmp_path)
+    monkeypatch.setattr(audiocpp, "required_assets", lambda use_gpu: (asset,))
+    monkeypatch.setattr(
+        audiocpp, "self_check", lambda root, gpu: lambda new, old: "illegal instruction\nmore"
+    )
+    monkeypatch.setattr(cli, "ASSETS", (asset,))
+    cli.main(["convert", str(_epub(tmp_path)), "--yes"])
+    capsys.readouterr()
+
+    assert cli.main(["doctor"]) == 0
+
+    out = capsys.readouterr().out
+    assert (
+        "audio.cpp voice engine (CPU): an older build (eeeeeeeeeeee); the update failed its "
+        "check here: illegal instruction"
+    ) in out
+
+
+def test_scan_tries_failed_updates_again_and_measures_the_speeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    asset, legacy = _engine_update(tmp_path)
+    monkeypatch.setattr(audiocpp, "required_assets", lambda use_gpu: (asset,))
+    results = ["crashed", None]  # fails in the conversion, then passes in the scan
+    monkeypatch.setattr(audiocpp, "self_check", lambda root, gpu: lambda n, o: results.pop(0))
+    monkeypatch.setattr(cli, "vulkan_possible", lambda: True)
+    probed: list[bool] = []
+
+    def fake_probe(root: Path, *, gpu: bool) -> Speeds:
+        probed.append(gpu)
+        return Speeds(cpu=4.6, gpu=19.8, gpu_description="NVIDIA RTX PRO 1000")
+
+    monkeypatch.setattr(cli, "probe", fake_probe)
+    root = tmp_path / "data"
+    cli.main(["convert", str(_epub(tmp_path)), "--yes"])
+    assert build_in_use(asset, root) == legacy
+    (root / "speeds.json").write_text("{}")
+
+    assert cli.main(["scan"]) == 0
+
+    out = capsys.readouterr().out
+    assert build_in_use(asset, root) != legacy  # tried again, and it passed
+    assert not (root / "speeds.json").exists()  # forgotten, so measured again
+    assert probed == [True]
+    assert "CPU, " in out and "about 4.6× real time." in out
+    assert "NVIDIA RTX PRO 1000: about 19.8× real time, 4.3× as fast as the CPU." in out
+
+
+def test_scan_without_a_card_says_so(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(cli, "vulkan_possible", lambda: True)
+    monkeypatch.setattr(cli, "probe", lambda root, gpu: Speeds(cpu=4.6))
+
+    assert cli.main(["scan"]) == 0
+
+    assert "Graphics card: not usable, so Tomecast uses the CPU." in capsys.readouterr().out
