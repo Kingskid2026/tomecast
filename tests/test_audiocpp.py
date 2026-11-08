@@ -3,20 +3,24 @@ import hashlib
 import json
 import platform
 import tarfile
+import time
 from pathlib import Path
 
 import pytest
 from fake_engine import write_fake_server
 
+from tomecast import downloads
 from tomecast.audio import wav_info
 from tomecast.downloads import (
     UPDATE_FAILED_NOTE,
     Asset,
+    Cancelled,
     Prepared,
     build_folder,
     build_in_use,
     failure,
     prepare,
+    waiting_check,
 )
 from tomecast.engines import audiocpp
 from tomecast.engines.audiocpp import (
@@ -597,8 +601,9 @@ def test_a_new_vulkan_build_must_voice_on_the_card_the_old_one_could(
     assert build_in_use(new, engine_root) == build_folder(old, engine_root)
     assert prepared.notes == (UPDATE_FAILED_NOTE,)
     assert "reported the cpu backend" in (failure(new, engine_root) or "")
-    # The new one on the card, then the old one on the card (it worked, so the new one failed).
-    assert _checks(tmp_path) == [(new.sha256[:12], "vulkan"), (old.sha256[:12], "vulkan")]
+    # The new one on the card, then the old one on the card (it worked, so the new one
+    # failed), and the same once more before the failure is recorded.
+    assert _checks(tmp_path) == [(new.sha256[:12], "vulkan"), (old.sha256[:12], "vulkan")] * 2
     config = _starts(tmp_path)[0]["config"]
     assert config["device"] == 0  # type: ignore[index]  # the discrete card, as a run would
 
@@ -615,7 +620,7 @@ def test_a_new_vulkan_build_must_load_the_voice_on_the_card(
     assert "not on the graphics card" in (failure(new, engine_root) or "")
 
 
-def test_when_the_card_fails_with_every_build_the_new_one_is_checked_on_the_cpu(
+def test_when_the_card_fails_with_every_build_nothing_is_switched_or_blamed(
     tmp_path: Path, engine_root: Path, with_devices: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     old = _engine_build(tmp_path, "old", gpu=True)
@@ -624,12 +629,18 @@ def test_when_the_card_fails_with_every_build_the_new_one_is_checked_on_the_cpu(
 
     prepared = _update(engine_root, old, new, gpu=True)
 
-    assert prepared.switched == (new,)  # the driver is the problem, not the update
-    assert _checks(tmp_path) == [
-        (new.sha256[:12], "vulkan"),
-        (old.sha256[:12], "vulkan"),
-        (new.sha256[:12], "cpu"),
-    ]
+    # The card is the problem, not the update: no switch (never on a CPU check while there's
+    # a card), nothing recorded, no note, and the next run checks again.
+    assert prepared.switched == ()
+    assert prepared.notes == ()
+    assert build_in_use(new, engine_root) == build_folder(old, engine_root)
+    assert failure(new, engine_root) is None
+    assert waiting_check(new, engine_root)
+    assert _checks(tmp_path) == [(new.sha256[:12], "vulkan"), (old.sha256[:12], "vulkan")]
+
+    monkeypatch.delenv("FAKE_CRASH_VULKAN")  # the driver works again
+    again = prepare([new, ESPEAK_NG], engine_root, check=audiocpp.self_check(engine_root, True))
+    assert again.switched == (new,)
 
 
 def test_without_a_card_a_vulkan_build_is_checked_on_the_cpu(
@@ -656,3 +667,137 @@ def test_an_engine_made_before_the_switch_starts_the_new_build(
         pass
 
     assert _checks(tmp_path)[-1] == (new.sha256[:12], "cpu")
+
+
+# --- After the review: one build per run, real time limits, stopping -------------------------
+
+
+def _two_cpu_builds(root: Path) -> tuple[Path, Path]:
+    """An older CPU build in use (A) and the pinned one (B) on disk beside it."""
+    old = root / AUDIOCPP_CPU.path / ("a" * 12)
+    new = build_folder(AUDIOCPP_CPU, root)
+    for folder, sha in ((old, "a" * 64), (new, AUDIOCPP_CPU.sha256)):
+        folder.mkdir(parents=True)
+        (folder / ".tomecast-sha256").write_text(sha + "\n")
+        write_fake_server(folder / "audiocpp_server")
+    prepare([AUDIOCPP_CPU], root, check=lambda n, o: "not yet")  # A stays, B waits
+    assert build_in_use(AUDIOCPP_CPU, root) == old
+    return old, new
+
+
+def test_a_crash_restart_mid_book_uses_the_same_build(tmp_path: Path, engine_root: Path) -> None:
+    old, new = _two_cpu_builds(engine_root)
+    with KokoroServer(engine_root, startup_timeout=20) as engine:
+        # Another Tomecast switches to B while this one is voicing a book with A...
+        downloads._promote(AUDIOCPP_CPU, engine_root, proven=False)
+        process = engine._process
+        assert process is not None
+        process.kill()  # ...and then A crashes
+        process.wait()
+        engine.synthesize("Hello there, this is a sentence.", tmp_path / "x.wav")
+    assert build_in_use(AUDIOCPP_CPU, engine_root) == new
+    builds = [Path(str(start["exe"])).parent for start in _starts(tmp_path)]
+    assert builds == [old, old]  # restarted with A: one book, one build
+
+
+def test_an_engine_runs_the_builds_prepare_chose(tmp_path: Path, engine_root: Path) -> None:
+    old, _ = _two_cpu_builds(engine_root)
+    downloads._promote(AUDIOCPP_CPU, engine_root, proven=False)  # B is in use now...
+    espeak = build_folder(ESPEAK_NG, engine_root)
+    with KokoroServer(engine_root, builds={"audiocpp-cpu": old, "espeak-ng": espeak}) as engine:
+        assert engine.builds == {"audiocpp-cpu": old, "espeak-ng": espeak}
+    assert Path(str(_starts(tmp_path)[0]["exe"])).parent == old  # ...but the run uses A
+
+
+def test_the_self_check_gives_a_new_build_a_real_runs_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    made: list[dict[str, object]] = []
+
+    class Recording(KokoroServer):
+        def __init__(self, root: Path, **kwargs: object) -> None:
+            made.append(kwargs)
+            raise EngineError("stop here")
+
+    monkeypatch.setattr(audiocpp, "KokoroServer", Recording)
+    audiocpp.check_build(tmp_path, tmp_path, None, backend="vulkan", device=0)
+
+    assert "startup_timeout" not in made[0] and "request_timeout" not in made[0]
+    defaults = KokoroServer(tmp_path)
+    assert (defaults._startup_timeout, defaults._request_timeout) == (120.0, 300.0)
+
+
+def test_a_start_up_can_be_cancelled(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("FAKE_LOG", str(tmp_path / "fake.log"))
+    slow = write_fake_server(tmp_path / "audiocpp_server", {"FAKE_START_DELAY": "30"})
+    started = time.monotonic()
+    stop_at = started + 0.5
+
+    with pytest.raises(Cancelled):
+        KokoroServer(
+            tmp_path / "data", executable=slow, cancelled=lambda: time.monotonic() > stop_at
+        ).start()
+    assert time.monotonic() - started < 5
+
+
+def test_a_cancelled_self_check_is_not_a_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FAKE_LOG", str(tmp_path / "fake.log"))
+    folder = tmp_path / "build"
+    folder.mkdir()
+    write_fake_server(folder / "audiocpp_server", {"FAKE_START_DELAY": "30"})
+    stop_at = time.monotonic() + 0.5
+
+    with pytest.raises(Cancelled):
+        audiocpp.check_build(
+            tmp_path / "data", folder, None, backend="cpu",
+            cancelled=lambda: time.monotonic() > stop_at,
+        )  # fmt: skip
+
+
+def test_closing_the_window_stops_every_engine_at_once(
+    tmp_path: Path, fake_server: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+
+    monkeypatch.setenv("FAKE_DELAY", "20")  # a request that would take 20 s
+    engine = KokoroServer(tmp_path / "data", executable=fake_server, startup_timeout=20)
+    engine.start()
+    errors: list[BaseException] = []
+
+    def voice() -> None:
+        try:
+            engine.synthesize("This takes a while to say.", tmp_path / "x.wav")
+        except BaseException as error:
+            errors.append(error)
+
+    thread = threading.Thread(target=voice)
+    thread.start()
+    time.sleep(0.5)  # the request is under way
+    started = time.monotonic()
+    audiocpp.stop_all_engines()
+    thread.join(timeout=10)
+    engine.close()
+
+    assert not thread.is_alive()
+    assert time.monotonic() - started < 5  # cut off, not waited for
+    assert len(errors) == 1 and isinstance(errors[0], Cancelled)  # and not restarted
+    assert len(_starts(tmp_path)) == 1
+
+
+def test_an_aborted_engine_is_not_restarted(tmp_path: Path, fake_server: Path) -> None:
+    with KokoroServer(tmp_path / "data", executable=fake_server, startup_timeout=20) as engine:
+        engine.abort()
+        assert engine._process is not None
+        engine._process.wait(timeout=10)
+        with pytest.raises(Cancelled):
+            engine.synthesize("Anyone there?", tmp_path / "x.wav")
+    assert len(_starts(tmp_path)) == 1
+
+
+def test_loaded_device_reads_audiocpps_reply(tmp_path: Path, fake_server: Path) -> None:
+    with KokoroServer(
+        tmp_path / "data", executable=fake_server, backend="vulkan", device=1, startup_timeout=20
+    ) as engine:
+        assert engine.loaded_device() == 1

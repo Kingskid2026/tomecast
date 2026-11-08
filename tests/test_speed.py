@@ -10,7 +10,8 @@ from pathlib import Path
 import pytest
 from fake_engine import write_fake_server
 
-from tomecast.downloads import build_folder
+from tomecast import speed as speed_module
+from tomecast.downloads import FAILURE_DAYS, Cancelled, build_folder
 from tomecast.engines import audiocpp
 from tomecast.engines.audiocpp import (
     AUDIOCPP_CPU,
@@ -226,3 +227,87 @@ def test_the_estimates() -> None:
 
 def test_the_speed_test_sentences_fit_in_one_request() -> None:
     assert all(len(text) <= audiocpp.MAX_CHARS for text in (WARM_UP, *SAMPLE))
+
+
+# --- After the review: failed measurements, time limits, the card switched off ---------------
+
+
+def test_a_card_that_fails_the_speed_test_isnt_started_again_on_every_launch(
+    tmp_path: Path, installed: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FAKE_DEVICES", DEVICES)
+    monkeypatch.setenv("FAKE_CRASH_VULKAN", "1")
+
+    for _ in range(3):  # three window launches
+        assert probe(installed, gpu=True).gpu is None
+
+    on_card = [s for s in _starts(tmp_path) if s["config"]["backend"] == "vulkan"]  # type: ignore[index]
+    assert len(on_card) == 1  # remembered as failed: tried again in a few days, or on `scan`
+    forget_speeds(installed)
+    probe(installed, gpu=True)
+    on_card = [s for s in _starts(tmp_path) if s["config"]["backend"] == "vulkan"]  # type: ignore[index]
+    assert len(on_card) == 2
+
+
+def test_a_failed_measurement_is_tried_again_after_a_few_days(
+    tmp_path: Path, installed: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FAKE_CRASH", "1")
+    assert probe(installed, gpu=False).cpu is None
+    monkeypatch.delenv("FAKE_CRASH")
+    assert probe(installed, gpu=False).cpu is None  # not yet
+
+    later = time.time() + (FAILURE_DAYS + 0.1) * 86400
+    monkeypatch.setattr("time.time", lambda: later)
+    assert probe(installed, gpu=False).cpu is not None
+
+
+def test_the_probe_gives_a_hung_engine_short_time_limits(
+    tmp_path: Path, installed: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FAKE_DELAY", "30")  # every request hangs
+    monkeypatch.setattr(speed_module, "PROBE_REQUEST_TIMEOUT", 0.5)
+    started = time.monotonic()
+
+    assert probe(installed, gpu=False).cpu is None
+
+    assert time.monotonic() - started < 10
+    assert speed_module.PROBE_STARTUP_TIMEOUT <= 30 and speed_module.PROBE_REQUEST_TIMEOUT <= 30
+
+
+def test_a_probe_stopped_by_the_user_records_nothing(
+    tmp_path: Path, installed: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FAKE_START_DELAY", "30")
+    stop_at = time.monotonic() + 0.5
+
+    with pytest.raises(Cancelled):
+        probe(installed, gpu=False, cancelled=lambda: time.monotonic() > stop_at)
+
+    assert not (installed / "speeds.json").exists()
+
+
+def test_without_the_card_the_probe_never_touches_it(
+    tmp_path: Path, installed: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    listed: list[object] = []
+
+    def list_devices(executable: object) -> list[object]:
+        listed.append(executable)
+        return []
+
+    monkeypatch.setattr(speed_module, "list_devices", list_devices)
+
+    probe(installed, gpu=False)
+
+    assert listed == []
+    assert all(s["config"]["backend"] == "cpu" for s in _starts(tmp_path))  # type: ignore[index]
+
+
+def test_engine_speed_remembers_a_failure_too(tmp_path: Path, installed: Path) -> None:
+    with KokoroServer(installed, startup_timeout=20) as engine:
+        engine.close()
+        assert engine_speed(installed, engine) is None
+        told: list[str] = []
+        assert engine_speed(installed, engine, measuring=lambda: told.append("x")) is None
+        assert told == []  # not measured again

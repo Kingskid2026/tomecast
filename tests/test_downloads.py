@@ -1,8 +1,14 @@
 import dataclasses
+import fcntl
 import hashlib
+import http.client
 import io
 import json
+import os
+import shutil
 import tarfile
+import threading
+import time
 import zipfile
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
@@ -12,13 +18,18 @@ import pytest
 
 from tomecast import downloads
 from tomecast.downloads import (
+    FAILURE_DAYS,
     UPDATE_FAILED_NOTE,
     UPDATE_NOT_DOWNLOADED_NOTE,
     Asset,
+    Cancelled,
+    CheckResult,
     DownloadDeclined,
     DownloadError,
+    Inconclusive,
     Prepared,
     ProgressCallback,
+    VoiceCheck,
     build_folder,
     build_in_use,
     build_sha256,
@@ -29,8 +40,11 @@ from tomecast.downloads import (
     installed_sha256,
     is_installed,
     is_usable,
+    mark_proven,
     needs_download,
     prepare,
+    roll_back,
+    version_key,
     waiting_check,
 )
 from tomecast.manifest import AUDIOCPP_VULKAN, ESPEAK_NG
@@ -188,18 +202,19 @@ def _build(tmp_path: Path, name: str, server: bytes = b"#!/bin/sh\n", **fields: 
 
 
 class Check:
-    """A self-check that records what it was asked to check, and passes or fails."""
+    """A self-check that records what it was asked to check, and gives these results in turn
+    (the last one from then on)."""
 
-    def __init__(self, problem: str | None = None) -> None:
-        self.problem = problem
+    def __init__(self, *results: CheckResult) -> None:
+        self.results = list(results) or [None]
         self.calls: list[tuple[dict[str, Path], dict[str, Path]]] = []
         self.during: Callable[[], None] | None = None  # runs while "checking"
 
-    def __call__(self, new: Mapping[str, Path], old: Mapping[str, Path]) -> str | None:
+    def __call__(self, new: Mapping[str, Path], old: Mapping[str, Path]) -> CheckResult:
         self.calls.append((dict(new), dict(old)))
         if self.during:
             self.during()
-        return self.problem
+        return self.results.pop(0) if len(self.results) > 1 else self.results[0]
 
 
 def _version(root: Path, asset: Asset) -> str:
@@ -229,7 +244,7 @@ def test_a_first_install_is_used_without_a_check(tmp_path: Path) -> None:
     assert build_in_use(asset, root) == build_folder(asset, root)
     assert _version(root, asset) == "v1"
     assert is_installed(asset, root)
-    assert prepared == Prepared()
+    assert prepared == Prepared(builds={"engine": build_folder(asset, root)})
 
 
 def test_a_new_build_goes_beside_the_old_one_and_is_used_once_it_passes(tmp_path: Path) -> None:
@@ -447,12 +462,11 @@ def test_new_builds_of_several_archives_are_checked_together(tmp_path: Path) -> 
 
     prepare([engine_2, rules_2], root, check=check)
 
-    assert check.calls == [
-        (
-            {"engine": build_folder(engine_2, root), "rules": build_folder(rules_2, root)},
-            {"engine": build_folder(engine_1, root), "rules": build_folder(rules_1, root)},
-        )
-    ]
+    together = (
+        {"engine": build_folder(engine_2, root), "rules": build_folder(rules_2, root)},
+        {"engine": build_folder(engine_1, root), "rules": build_folder(rules_1, root)},
+    )
+    assert check.calls == [together, together]  # failed, so tried once more
     assert (_version(root, engine_2), _version(root, rules_2)) == ("e1", "r1")
 
 
@@ -622,3 +636,334 @@ def test_after_the_upgrade_the_old_build_goes_once_a_newer_one_passes(tmp_path: 
     assert not legacy.exists()
     assert build_sha256(build_folder(ours, root)) == ours.sha256  # now the fallback
     assert build_in_use(after, root) == build_folder(after, root)
+
+
+# --- After the review: rollback, fairness, two versions, safe deletes ----------------------------
+
+
+def _switched(tmp_path: Path, root: Path) -> tuple[Asset, Asset, Prepared]:
+    """v1 in use, then v2 switched to after passing its check (it hasn't run a book yet)."""
+    old, new = _build(tmp_path, "v1"), _build(tmp_path, "v2")
+    prepare([old], root, check=Check())
+    prepared = prepare([new], root, check=Check())
+    assert prepared.switched == (new,)
+    return old, new, prepared
+
+
+def test_a_switched_build_that_fails_a_real_run_is_rolled_back(tmp_path: Path) -> None:
+    root = tmp_path / "data"
+    old, new, prepared = _switched(tmp_path, root)
+    assert prepared.builds == {"engine": build_folder(new, root)}
+
+    assert roll_back(root, prepared.builds, "the voice engine keeps crashing")
+
+    assert _version(root, new) == "v1"  # the next run uses the build that worked
+    assert failure(new, root) == "the voice engine keeps crashing"
+    check = Check()
+    again = prepare([new], root, check=check)
+    assert check.calls == []  # the bad build isn't picked (or downloaded) again
+    assert again.builds == {"engine": build_folder(old, root)}
+    assert build_sha256(build_folder(new, root)) == new.sha256  # kept, for a retry later
+
+
+def test_a_build_that_has_finished_a_run_is_not_rolled_back(tmp_path: Path) -> None:
+    root = tmp_path / "data"
+    _, new, prepared = _switched(tmp_path, root)
+    mark_proven(root, prepared.builds)
+
+    assert not roll_back(root, prepared.builds, "out of graphics memory")
+
+    assert _version(root, new) == "v2"
+    assert failure(new, root) is None
+
+
+def test_only_the_build_the_run_used_is_rolled_back(tmp_path: Path) -> None:
+    root = tmp_path / "data"
+    old, new, _ = _switched(tmp_path, root)
+
+    assert not roll_back(root, {"engine": build_folder(old, root)}, "it failed")
+    assert _version(root, new) == "v2"
+
+
+def test_a_first_install_has_nothing_to_roll_back_to(tmp_path: Path) -> None:
+    root = tmp_path / "data"
+    asset = _build(tmp_path, "v1")
+    prepared = prepare([asset], root, check=Check())
+
+    assert not roll_back(root, prepared.builds, "it failed")
+    assert _version(root, asset) == "v1"
+
+
+def test_a_failed_check_is_tried_once_more_before_it_counts(tmp_path: Path) -> None:
+    root = tmp_path / "data"
+    old, new = _build(tmp_path, "v1"), _build(tmp_path, "v2")
+    prepare([old], root, check=Check())
+    check = Check("the engine didn't start within 120s", None)  # a slow first start
+
+    prepared = prepare([new], root, check=check)
+
+    assert len(check.calls) == 2
+    assert prepared.switched == (new,)
+    assert prepared.notes == ()
+
+
+def test_a_recorded_failure_expires_after_a_few_days(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "data"
+    old, new = _build(tmp_path, "v1"), _build(tmp_path, "v2")
+    prepare([old], root, check=Check())
+    prepare([new], root, check=Check("busy"))
+    assert not waiting_check(new, root)
+
+    now = time.time()
+    monkeypatch.setattr("time.time", lambda: now + (FAILURE_DAYS - 0.5) * 86400)
+    assert not waiting_check(new, root)
+    monkeypatch.setattr("time.time", lambda: now + (FAILURE_DAYS + 0.5) * 86400)
+    assert waiting_check(new, root)
+    assert prepare([new], root, check=Check()).switched == (new,)
+
+
+def test_no_verdict_switches_nothing_records_nothing_and_checks_again(tmp_path: Path) -> None:
+    root = tmp_path / "data"
+    old, new = _build(tmp_path, "v1"), _build(tmp_path, "v2")
+    prepare([old], root, check=Check())
+    unsure = Check(Inconclusive("the graphics card didn't work with any build"))
+
+    prepared = prepare([new], root, check=unsure)
+
+    assert len(unsure.calls) == 1  # no retry: it isn't a failure
+    assert (prepared.switched, prepared.notes) == ((), ())
+    assert _version(root, new) == "v1"
+    assert failure(new, root) is None
+    assert waiting_check(new, root)
+    assert prepare([new], root, check=Check()).switched == (new,)  # the next run
+
+
+def test_each_build_is_judged_by_the_voices_that_use_it_and_they_switch_together(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "data"
+    engine_1, engine_2 = _build(tmp_path, "e1"), _build(tmp_path, "e2")
+    rules_1 = _build(tmp_path, "r1", id="rules", path="engines/rules", replaces=())
+    rules_2 = _build(tmp_path, "r2", id="rules", path="engines/rules", replaces=())
+    prepare([engine_1, rules_1], root, check=Check())
+    kokoro, ming = Check(), Check("Ming made silence")
+    checks = [
+        VoiceCheck("Kokoro", frozenset({"engine", "rules"}), kokoro),
+        VoiceCheck("Ming", frozenset({"engine"}), ming),
+    ]
+
+    prepared = prepare([engine_2, rules_2], root, check=checks)
+
+    assert len(kokoro.calls) == 1 and len(ming.calls) == 2  # Ming's failure was retried
+    assert failure(engine_2, root) == "Ming: Ming made silence"
+    assert failure(rules_2, root) is None  # only the engine is blamed...
+    assert (_version(root, engine_2), _version(root, rules_2)) == ("e1", "r1")  # ...but neither
+    assert prepared.notes == (UPDATE_FAILED_NOTE,)
+
+    # The next run checks the new eSpeak-like build with the engine in use.
+    kokoro_again = Check()
+    checks = [
+        VoiceCheck("Kokoro", frozenset({"engine", "rules"}), kokoro_again),
+        VoiceCheck("Ming", frozenset({"engine"}), Check()),
+    ]
+    assert prepare([engine_2, rules_2], root, check=checks).switched == (rules_2,)
+    new, _ = kokoro_again.calls[0]
+    assert new == {"engine": build_folder(engine_1, root), "rules": build_folder(rules_2, root)}
+
+
+def test_a_build_no_voice_uses_is_never_switched_to_unchecked(tmp_path: Path) -> None:
+    root = tmp_path / "data"
+    old, new = _build(tmp_path, "v1"), _build(tmp_path, "v2")
+    prepare([old], root, check=Check())
+    ming = Check()
+
+    prepared = prepare([new], root, check=[VoiceCheck("Ming", frozenset({"other"}), ming)])
+
+    assert ming.calls == []
+    assert prepared.switched == ()
+    assert _version(root, new) == "v1"
+
+
+def test_an_older_tomecast_never_switches_away_from_a_newer_ones_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "data"
+    ours, theirs = _build(tmp_path, "ours"), _build(tmp_path, "theirs")
+    monkeypatch.setattr(downloads, "__version__", "0.2.0")
+    prepare([ours], root, check=Check())
+    monkeypatch.setattr(downloads, "__version__", "0.3.0")  # the newer CLI runs
+    assert prepare([theirs], root, check=Check()).switched == (theirs,)
+
+    monkeypatch.setattr(downloads, "__version__", "0.2.0")  # the older window still open
+    check = Check()
+    prepared = prepare([ours], root, check=check)
+
+    assert check.calls == []  # no check, no switch back
+    assert _version(root, ours) == "theirs"
+    assert prepared.builds == {"engine": build_folder(ours, root)}  # it runs its own build
+    monkeypatch.setattr(downloads, "__version__", "0.3.0")
+    again = prepare([theirs], root, check=check)
+    assert (check.calls, again.switched) == ([], ())  # and the newer one has nothing to undo
+    assert again.builds == {"engine": build_folder(theirs, root)}
+
+
+def test_an_older_tomecast_without_its_own_build_uses_the_newer_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "data"
+    theirs = _build(tmp_path, "theirs")
+    monkeypatch.setattr(downloads, "__version__", "0.3.0")
+    prepare([theirs], root, check=Check())
+    monkeypatch.setattr(downloads, "__version__", "0.2.0")
+    ours = _build(tmp_path, "ours")
+    Path(ours.url.removeprefix("file://")).unlink()  # a download would fail
+
+    prepared = prepare([ours], root, check=Check())
+
+    assert not needs_download(ours, root)
+    assert prepared.builds == {"engine": build_folder(theirs, root)}
+
+
+def test_versions_compare_as_numbers_with_pre_releases_first() -> None:
+    assert version_key("0.2.0") < version_key("0.10.0")
+    assert version_key("0.2.0rc1") < version_key("0.2.0") < version_key("0.2.1")
+    assert version_key("1.0") == version_key("1.0.0")
+
+
+def test_a_half_deleted_build_never_looks_complete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "data"
+    v1, v2, v3 = (_build(tmp_path, f"v{n}") for n in range(1, 4))
+    prepare([v1], root, check=Check())
+    prepare([v2], root, check=Check())
+    real_rmtree = shutil.rmtree
+
+    def killed_halfway(path: object, *args: object, **kwargs: object) -> None:
+        if not Path(str(path)).name.startswith(".download-old-"):
+            return real_rmtree(path, *args, **kwargs)  # type: ignore[call-overload,no-any-return]
+        (Path(str(path)) / "VERSION").unlink()  # some files gone, then the power cut
+        raise SystemExit("killed")
+
+    monkeypatch.setattr("shutil.rmtree", killed_halfway)
+    with pytest.raises(SystemExit):
+        prepare([v3], root, check=Check())  # v3 passes; deleting v1 is interrupted
+    monkeypatch.setattr("shutil.rmtree", real_rmtree)
+
+    v1_folder = build_folder(v1, root)
+    assert not v1_folder.exists()  # renamed away before anything was deleted
+    leftovers = list((root / "engines" / "engine").glob(".download-*"))
+    assert len(leftovers) == 1 and build_sha256(leftovers[0]) == v1.sha256
+    assert _version(root, v3) == "v3"
+    prepare([v3], root, check=Check())  # the next run tidies it away
+    assert not any((root / "engines" / "engine").glob(".download-*"))
+
+
+def test_a_download_cut_off_mid_way_keeps_the_old_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "data"
+    old, new = _build(tmp_path, "v1"), _build(tmp_path, "v2")
+    prepare([old], root, check=Check())
+
+    class CutOff(io.BytesIO):
+        def read(self, size: int | None = -1) -> bytes:
+            raise http.client.IncompleteRead(b"part", 100)
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: CutOff())
+
+    prepared = prepare([new], root, check=Check())
+
+    assert prepared.notes == (UPDATE_NOT_DOWNLOADED_NOTE,)
+    assert _version(root, new) == "v1"
+
+
+def test_waiting_for_another_tomecast_can_be_cancelled(tmp_path: Path) -> None:
+    root = tmp_path / "data"
+    root.mkdir()
+    asset = _build(tmp_path, "v1")
+    with (root / ".install.lock").open("w") as other:  # another Tomecast is installing
+        fcntl.flock(other, fcntl.LOCK_EX)
+        started = time.monotonic()
+        with pytest.raises(Cancelled):
+            prepare(
+                [asset], root, check=Check(), cancelled=lambda: time.monotonic() > started + 0.3
+            )
+        assert time.monotonic() - started < 3
+    assert build_in_use(asset, root) is None
+
+
+def test_waiting_for_another_tomecast_goes_on_once_it_is_done(tmp_path: Path) -> None:
+    root = tmp_path / "data"
+    root.mkdir()
+    asset = _build(tmp_path, "v1")
+    other = (root / ".install.lock").open("w")
+    fcntl.flock(other, fcntl.LOCK_EX)
+    threading.Timer(0.4, other.close).start()  # it finishes and lets go
+
+    prepare([asset], root, check=Check())
+
+    assert _version(root, asset) == "v1"
+
+
+def test_a_check_stopped_by_the_user_records_nothing(tmp_path: Path) -> None:
+    root = tmp_path / "data"
+    old, new = _build(tmp_path, "v1"), _build(tmp_path, "v2")
+    prepare([old], root, check=Check())
+    stopped = False
+
+    def stop_during_check() -> None:
+        nonlocal stopped
+        stopped = True  # Cancel pressed while the engine was starting
+
+    check = Check("the voice engine stopped while starting")
+    check.during = stop_during_check
+
+    with pytest.raises(Cancelled):
+        prepare([new], root, check=check, cancelled=lambda: stopped)
+
+    assert failure(new, root) is None
+    assert waiting_check(new, root)
+
+
+def test_a_verified_model_is_not_hashed_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "model.bin"
+    source.write_bytes(b"a big model")
+    asset = _file_asset(source)
+    root = tmp_path / "data"
+    ensure(asset, root)  # verified while downloading: its marker is written
+    hashed: list[Path] = []
+    real = downloads._sha256_of
+
+    def counting(path: Path) -> str:
+        hashed.append(path)
+        return real(path)
+
+    monkeypatch.setattr(downloads, "_sha256_of", counting)
+
+    assert is_installed(asset, root) and not needs_download(asset, root)
+    assert hashed == []
+    target = root / asset.path
+    target.write_bytes(b"a big modxl")  # changed (same size, new modification time)
+    os.utime(target, ns=(time.time_ns(), time.time_ns() + 10**9))
+    assert not is_installed(asset, root)
+    assert hashed == [target]
+
+
+def test_the_gui_check_never_hashes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    source = tmp_path / "model.bin"
+    source.write_bytes(b"a big model")
+    asset = _file_asset(source)
+    root = tmp_path / "data"
+    target = root / asset.path
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"a big model")  # put there by Tomecast 0.1.x: no marker yet
+    monkeypatch.setattr(downloads, "_sha256_of", lambda path: pytest.fail("hashed"))
+
+    assert not needs_download(asset, root, verify=False)  # the pinned size: counts for now
+    target.write_bytes(b"short")
+    assert needs_download(asset, root, verify=False)

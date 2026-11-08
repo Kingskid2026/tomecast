@@ -12,6 +12,7 @@ with it) change how it behaves:
 ``FAKE_SILENT``           voice silence instead of a tone
 ``FAKE_DIE_AFTER``        crash mid-request after this many requests (``FAKE_SLOW_EXIT``: slowly)
 ``FAKE_DELAY``            seconds each request takes
+``FAKE_START_DELAY``      seconds before it starts serving (a slow first start)
 """
 
 from __future__ import annotations
@@ -37,6 +38,7 @@ FAKE_SERVER = textwrap.dedent(
         k: v for k, v in os.environ.items() if k.startswith(("AUDIOCPP_", "TMPDIR"))
     }}) + "\\n")
     log.flush()
+    time.sleep(float(os.environ.get("FAKE_START_DELAY", "0")))  # a slow first start
     if os.environ.get("FAKE_CRASH") or (
         os.environ.get("FAKE_CRASH_VULKAN") and config["backend"] == "vulkan"
     ):
@@ -62,8 +64,12 @@ FAKE_SERVER = textwrap.dedent(
         def do_GET(self):
             if self.path == "/v1/models":
                 device = int(os.environ.get("FAKE_LOADED_DEVICE", config.get("device", 0)))
-                models = {"object": "list", "data": [
-                    {"id": "kokoro", "loaded": True, "device": device}]}
+                # audio.cpp 0.9.4's reply, checked on the AMD 860M (device 1) and the CPU.
+                models = {"object": "list", "data": [{
+                    "id": "kokoro", "object": "model", "owned_by": "engine",
+                    "family": "kokoro_tts", "task": "tts", "mode": "offline",
+                    "device": device, "loaded": True, "configured": True,
+                    "path": config["models"][0]["path"]}]}
                 self.send_response(200)
                 self.end_headers()
                 self.wfile.write(json.dumps(models).encode())

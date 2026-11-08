@@ -16,7 +16,7 @@ from format_factory import book_in_format
 from pdf_factory import PageBuilder, build_pdf
 
 from tomecast import __version__, cli
-from tomecast.downloads import Asset, build_in_use
+from tomecast.downloads import Asset, build_in_use, roll_back
 from tomecast.engines import audiocpp
 from tomecast.engines.audiocpp import EngineError
 from tomecast.hardware import GpuDevice
@@ -35,7 +35,10 @@ class FakeKokoro:
     gpu_warning: str | None = None  # set: a use_gpu run falls back to the CPU
     texts: ClassVar[list[str]] = []  # everything the voice was asked to say, across all instances
 
-    def __init__(self, root: Path, *, voice: str, speed: float, use_gpu: bool = False) -> None:
+    def __init__(
+        self, root: Path, *, voice: str, speed: float, use_gpu: bool = False, **kwargs: object
+    ) -> None:
+        self.kwargs = kwargs  # builds=..., as prepare() chose them
         self.label = f"Fake ({voice})"
         self.max_chars = 200
         self.sample_rate = 24000
@@ -631,8 +634,10 @@ def test_preview_passes_the_voice_and_speed_to_the_engine(
     seen: dict[str, object] = {}
 
     class Recording(FakeKokoro):
-        def __init__(self, root: Path, *, voice: str, speed: float, use_gpu: bool = False) -> None:
-            super().__init__(root, voice=voice, speed=speed, use_gpu=use_gpu)
+        def __init__(
+            self, root: Path, *, voice: str, speed: float, use_gpu: bool = False, **kwargs: object
+        ) -> None:
+            super().__init__(root, voice=voice, speed=speed, use_gpu=use_gpu, **kwargs)
             seen.update(voice=voice, speed=speed)
 
     monkeypatch.setattr(cli, "AutoKokoro", Recording)
@@ -775,7 +780,7 @@ def test_convert_rejects_an_unknown_footnote_choice(
 # --- engine updates, speed and estimates ------------------------------------------------------
 
 
-def _engine_update(tmp_path: Path) -> tuple[Asset, Path]:
+def _engine_update(tmp_path: Path, *, gpu: bool = False) -> tuple[Asset, Path]:
     """An engine whose 0.1.x build is installed, with a newer build pinned (downloadable from
     a local file). Returns the asset and the old build's folder."""
     root = tmp_path / "data"
@@ -792,7 +797,7 @@ def _engine_update(tmp_path: Path) -> tuple[Asset, Path]:
     asset = Asset(
         "audio.cpp voice engine (CPU)", archive.as_uri(), hashlib.sha256(blob).hexdigest(),
         len(blob), "engines/engine", archive="tar.gz", replaces=("engines/engine-0.1",),
-        id="audiocpp-cpu",
+        id="audiocpp-vulkan" if gpu else "audiocpp-cpu",
     )  # fmt: skip
     return asset, legacy
 
@@ -846,7 +851,7 @@ def test_an_update_that_fails_its_check_is_reported_and_the_old_build_kept(
 ) -> None:
     asset, legacy = _engine_update(tmp_path)
     monkeypatch.setattr(audiocpp, "required_assets", lambda use_gpu: (asset,))
-    monkeypatch.setattr(audiocpp, "self_check", lambda root, gpu: lambda new, old: "crashed")
+    monkeypatch.setattr(audiocpp, "self_check", lambda root, gpu, cancelled: lambda n, o: "crashed")
 
     assert cli.main(["convert", str(_epub(tmp_path)), "--yes"]) == 0
 
@@ -865,7 +870,7 @@ def test_an_update_that_passes_is_switched_to(
 ) -> None:
     asset, legacy = _engine_update(tmp_path)
     monkeypatch.setattr(audiocpp, "required_assets", lambda use_gpu: (asset,))
-    monkeypatch.setattr(audiocpp, "self_check", lambda root, gpu: lambda new, old: None)
+    monkeypatch.setattr(audiocpp, "self_check", lambda root, gpu, cancelled: lambda n, o: None)
 
     assert cli.main(["convert", str(_epub(tmp_path)), "--yes"]) == 0
 
@@ -881,7 +886,9 @@ def test_doctor_says_when_an_update_failed_here(
     asset, _ = _engine_update(tmp_path)
     monkeypatch.setattr(audiocpp, "required_assets", lambda use_gpu: (asset,))
     monkeypatch.setattr(
-        audiocpp, "self_check", lambda root, gpu: lambda new, old: "illegal instruction\nmore"
+        audiocpp,
+        "self_check",
+        lambda root, gpu, cancelled: lambda new, old: "illegal instruction\nmore",
     )
     monkeypatch.setattr(cli, "ASSETS", (asset,))
     cli.main(["convert", str(_epub(tmp_path)), "--yes"])
@@ -899,10 +906,11 @@ def test_doctor_says_when_an_update_failed_here(
 def test_scan_tries_failed_updates_again_and_measures_the_speeds(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    asset, legacy = _engine_update(tmp_path)
+    asset, legacy = _engine_update(tmp_path, gpu=True)
     monkeypatch.setattr(audiocpp, "required_assets", lambda use_gpu: (asset,))
-    results = ["crashed", None]  # fails in the conversion, then passes in the scan
-    monkeypatch.setattr(audiocpp, "self_check", lambda root, gpu: lambda n, o: results.pop(0))
+    # Fails in the conversion (and its one retry), then passes in the scan.
+    results = ["crashed", "crashed", None]
+    monkeypatch.setattr(audiocpp, "self_check", lambda root, gpu, c: lambda n, o: results.pop(0))
     monkeypatch.setattr(cli, "vulkan_possible", lambda: True)
     probed: list[bool] = []
 
@@ -930,8 +938,49 @@ def test_scan_without_a_card_says_so(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setattr(cli, "vulkan_possible", lambda: True)
-    monkeypatch.setattr(cli, "probe", lambda root, gpu: Speeds(cpu=4.6))
+    monkeypatch.setattr(cli, "probe", lambda root, gpu, cancelled=None: Speeds(cpu=4.6))
 
     assert cli.main(["scan"]) == 0
 
     assert "Graphics card: not usable, so Tomecast uses the CPU." in capsys.readouterr().out
+
+
+def test_an_update_that_crashes_on_the_book_is_rolled_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    asset, legacy = _engine_update(tmp_path)
+    monkeypatch.setattr(audiocpp, "required_assets", lambda use_gpu: (asset,))
+    monkeypatch.setattr(audiocpp, "self_check", lambda root, gpu, cancelled: lambda n, o: None)
+    FakeKokoro.fail_with = "the voice engine keeps crashing. Its log:\nSegmentation fault"
+    root = tmp_path / "data"
+
+    assert cli.main(["convert", str(_epub(tmp_path)), "--yes"]) == 1
+
+    err = capsys.readouterr().err
+    assert "keeps crashing" in err
+    assert (
+        "Note: The voice engine update didn't work on this computer, so Tomecast kept using "
+        "the previous version. Run the same command again to make the book with it."
+    ) in err
+    assert build_in_use(asset, root) == legacy
+    pinned = [made.kwargs["builds"] for made in FakeKokoro.made]
+    assert pinned == [{"audiocpp-cpu": root / asset.path / asset.sha256[:12]}]  # the new one
+
+    FakeKokoro.fail_with = None
+    assert cli.main(["convert", str(_epub(tmp_path)), "--yes"]) == 0  # the next run
+    assert FakeKokoro.made[-1].kwargs["builds"] == {"audiocpp-cpu": legacy}
+    assert "Checking the new voice engine" not in capsys.readouterr().out  # not tried again
+
+
+def test_a_finished_book_proves_the_new_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    asset, _ = _engine_update(tmp_path)
+    monkeypatch.setattr(audiocpp, "required_assets", lambda use_gpu: (asset,))
+    monkeypatch.setattr(audiocpp, "self_check", lambda root, gpu, cancelled: lambda n, o: None)
+    root = tmp_path / "data"
+    assert cli.main(["convert", str(_epub(tmp_path)), "--yes"]) == 0
+    builds = {"audiocpp-cpu": root / asset.path / asset.sha256[:12]}
+
+    assert not roll_back(root, builds, "a later failure is the book's fault, not the build's")
+    assert build_in_use(asset, root) == builds["audiocpp-cpu"]

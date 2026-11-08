@@ -27,7 +27,14 @@ from typing import Literal, Protocol
 from tomecast import __version__
 from tomecast.audio import wav_info
 from tomecast.book import Book, Chapter
-from tomecast.downloads import build_in_use, build_sha256, local_path
+from tomecast.downloads import (
+    FAILURE_DAYS,
+    Cancelled,
+    IsCancelled,
+    build_in_use,
+    build_sha256,
+    local_path,
+)
 from tomecast.engines.audiocpp import (
     AUDIOCPP_CPU,
     AUDIOCPP_VULKAN,
@@ -150,6 +157,14 @@ def known_speed(root: Path, key: str) -> float | None:
     return float(value) if isinstance(value, int | float) and value > 0 else None
 
 
+def failed_recently(root: Path, key: str) -> bool:
+    """True if the speed test for ``key`` failed less than :data:`FAILURE_DAYS` days ago, so
+    it isn't tried again yet (a card that crashes isn't started on every launch)."""
+    entry = _load(root).get(key)
+    when = entry.get("failed_at") if isinstance(entry, dict) else None
+    return isinstance(when, int | float) and time.time() - when < FAILURE_DAYS * 86400
+
+
 def remember_speed(root: Path, key: str, speedup: float) -> None:
     speeds = _load(root)
     speeds[key] = {
@@ -160,8 +175,20 @@ def remember_speed(root: Path, key: str, speedup: float) -> None:
     _save(root, speeds)
 
 
+def remember_failure(root: Path, key: str, reason: str) -> None:
+    """The speed test for ``key`` failed: don't try it again for a few days."""
+    speeds = _load(root)
+    speeds[key] = {
+        "failed_at": round(time.time()),
+        "reason": reason[-500:],
+        "tomecast": __version__,
+    }
+    _save(root, speeds)
+
+
 def forget_speeds(root: Path) -> None:
-    """Forget every measured speed, so each is measured again (``tomecast scan``)."""
+    """Forget every measured speed (and failed speed test), so each is measured again
+    (``tomecast scan``)."""
     (root / _SPEEDS).unlink(missing_ok=True)
 
 
@@ -170,7 +197,7 @@ def engine_speed(
 ) -> float | None:
     """How many times real time ``engine`` (already started) voices, on the build and device
     it uses: the speed measured before, or measured now on it (``measuring`` is called first).
-    ``None`` if the speed test failed; that never stops a conversion."""
+    ``None`` if the speed test failed (now, or recently); that never stops a conversion."""
     key = speed_key(
         engine.executable.parent,
         backend="vulkan" if engine.backend == "vulkan" else "cpu",
@@ -179,20 +206,26 @@ def engine_speed(
     )
     if (known := known_speed(root, key)) is not None:
         return known
+    if failed_recently(root, key):
+        return None
     if measuring:
         measuring()
     try:
         value = round(measure(engine), 2)  # as it's remembered, so every run shows the same
-    except EngineError:
+    except EngineError as error:
+        remember_failure(root, key, str(error))
         return None
     remember_speed(root, key, value)
     return value
 
 
-def probe(root: Path, *, gpu: bool) -> Speeds:
+def probe(root: Path, *, gpu: bool, cancelled: IsCancelled | None = None) -> Speeds:
     """The CPU's speed, and with ``gpu`` the graphics card's, using the builds in use. Each is
-    the one measured before, or measured now (starting the engine, a few seconds). Never
-    downloads or raises: anything not installed, or not working, is left out.
+    the one measured before, or measured now (starting the engine, a few seconds, with short
+    time limits). A failed measurement is remembered too, so it isn't tried again for a few
+    days. Never downloads or raises, except :class:`~tomecast.downloads.Cancelled` when
+    ``cancelled`` says the user stopped (closing the window); anything not installed, or not
+    working, is left out. With ``gpu`` false it doesn't touch the graphics card at all.
 
     The CPU speed is the CPU build's, or the graphics-card build's CPU backend if that is the
     only one installed (they are the same code).
@@ -200,13 +233,19 @@ def probe(root: Path, *, gpu: bool) -> Speeds:
     if not (local_path(KOKORO_Q8, root).is_file() and build_in_use(ESPEAK_NG, root)):
         return Speeds()
     cpu_build = build_in_use(AUDIOCPP_CPU, root) or build_in_use(AUDIOCPP_VULKAN, root)
-    cpu = _speed_on(root, cpu_build, "cpu", None, "") if cpu_build else None
+    cpu = _speed_on(root, cpu_build, "cpu", None, "", cancelled) if cpu_build else None
     vulkan = build_in_use(AUDIOCPP_VULKAN, root) if gpu else None
     device = pick_device(list_devices(vulkan / EXECUTABLE)) if vulkan else None
     if vulkan is None or device is None:
         return Speeds(cpu=cpu)
-    on_card = _speed_on(root, vulkan, "vulkan", device.index, device.description)
+    on_card = _speed_on(root, vulkan, "vulkan", device.index, device.description, cancelled)
     return Speeds(cpu, on_card, device.description if on_card is not None else "")
+
+
+# The probe runs at the window's start-up: an engine that hangs mustn't hold the window's
+# worker for long (a real conversion gives it 120 s to start and 300 s per request).
+PROBE_STARTUP_TIMEOUT = 30.0
+PROBE_REQUEST_TIMEOUT = 30.0
 
 
 def _speed_on(
@@ -215,17 +254,30 @@ def _speed_on(
     backend: Literal["cpu", "vulkan"],
     device: int | None,
     description: str,
+    cancelled: IsCancelled | None,
 ) -> float | None:
     threads = default_threads()
     key = speed_key(build, backend=backend, gpu_description=description, threads=threads)
     if (known := known_speed(root, key)) is not None:
         return known
+    if failed_recently(root, key):
+        return None
     try:
         with KokoroServer(
-            root, executable=build / EXECUTABLE, backend=backend, device=device, threads=threads
+            root,
+            executable=build / EXECUTABLE,
+            backend=backend,
+            device=device,
+            threads=threads,
+            startup_timeout=PROBE_STARTUP_TIMEOUT,
+            request_timeout=PROBE_REQUEST_TIMEOUT,
+            cancelled=cancelled,
         ) as engine:
             value = round(measure(engine), 2)
-    except (EngineError, OSError):
+    except (EngineError, OSError) as error:
+        if cancelled is not None and cancelled():
+            raise Cancelled from error  # stopped, not failed: nothing to remember
+        remember_failure(root, key, str(error))
         return None
     remember_speed(root, key, value)
     return value
