@@ -33,7 +33,7 @@ from PySide6.QtGui import QDesktopServices, QGuiApplication
 from tomecast.book import Book
 from tomecast.chunking import split_sentences
 from tomecast.cleanup import CleanupOptions, clean
-from tomecast.downloads import Asset, data_dir, is_installed
+from tomecast.downloads import Asset, build_in_use, data_dir, is_installed, needs_download
 from tomecast.engines.audiocpp import (
     DEFAULT_VOICE,
     VOICES,
@@ -54,10 +54,13 @@ from tomecast.gui.worker import (
     PreviewJob,
     ReadJob,
     ScanJob,
+    SelfCheckFor,
+    SpeedProbe,
     TimedControl,
     kokoro_engine,
     megabytes,
     preview_file,
+    probe_speeds,
     scan_gpu,
 )
 from tomecast.hardware import short_name, vulkan_possible
@@ -65,6 +68,7 @@ from tomecast.names import Name
 from tomecast.packaging import portable_name
 from tomecast.pronunciations import book_list_path
 from tomecast.readers import FORMATS, SUFFIXES
+from tomecast.speed import Speeds
 from tomecast.textprep import TextPrep
 
 SCREENS = ("drop", "chapters", "voice", "names", "converting", "done")
@@ -80,6 +84,17 @@ _FORMAT_LIST = f"{', '.join(FORMATS[:-1])} and {FORMATS[-1]}"
 STOPPED_MESSAGE = "Stopped. Start again to continue where you left off."
 UNKNOWN_TIME = "--:--:--"
 DOWNLOAD_NOTE = "STARTING DOWNLOADS THE VOICE ONCE · {mb} MB"
+# When everything missing is a newer build of an engine that's installed (Start checks it
+# before using it, and keeps the old one if it doesn't work here).
+UPDATE_NOTE = "STARTING DOWNLOADS A VOICE ENGINE UPDATE · {mb} MB"
+# The "Use graphics card" note, with and without a measured speed-up (the card counts as
+# faster from 1.05 times the CPU's speed).
+GPU_NOTE_ON = "FASTER · USES THE DRIVER ALREADY INSTALLED"
+GPU_NOTE_OFF = "USING THE CPU · THE GRAPHICS CARD IS USUALLY SEVERAL TIMES FASTER"
+GPU_NOTE_ON_MEASURED = "ABOUT {ratio}\u00d7 FASTER HERE · USES THE DRIVER ALREADY INSTALLED"
+GPU_NOTE_OFF_MEASURED = "USING THE CPU · THE GRAPHICS CARD IS ABOUT {ratio}\u00d7 FASTER HERE"
+GPU_NOTE_ON_NOT_FASTER = "NO FASTER THAN THE CPU HERE · USES THE DRIVER ALREADY INSTALLED"
+GPU_NOTE_OFF_NOT_FASTER = "USING THE CPU · THE GRAPHICS CARD WAS NO FASTER HERE"
 NAME_METER_DOTS = 11  # the Names screen's count meter
 
 # Voice menu groups, and the order of voices in each (as in the maintainer's mockup).
@@ -239,6 +254,7 @@ class Backend(QObject):
     gpuAvailableChanged = Signal()
     useGpuChanged = Signal()
     gpuNameChanged = Signal()
+    gpuNoteChanged = Signal()
     errorMessageChanged = Signal()
 
     bookLoadedChanged = Signal()
@@ -305,6 +321,8 @@ class Backend(QObject):
         cover_sink: Callable[[bytes | None], None] | None = None,
         gpu_check: Callable[[], bool] = vulkan_possible,
         device_scanner: DeviceScanner = scan_gpu,
+        speed_probe: SpeedProbe = probe_speeds,
+        engine_check: SelfCheckFor | None = None,
     ) -> None:
         super().__init__(parent)
         self._settings = settings if settings is not None else QSettings()
@@ -318,7 +336,9 @@ class Backend(QObject):
         self._convert_job: int | None = None
         self._control: TimedControl | None = None
         self._chapter_labels: list[str] = []
-        self._speedup: float | None = None  # measured in this session
+        # Times real time per device label ("CPU" or the card's short name): from the speed test
+        # at start-up, then from what this session's conversions measured.
+        self._speeds: dict[str, float] = {}
         self._raw_book: Book | None = None  # as read, before cleanup
         self._book: Book | None = None  # cleaned with the skip switches
         self._book_path: Path | None = None
@@ -349,7 +369,7 @@ class Backend(QObject):
         self._gpuAvailable = gpu_check()
         self._useGpu = _as_bool(self._settings.value("useGpu", True), default=True)
         self._gpuName = ""
-        self._speedup_for = ""  # the hardware label the measured speed belongs to
+        self._gpuNote = GPU_NOTE_ON if self._useGpu else GPU_NOTE_OFF
         self._errorMessage = ""
         # Book
         self._bookLoaded = False
@@ -409,6 +429,8 @@ class Backend(QObject):
             data_root=self._data_root,
             system_check=system_check,
             device_scanner=device_scanner,
+            speed_probe=speed_probe,
+            **({"engine_check": engine_check} if engine_check is not None else {}),
         )
         self._worker.moveToThread(self._thread)
         self._jobRequested.connect(self._worker.run)
@@ -421,9 +443,11 @@ class Backend(QObject):
         self._worker.converted.connect(self._on_converted)
         self._worker.failed.connect(self._on_failed)
         self._worker.deviceChosen.connect(self._on_device)
+        self._worker.speedsKnown.connect(self._on_speeds)
         self._thread.start()
-        if self._gpuAvailable:
-            self._jobRequested.emit(ScanJob(next(self._jobs)))  # learn the card's name
+        # The card's name, and how fast it and the CPU voice (measured once per engine build
+        # and device, then remembered).
+        self._jobRequested.emit(ScanJob(next(self._jobs), gpu=self._gpuAvailable))
 
     # --- Properties: app -------------------------------------------------------------------
 
@@ -435,6 +459,7 @@ class Backend(QObject):
     gpuAvailable: bool = _field(bool, "gpuAvailable", gpuAvailableChanged)
     useGpu: bool = _field(bool, "useGpu", useGpuChanged)
     gpuName: str = _field(str, "gpuName", gpuNameChanged)
+    gpuNote: str = _field(str, "gpuNote", gpuNoteChanged)
     errorMessage: str = _field(str, "errorMessage", errorMessageChanged)
 
     # --- Properties: book ------------------------------------------------------------------
@@ -471,7 +496,8 @@ class Backend(QObject):
     footnotesAtEnd: bool = _field(bool, "footnotesAtEnd", footnotesAtEndChanged)
 
     def _get_selection_summary(self) -> dict[str, str]:
-        return self._chapters.summary(self._speedup or DEFAULT_SPEEDUP, self._speed)
+        speedup = self._speeds.get(self._device_label(), DEFAULT_SPEEDUP)
+        return self._chapters.summary(speedup, self._speed)
 
     selectionSummary = _property(dict, _get_selection_summary, selectionSummaryChanged)
 
@@ -548,8 +574,7 @@ class Backend(QObject):
         self._update("useGpu", on)
         self._settings.setValue("useGpu", on)
         self._settings.sync()
-        self._speedup = None  # the measured speed belonged to the other hardware
-        self.selectionSummaryChanged.emit()
+        self.selectionSummaryChanged.emit()  # each device has its own speed
         self._refresh_hardware_label()
         self._refresh_download_note()
 
@@ -886,6 +911,20 @@ class Backend(QObject):
         """The worker found out (or started the engine on) which graphics card is in use."""
         self._update("gpuName", description)
         self._refresh_hardware_label()
+        self.selectionSummaryChanged.emit()
+
+    @Slot(object)
+    def _on_speeds(self, speeds: Speeds) -> None:
+        """The start-up scan's speeds. A speed this session measured converting is better,
+        so it isn't replaced."""
+        if speeds.cpu is not None:
+            self._speeds.setdefault("CPU", speeds.cpu)
+        if speeds.gpu is not None and speeds.gpu_description:
+            self._speeds.setdefault(short_name(speeds.gpu_description), speeds.gpu)
+            if not self._gpuName and self._gpuAvailable:
+                self._update("gpuName", speeds.gpu_description)
+        self._refresh_hardware_label()
+        self.selectionSummaryChanged.emit()
 
     @Slot(int, str)
     def _on_preview_ready(self, job: int, path: str) -> None:
@@ -999,24 +1038,30 @@ class Backend(QObject):
 
     def _refresh_download_note(self) -> None:
         """Say what Start will download: nothing when every required file is installed."""
-        missing = [a for a in self._assets_for(self._using_gpu) if not self._installed(a)]
+        missing = [a for a in self._assets_for(self._using_gpu) if self._needs_download(a)]
         if not missing:
             self._update("downloadNote", "")
             return
         mb = math.ceil(sum(asset.size for asset in missing) / 1_000_000)
-        self._update("downloadNote", DOWNLOAD_NOTE.format(mb=f"{mb:,}"))
+        updates = all(a.archive and build_in_use(a, self._data_root) is not None for a in missing)
+        self._update(
+            "downloadNote", (UPDATE_NOTE if updates else DOWNLOAD_NOTE).format(mb=f"{mb:,}")
+        )
 
-    def _installed(self, asset: Asset) -> bool:
-        """``is_installed``, but a plain file that was already hashed isn't hashed again until
-        its size or modification time changes (the voice model is large)."""
+    def _needs_download(self, asset: Asset) -> bool:
+        """``needs_download``, but a plain file that was already hashed isn't hashed again
+        until its size or modification time changes (the voice model is large)."""
+        if asset.archive:
+            return needs_download(asset, self._data_root)  # reads small marker files
+        return not self._file_installed(asset)
+
+    def _file_installed(self, asset: Asset) -> bool:
         path = self._data_root / asset.path
         try:
             stat = path.stat()
         except OSError:
             self._verified.pop(path, None)
             return is_installed(asset, self._data_root)
-        if asset.archive:
-            return is_installed(asset, self._data_root)  # reads one small marker file
         stamp = (stat.st_size, stat.st_mtime_ns)
         if self._verified.get(path) == stamp:
             return True
@@ -1108,18 +1153,31 @@ class Backend(QObject):
 
     def _refresh_hardware_label(self) -> None:
         device = self._device_label()
-        if self._speedup is not None and self._speedup_for == device:
-            self._update(
-                "hardwareLabel", f"{device} \u00b7 ABOUT {self._speedup:.1f}\u00d7 REAL TIME"
-            )
+        speedup = self._speeds.get(device)
+        if speedup is not None:
+            self._update("hardwareLabel", f"{device} \u00b7 ABOUT {speedup:.1f}\u00d7 REAL TIME")
         elif device == "CPU":
             self._update("hardwareLabel", self._cpuLabel)
         else:
             self._update("hardwareLabel", device)
+        self._update("gpuNote", self._gpu_note())
+
+    def _gpu_note(self) -> str:
+        """The note under "Use graphics card": the card's measured speed-up over the CPU
+        once both have been measured, else the general one."""
+        cpu = self._speeds.get("CPU")
+        card = self._speeds.get(short_name(self._gpuName)) if self._gpuName else None
+        if not cpu or not card:
+            return GPU_NOTE_ON if self._useGpu else GPU_NOTE_OFF
+        ratio = card / cpu
+        if ratio < 1.05:
+            return GPU_NOTE_ON_NOT_FASTER if self._useGpu else GPU_NOTE_OFF_NOT_FASTER
+        note = GPU_NOTE_ON_MEASURED if self._useGpu else GPU_NOTE_OFF_MEASURED
+        return note.format(ratio=f"{ratio:.1f}")
 
     def _measured(self, speedup: float) -> None:
-        self._speedup = speedup
-        self._speedup_for = self._device_label()
+        """A conversion measured the speed on what it ran on (the CPU if the card fell back)."""
+        self._speeds[self._device_label()] = speedup
         self._refresh_hardware_label()
         self.selectionSummaryChanged.emit()
 

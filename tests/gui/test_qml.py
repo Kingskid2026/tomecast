@@ -637,7 +637,7 @@ def test_register_again_returns_the_same_backend(backend: DemoBackend) -> None:
 def test_backend_property_list_matches_the_contract(backend: DemoBackend) -> None:
     contract = {
         "screen", "themeSetting", "theme", "reduceMotion", "hardwareLabel", "errorMessage",
-        "gpuAvailable", "useGpu", "gpuName",
+        "gpuAvailable", "useGpu", "gpuName", "gpuNote",
         "bookLoaded", "loading", "bookTitle", "bookAuthors", "coverSource", "artSource",
         "formatsLabel", "chapters", "skipFrontMatter", "selectionSummary",
         "voiceGroups", "voice", "voiceLabel", "speed", "outputFormat", "previewText",
@@ -952,12 +952,19 @@ def test_the_graphics_card_row_is_keyboard_reachable_and_named(
 
 @pytest.mark.parametrize("width", [1200, 680, 560, 400])
 @pytest.mark.parametrize("use_gpu", [True, False])
+@pytest.mark.parametrize("measured", [False, True])
 def test_the_graphics_card_row_fits_at_every_width(
-    app_window: Window, messages: Messages, width: int, use_gpu: bool
+    app_window: Window, messages: Messages, width: int, use_gpu: bool, measured: bool
 ) -> None:
     app_window.window.resize(width, 700)
     app_window.backend.set_gpu(True)
     app_window.backend.setUseGpu(use_gpu)
+    if measured:  # the longest notes, once the speed-up has been measured
+        app_window.backend.set_gpu_note(
+            "ABOUT 4.3× FASTER HERE · USES THE DRIVER ALREADY INSTALLED"
+            if use_gpu
+            else "USING THE CPU · THE GRAPHICS CARD IS ABOUT 4.3× FASTER HERE"
+        )
     page = app_window.show("voice")
     app_window.settle()
     assert page.property("contentWidth") == width  # nothing scrolls sideways

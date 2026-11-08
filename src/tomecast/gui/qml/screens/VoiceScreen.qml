@@ -349,9 +349,7 @@ ScreenPage {
                     MonoLabel {
                         objectName: "gpuNote"
                         Layout.fillWidth: true
-                        text: Backend.useGpu
-                              ? "FASTER · USES THE DRIVER ALREADY INSTALLED"
-                              : "USING THE CPU · THE GRAPHICS CARD IS USUALLY SEVERAL TIMES FASTER"
+                        text: Backend.gpuNote
                         size: 11
                         wrapMode: Text.Wrap
                     }

@@ -1,18 +1,28 @@
+import dataclasses
+import hashlib
 import json
 import platform
-import stat
-import sys
-import textwrap
+import tarfile
 from pathlib import Path
 
 import pytest
+from fake_engine import write_fake_server
 
 from tomecast.audio import wav_info
-from tomecast.downloads import Asset
+from tomecast.downloads import (
+    UPDATE_FAILED_NOTE,
+    Asset,
+    Prepared,
+    build_folder,
+    build_in_use,
+    failure,
+    prepare,
+)
 from tomecast.engines import audiocpp
 from tomecast.engines.audiocpp import (
     AUDIOCPP_CPU,
     AUDIOCPP_VULKAN,
+    ESPEAK_NG,
     AutoKokoro,
     EngineError,
     GpuUnavailable,
@@ -21,93 +31,11 @@ from tomecast.engines.audiocpp import (
     required_assets,
 )
 
-# A stand-in for audiocpp_server: same command line, same HTTP API, no model.
-FAKE_SERVER = textwrap.dedent(
-    """
-    import http.server, json, math, os, socket, struct, sys, time, wave, io
-
-    if "--list-devices" in sys.argv:
-        print("ggml_vulkan: Found 2 Vulkan devices", file=sys.stderr)
-        print(os.environ.get("FAKE_DEVICES", "{}"))
-        sys.exit(0)
-    config = json.load(open(sys.argv[sys.argv.index("--config") + 1]))
-    log = open(os.environ["FAKE_LOG"], "a")
-    log.write(json.dumps({"event": "start", "config": config, "env": {
-        k: v for k, v in os.environ.items() if k.startswith(("AUDIOCPP_", "TMPDIR"))
-    }}) + "\\n")
-    log.flush()
-    if os.environ.get("FAKE_CRASH") or (
-        os.environ.get("FAKE_CRASH_VULKAN") and config["backend"] == "vulkan"
-    ):
-        print("model failed to load", flush=True)
-        sys.exit(3)
-
-    def wav_for(text):
-        frames = max(1, int(len(text) / 15 * 24000))
-        buf = io.BytesIO()
-        with wave.open(buf, "wb") as w:
-            w.setnchannels(1); w.setsampwidth(2); w.setframerate(24000)
-            w.writeframes(b"".join(
-                struct.pack("<h", int(8000 * math.sin(i / 10))) for i in range(frames)))
-        return buf.getvalue()
-
-    REQUESTS = [0]
-
-    class Handler(http.server.BaseHTTPRequestHandler):
-        def log_message(self, *args):
-            pass
-
-        def do_GET(self):
-            self.send_response(200 if self.path == "/health" else 404)
-            self.end_headers()
-            # The real audio.cpp 0.9.4 reply (checked against the binary).
-            backend = os.environ.get("FAKE_REPORT_BACKEND") or config["backend"]
-            self.wfile.write(
-                json.dumps({"status": "ok", "backend": backend, "version": "0.9.4"}).encode())
-
-        def do_POST(self):
-            REQUESTS[0] += 1
-            die_after = os.environ.get("FAKE_DIE_AFTER")
-            if die_after is not None and REQUESTS[0] > int(die_after):
-                if os.environ.get("FAKE_SLOW_EXIT"):
-                    # The connection drops first, and the process only ends a bit later.
-                    self.connection.shutdown(socket.SHUT_RDWR)
-                    time.sleep(float(os.environ["FAKE_SLOW_EXIT"]))
-                os._exit(1)  # crash mid-request, like an engine running out of memory
-            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-            text = body["input"]
-            if "DIGITS" in text and len(text) > 12:
-                return self.fail("Kokoro phoneme string exceeds 510 symbols")
-            if "EXPLODE" in text:
-                return self.fail("something broke")
-            log.write(json.dumps({"event": "voiced", "body": body}) + "\\n")
-            log.flush()
-            data = wav_for(text)
-            self.send_response(200)
-            self.send_header("Content-Type", "audio/wav")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
-
-        def fail(self, message):
-            data = json.dumps({"error": {"message": message, "type": "server_error"}}).encode()
-            self.send_response(500)
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
-
-    http.server.HTTPServer((config["host"], config["port"]), Handler).serve_forever()
-    """
-)
-
 
 @pytest.fixture
 def fake_server(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    script = tmp_path / "audiocpp_server"
-    script.write_text(f"#!{sys.executable}\n{FAKE_SERVER}")
-    script.chmod(script.stat().st_mode | stat.S_IXUSR)
     monkeypatch.setenv("FAKE_LOG", str(tmp_path / "fake.log"))
-    return script
+    return write_fake_server(tmp_path / "audiocpp_server")
 
 
 def _events(tmp_path: Path) -> list[dict[str, object]]:
@@ -176,6 +104,15 @@ def test_a_crash_at_startup_shows_the_engine_log(
     monkeypatch.setenv("FAKE_CRASH", "1")
     with pytest.raises(EngineError, match="model failed to load"):
         _server(tmp_path, fake_server).start()
+
+
+def test_an_engine_that_dies_without_a_word_says_how_it_ended(tmp_path: Path) -> None:
+    program = tmp_path / "audiocpp_server"
+    program.write_text("#!/bin/sh\nkill -SEGV $$\n")  # a damaged build: crashes at once
+    program.chmod(0o755)
+
+    with pytest.raises(EngineError, match="no log; it exited with signal SIGSEGV"):
+        _server(tmp_path, program).start()
 
 
 def test_synthesize_needs_a_running_server(tmp_path: Path, fake_server: Path) -> None:
@@ -303,7 +240,9 @@ def test_the_engine_comes_from_tomecasts_own_build(asset: Asset, variant: str) -
     assert int(asset.sha256, 16) >= 0  # a real hex digest, not a placeholder
     assert asset.size > 0
     assert asset.archive == "tar.gz"
-    assert asset.path == f"engines/audiocpp-{audiocpp.AUDIOCPP_VERSION}-{variant}"
+    # Each build gets its own folder in here; 0.1.x's folder is taken over, not downloaded again.
+    assert asset.path == f"engines/audiocpp-{variant}"
+    assert asset.replaces == (f"engines/audiocpp-0.9.4-{variant}",)
 
 
 def test_label_names_the_voice(tmp_path: Path) -> None:
@@ -513,13 +452,13 @@ def test_auto_without_the_gpu_never_asks_about_devices(
 
 
 def test_the_engine_build_follows_the_choice(tmp_path: Path) -> None:
-    assert AutoKokoro(tmp_path, use_gpu=True)._executable.parent.name.endswith("-vulkan")
-    assert AutoKokoro(tmp_path, use_gpu=False)._executable.parent.name.endswith("-cpu")
+    assert AutoKokoro(tmp_path, use_gpu=True).executable.parent.parent.name == "audiocpp-vulkan"
+    assert AutoKokoro(tmp_path, use_gpu=False).executable.parent.parent.name == "audiocpp-cpu"
     assert AUDIOCPP_VULKAN in required_assets(True)
     assert AUDIOCPP_CPU not in required_assets(True)
     assert AUDIOCPP_CPU in required_assets(False)
     assert AUDIOCPP_VULKAN not in required_assets(False)
-    assert AUDIOCPP_VULKAN.path == "engines/audiocpp-0.9.4-vulkan"
+    assert AUDIOCPP_VULKAN.path == "engines/audiocpp-vulkan"
 
 
 def test_a_port_taken_at_startup_is_retried_on_a_fresh_one(
@@ -563,3 +502,157 @@ def test_a_port_that_stays_taken_gives_a_clear_error(
             _server(tmp_path, fake_server).start()
     finally:
         blocker.close()
+
+
+# --- The self-check a new engine build must pass ----------------------------------------------
+
+
+def _engine_build(tmp_path: Path, name: str, gpu: bool, env: dict[str, str] | None = None) -> Asset:
+    """A fake engine build (the fake server, behaving as ``env`` says), pinned like ours."""
+    folder = tmp_path / "builds" / name
+    folder.mkdir(parents=True)
+    server = write_fake_server(folder / "audiocpp_server", env)
+    archive = folder.with_suffix(".tar.gz")
+    with tarfile.open(archive, "w:gz") as tar:
+        tar.add(server, arcname="audiocpp_server")
+    data = archive.read_bytes()
+    return dataclasses.replace(
+        AUDIOCPP_VULKAN if gpu else AUDIOCPP_CPU,
+        url=archive.as_uri(),
+        sha256=hashlib.sha256(data).hexdigest(),
+        size=len(data),
+    )
+
+
+@pytest.fixture
+def engine_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A data folder with eSpeak installed (a stand-in: the fake engine never reads it)."""
+    monkeypatch.setenv("FAKE_LOG", str(tmp_path / "fake.log"))
+    root = tmp_path / "data"
+    espeak = build_folder(ESPEAK_NG, root)
+    espeak.mkdir(parents=True)
+    (espeak / ".tomecast-sha256").write_text(ESPEAK_NG.sha256 + "\n")
+    return root
+
+
+def _update(root: Path, old: Asset, new: Asset, *, gpu: bool) -> Prepared:
+    """Install ``old``, then update to ``new`` with the real self-check."""
+    prepare([old, ESPEAK_NG], root, check=audiocpp.self_check(root, gpu))
+    assert build_in_use(old, root) == build_folder(old, root)
+    return prepare([new, ESPEAK_NG], root, check=audiocpp.self_check(root, gpu))
+
+
+def _checks(tmp_path: Path) -> list[tuple[str, str]]:
+    """(build folder name, backend) for each engine start, in order."""
+    return [
+        (Path(str(event["exe"])).parent.name, event["config"]["backend"])  # type: ignore[index]
+        for event in _starts(tmp_path)
+    ]
+
+
+def test_a_new_build_that_voices_on_the_cpu_is_switched_to(
+    tmp_path: Path, engine_root: Path
+) -> None:
+    old = _engine_build(tmp_path, "old", gpu=False)
+    new = _engine_build(tmp_path, "new", gpu=False)
+
+    prepared = _update(engine_root, old, new, gpu=False)
+
+    assert prepared.switched == (new,)
+    assert build_in_use(new, engine_root) == build_folder(new, engine_root)
+    assert _checks(tmp_path) == [(new.sha256[:12], "cpu")]
+    voiced = [e["body"] for e in _events(tmp_path) if e["event"] == "voiced"]
+    assert voiced[0]["input"] == audiocpp.SELF_CHECK_TEXT  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    ("env", "why"),
+    [
+        ({"FAKE_CRASH": "1"}, "model failed to load"),  # e.g. a missing library
+        ({"FAKE_SILENT": "1"}, "silent"),  # it starts, but the audio is no good
+    ],
+)
+def test_a_new_build_that_doesnt_voice_is_not_switched_to(
+    tmp_path: Path, engine_root: Path, env: dict[str, str], why: str
+) -> None:
+    old = _engine_build(tmp_path, "old", gpu=False)
+    new = _engine_build(tmp_path, "new", gpu=False, env=env)
+
+    prepared = _update(engine_root, old, new, gpu=False)
+
+    assert build_in_use(new, engine_root) == build_folder(old, engine_root)
+    assert prepared.notes == (UPDATE_FAILED_NOTE,)
+    reason = failure(new, engine_root)
+    assert reason is not None and why in reason
+
+
+def test_a_new_vulkan_build_must_voice_on_the_card_the_old_one_could(
+    tmp_path: Path, engine_root: Path, with_devices: None
+) -> None:
+    old = _engine_build(tmp_path, "old", gpu=True)
+    new = _engine_build(tmp_path, "new", gpu=True, env={"FAKE_REPORT_BACKEND": "cpu"})
+
+    prepared = _update(engine_root, old, new, gpu=True)
+
+    assert build_in_use(new, engine_root) == build_folder(old, engine_root)
+    assert prepared.notes == (UPDATE_FAILED_NOTE,)
+    assert "reported the cpu backend" in (failure(new, engine_root) or "")
+    # The new one on the card, then the old one on the card (it worked, so the new one failed).
+    assert _checks(tmp_path) == [(new.sha256[:12], "vulkan"), (old.sha256[:12], "vulkan")]
+    config = _starts(tmp_path)[0]["config"]
+    assert config["device"] == 0  # type: ignore[index]  # the discrete card, as a run would
+
+
+def test_a_new_vulkan_build_must_load_the_voice_on_the_card(
+    tmp_path: Path, engine_root: Path, with_devices: None
+) -> None:
+    old = _engine_build(tmp_path, "old", gpu=True)
+    new = _engine_build(tmp_path, "new", gpu=True, env={"FAKE_LOADED_DEVICE": "1"})
+
+    _update(engine_root, old, new, gpu=True)
+
+    assert build_in_use(new, engine_root) == build_folder(old, engine_root)
+    assert "not on the graphics card" in (failure(new, engine_root) or "")
+
+
+def test_when_the_card_fails_with_every_build_the_new_one_is_checked_on_the_cpu(
+    tmp_path: Path, engine_root: Path, with_devices: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    old = _engine_build(tmp_path, "old", gpu=True)
+    new = _engine_build(tmp_path, "new", gpu=True)
+    monkeypatch.setenv("FAKE_CRASH_VULKAN", "1")  # a broken driver: no build can use the card
+
+    prepared = _update(engine_root, old, new, gpu=True)
+
+    assert prepared.switched == (new,)  # the driver is the problem, not the update
+    assert _checks(tmp_path) == [
+        (new.sha256[:12], "vulkan"),
+        (old.sha256[:12], "vulkan"),
+        (new.sha256[:12], "cpu"),
+    ]
+
+
+def test_without_a_card_a_vulkan_build_is_checked_on_the_cpu(
+    tmp_path: Path, engine_root: Path
+) -> None:
+    old = _engine_build(tmp_path, "old", gpu=True)
+    new = _engine_build(tmp_path, "new", gpu=True)
+
+    assert _update(engine_root, old, new, gpu=True).switched == (new,)
+    assert _checks(tmp_path) == [(new.sha256[:12], "cpu")]
+
+
+def test_an_engine_made_before_the_switch_starts_the_new_build(
+    tmp_path: Path, engine_root: Path
+) -> None:
+    old = _engine_build(tmp_path, "old", gpu=False)
+    new = _engine_build(tmp_path, "new", gpu=False)
+    prepare([old, ESPEAK_NG], engine_root, check=audiocpp.self_check(engine_root, False))
+    # Made before the switch, as the window does (it makes the engine, then downloads).
+    engine = AutoKokoro(engine_root, use_gpu=False, startup_timeout=20)
+
+    prepare([new, ESPEAK_NG], engine_root, check=audiocpp.self_check(engine_root, False))
+    with engine:
+        pass
+
+    assert _checks(tmp_path)[-1] == (new.sha256[:12], "cpu")

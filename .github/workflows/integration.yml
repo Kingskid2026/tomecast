@@ -16,7 +16,9 @@ on:
   pull_request:
     paths: &paths
       - src/tomecast/engines/**
+      - src/tomecast/manifest.py
       - src/tomecast/downloads.py
+      - src/tomecast/speed.py
       - src/tomecast/hardware.py
       - src/tomecast/convert.py
       - src/tomecast/workdirs.py
@@ -64,7 +66,8 @@ jobs:
           from tomecast.engines.audiocpp import AUDIOCPP_VULKAN, required_assets
           print("-".join(a.sha256[:12] for a in (*required_assets(use_gpu=False), AUDIOCPP_VULKAN)))
           ')
-          echo "key=tomecast-engine-$key" >> "$GITHUB_OUTPUT"
+          # "builds2": the data folder's layout (one folder per engine build, installed.json).
+          echo "key=tomecast-engine-builds2-$key" >> "$GITHUB_OUTPUT"
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: cache
         with:

@@ -35,6 +35,9 @@ from PySide6.QtQml import QQmlEngine, qmlRegisterSingletonInstance, qmlRegisterT
 from PySide6.QtQuick import QQuickImageProvider
 
 MIN_SPEED, MAX_SPEED, SPEED_STEP = 0.5, 3.0, 0.25  # as in tomecast.gui.backend
+# The "Use graphics card" note before a speed-up is measured (as in tomecast.gui.backend).
+GPU_NOTE_ON = "FASTER · USES THE DRIVER ALREADY INSTALLED"
+GPU_NOTE_OFF = "USING THE CPU · THE GRAPHICS CARD IS USUALLY SEVERAL TIMES FASTER"
 
 QML_URI = "TomecastNative"
 DATA_PATH = Path(__file__).resolve().parent / "data" / "alice_demo.json"
@@ -222,6 +225,7 @@ class DemoBackend(QObject):
     gpuAvailableChanged = Signal()
     useGpuChanged = Signal()
     gpuNameChanged = Signal()
+    gpuNoteChanged = Signal()
     errorMessageChanged = Signal()
     bookLoadedChanged = Signal()
     loadingChanged = Signal()
@@ -321,6 +325,7 @@ class DemoBackend(QObject):
             "gpuAvailable": False,
             "useGpu": True,
             "gpuName": "",
+            "gpuNote": GPU_NOTE_ON,
             "errorMessage": "",
             "bookLoaded": False,
             "loading": False,
@@ -481,6 +486,10 @@ class DemoBackend(QObject):
         self._set("gpuAvailable", available)
         self._set("gpuName", name)
 
+    def set_gpu_note(self, text: str) -> None:
+        """Show a measured speed-up under "Use graphics card" (the real backend's wording)."""
+        self._set("gpuNote", text)
+
     def set_loading(self, on: bool) -> None:
         self._set("loading", on)
 
@@ -624,6 +633,7 @@ class DemoBackend(QObject):
     def setUseGpu(self, on: bool) -> None:
         self._record("setUseGpu", on)
         self._set("useGpu", on)
+        self._set("gpuNote", GPU_NOTE_ON if on else GPU_NOTE_OFF)
 
     @Slot()
     def togglePreview(self) -> None:
@@ -743,6 +753,7 @@ class DemoBackend(QObject):
     )
     useGpu = Property(bool, lambda self: self._get("useGpu"), notify=useGpuChanged)
     gpuName = Property(str, lambda self: self._get("gpuName"), notify=gpuNameChanged)
+    gpuNote = Property(str, lambda self: self._get("gpuNote"), notify=gpuNoteChanged)
     errorMessage = Property(str, lambda self: self._get("errorMessage"), notify=errorMessageChanged)
     bookLoaded = Property(bool, lambda self: self._get("bookLoaded"), notify=bookLoadedChanged)
     loading = Property(bool, lambda self: self._get("loading"), notify=loadingChanged)

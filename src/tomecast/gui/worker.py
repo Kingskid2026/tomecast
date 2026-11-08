@@ -38,8 +38,22 @@ from tomecast.convert import (
     convert_book,
     plan_chunks,
 )
-from tomecast.downloads import Asset, DownloadError, ensure, is_installed, local_path
-from tomecast.engines.audiocpp import AUDIOCPP_VULKAN, AutoKokoro, EngineError
+from tomecast.downloads import (
+    Asset,
+    DownloadError,
+    ProgressCallback,
+    SelfCheck,
+    build_in_use,
+    is_usable,
+    prepare,
+)
+from tomecast.engines.audiocpp import (
+    AUDIOCPP_VULKAN,
+    EXECUTABLE,
+    AutoKokoro,
+    EngineError,
+    self_check,
+)
 from tomecast.gui.fixes import FixLists, ListFile
 from tomecast.hardware import list_devices, pick_device
 from tomecast.names import Name, find_book_names
@@ -51,6 +65,7 @@ from tomecast.pronunciations import (
     load_for_book,
 )
 from tomecast.readers import InvalidEbookError, read_book
+from tomecast.speed import Speeds, probe
 from tomecast.textprep import TextPrep
 from tomecast.workdirs import WorkFolderBusy, exclusive, work_folder
 
@@ -82,6 +97,10 @@ EngineFactory = Callable[[Path, str, float, bool], Engine]
 AssetsFor = Callable[[bool], Sequence[Asset]]
 # (data folder) -> the graphics card's description if one would be used, else ""
 DeviceScanner = Callable[[Path], str]
+# (data folder, look at the graphics card too) -> the speeds measured (or remembered) there
+SpeedProbe = Callable[[Path, bool], Speeds]
+# (data folder, use the graphics card) -> the check a new engine build must pass
+SelfCheckFor = Callable[[Path, bool], SelfCheck]
 
 
 def kokoro_engine(root: Path, voice: str, speed: float, use_gpu: bool) -> Engine:
@@ -91,13 +110,19 @@ def kokoro_engine(root: Path, voice: str, speed: float, use_gpu: bool) -> Engine
 
 
 def scan_gpu(root: Path) -> str:
-    """The description of the graphics card that would be used, or ``""``. Only looks if the
-    graphics-card engine is already installed; it never downloads."""
-    if not is_installed(AUDIOCPP_VULKAN, root):
+    """The description of the graphics card that would be used, or ``""``. Only looks if a
+    graphics-card engine build is installed; it never downloads."""
+    build = build_in_use(AUDIOCPP_VULKAN, root)
+    if build is None:
         return ""
-    executable = local_path(AUDIOCPP_VULKAN, root) / "audiocpp_server"
-    device = pick_device(list_devices(executable))
+    device = pick_device(list_devices(build / EXECUTABLE))
     return device.description if device else ""
+
+
+def probe_speeds(root: Path, gpu: bool) -> Speeds:
+    """The real speed probe: the CPU's speed, and the card's with ``gpu``, measured once per
+    engine build and device (a few seconds each) and remembered after that."""
+    return probe(root, gpu=gpu)
 
 
 class TimedControl(ConversionControl):
@@ -140,9 +165,11 @@ class ReadJob:
 
 @dataclass(frozen=True, slots=True)
 class ScanJob:
-    """Look for the graphics card (when its engine is installed) to show its name."""
+    """Look for the graphics card (when its engine is installed) to show its name, and find
+    out how fast this computer voices (remembered, or measured once with what's installed)."""
 
     job: int
+    gpu: bool = False  # a graphics driver is there, so look at the card too
 
 
 @dataclass(frozen=True, slots=True)
@@ -306,6 +333,7 @@ class ConversionWorker(QObject):
     cancelled = Signal(int)  # job
     failed = Signal(int, str)  # job, message for the error banner
     deviceChosen = Signal(str)  # the graphics card's description, or "" for the CPU
+    speedsKnown = Signal(object)  # Speeds, from the start-up scan
 
     def __init__(
         self,
@@ -315,6 +343,8 @@ class ConversionWorker(QObject):
         data_root: Path,
         system_check: Callable[[], None],
         device_scanner: DeviceScanner = scan_gpu,
+        speed_probe: SpeedProbe = probe_speeds,
+        engine_check: SelfCheckFor = self_check,
     ) -> None:
         super().__init__()
         self._engine_factory = engine_factory
@@ -322,8 +352,11 @@ class ConversionWorker(QObject):
         self._root = data_root
         self._system_check = system_check
         self._device_scanner = device_scanner
+        self._speed_probe = speed_probe
+        self._self_check = engine_check
         self._stopping = threading.Event()
-        self._assets_ready: dict[bool, bool] = {}  # per "use the graphics card"
+        self._assets_ready: dict[bool, bool] = {}  # per "use the graphics card": prepared
+        self._assets_usable: dict[bool, bool] = {}  # some build of each is there (previews)
         self._preview_engine: Engine | None = None
         self._preview_gpu = False
 
@@ -340,7 +373,7 @@ class ConversionWorker(QObject):
             if isinstance(job, ReadJob):
                 self._read(job)
             elif isinstance(job, ScanJob):
-                self.deviceChosen.emit(self._device_scanner(self._root))
+                self._scan(job)
             elif isinstance(job, PreviewJob):
                 self._preview(job)
             else:
@@ -355,6 +388,14 @@ class ConversionWorker(QObject):
         thread = QThread.currentThread()
         if thread is not None:
             thread.quit()
+
+    # --- Start-up scan --------------------------------------------------------------------
+
+    def _scan(self, job: ScanJob) -> None:
+        if job.gpu:
+            self.deviceChosen.emit(self._device_scanner(self._root))
+        self._close_preview_engine()  # one model in memory at a time
+        self.speedsKnown.emit(self._speed_probe(self._root, job.gpu))
 
     # --- Reading a book ------------------------------------------------------------------
 
@@ -382,8 +423,8 @@ class ConversionWorker(QObject):
             self._system_check()
             # Use the graphics card's engine for the preview only if it's installed already
             # (previews never download); otherwise the CPU engine will do.
-            use_gpu = job.use_gpu and self._have_assets(True)
-            if not use_gpu and not self._have_assets(False):
+            use_gpu = job.use_gpu and self._have_usable(True)
+            if not use_gpu and not self._have_usable(False):
                 self.failed.emit(
                     job.job,
                     "The voice model downloads once, when you start converting a book. "
@@ -467,7 +508,7 @@ class ConversionWorker(QObject):
             self.progressed.emit(
                 job.job, ConvertUpdate(0, len(chunks), first_chapter, "", "starting", None, None)
             )
-            self._download_missing(job)
+            install_notes = self._prepare(job)
             if job.control.cancelled:
                 raise ConversionCancelled
             workdir = work_folder(
@@ -475,7 +516,7 @@ class ConversionWorker(QObject):
             )
             with exclusive(workdir):
                 self.stageChanged.emit(job.job, "starting")
-                outcome = self._voice_book(job, engine, chunks, workdir, prep, notes)
+                outcome = self._voice_book(job, engine, chunks, workdir, prep, notes, install_notes)
             shutil.rmtree(workdir, ignore_errors=True)
         except ConversionCancelled:
             self.cancelled.emit(job.job)
@@ -499,10 +540,12 @@ class ConversionWorker(QObject):
         workdir: Path,
         prep: TextPrep,
         notes: Sequence[str] = (),
+        install_notes: Sequence[str] = (),
     ) -> ConvertResult:
         """Start the engine, convert, and stop the engine again (all on this thread).
 
-        ``notes`` are warnings about pronunciation list lines that were skipped.
+        ``notes`` are warnings about pronunciation list lines that were skipped;
+        ``install_notes`` say an engine update was kept back.
         """
         control = job.control
         try:
@@ -529,6 +572,7 @@ class ConversionWorker(QObject):
             size_bytes=_size_of(result.output),
             seconds_taken=max(0.0, taken),
             warnings=(
+                *install_notes,
                 *((engine.warning,) if engine.warning else ()),
                 *result.warnings,
                 *(_as_sentence(f"Pronunciation list: {note}") for note in notes),
@@ -551,28 +595,50 @@ class ConversionWorker(QObject):
             ),
         )
 
-    def _have_assets(self, use_gpu: bool) -> bool:
-        if not self._assets_ready.get(use_gpu):
-            self._assets_ready[use_gpu] = all(
-                is_installed(asset, self._root) for asset in self._assets_for(use_gpu)
+    def _have_usable(self, use_gpu: bool) -> bool:
+        """Some build of every file the choice needs is installed (previews never download,
+        and use an older engine build while an update waits)."""
+        if not self._assets_usable.get(use_gpu):
+            self._assets_usable[use_gpu] = all(
+                is_usable(asset, self._root) for asset in self._assets_for(use_gpu)
             )
-        return self._assets_ready[use_gpu]
+        return self._assets_usable[use_gpu]
 
-    def _download_missing(self, job: ConvertJob) -> None:
-        """Download the engine and model if needed. Pressing Start counts as agreeing to it,
-        so the label says it's a one-time download."""
-        if self._have_assets(job.use_gpu):
-            return
-        missing = [
-            asset for asset in self._assets_for(job.use_gpu) if not is_installed(asset, self._root)
-        ]
-        self.stageChanged.emit(job.job, "downloading")
-        for number, asset in enumerate(missing, start=1):
-            step = f" ({number} OF {len(missing)})" if len(missing) > 1 else ""
-            show = self._download_reporter(job, f"DOWNLOADING ONCE{step} · {asset.name.upper()}")
+    def _prepare(self, job: ConvertJob) -> tuple[str, ...]:
+        """Download what's missing and switch to new engine builds once they pass their
+        self-check (:func:`tomecast.downloads.prepare`). Pressing Start counts as agreeing to
+        the downloads, so the label says whether it's a one-time download or an update.
+        Returns the notes to show on the done screen (an update kept back)."""
+        if self._assets_ready.get(job.use_gpu):
+            return ()
+        kind = "DOWNLOADING ONCE"
+
+        def consent(missing: Sequence[Asset], updates: bool) -> bool:
+            nonlocal kind
+            kind = "DOWNLOADING AN UPDATE" if updates else "DOWNLOADING ONCE"
+            return True
+
+        def on_download(asset: Asset, number: int, count: int) -> ProgressCallback:
+            self.stageChanged.emit(job.job, "downloading")
+            step = f" ({number} OF {count})" if count > 1 else ""
+            show = self._download_reporter(job, f"{kind}{step} · {asset.name.upper()}")
             show(0, asset.size)
-            ensure(asset, self._root, progress=show)
+            return show
+
+        def on_check() -> None:
+            self.stageChanged.emit(job.job, "starting")
+
+        prepared = prepare(
+            self._assets_for(job.use_gpu),
+            self._root,
+            check=self._self_check(self._root, job.use_gpu),
+            consent=consent,
+            on_download=on_download,
+            on_check=on_check,
+        )
         self._assets_ready[job.use_gpu] = True
+        self._assets_usable[job.use_gpu] = True
+        return prepared.notes
 
     def _download_reporter(self, job: ConvertJob, label: str) -> Callable[[int, int], None]:
         shown = -1

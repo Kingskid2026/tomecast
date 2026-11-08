@@ -1,9 +1,10 @@
 """Work folders for resumable conversions, shared by the terminal command and the window.
 
 Each conversion keeps its chunk audio in ``<data folder>/cache/convert-<key>/``. The key is a
-hash of the book file, the voice, the speed, the seed, and the engine build (CPU or graphics
-card) and model versions, so the same book with the same settings resumes in the same folder,
-and a resumed book never mixes two voices, models or engine builds.
+hash of the book file, the voice, the speed, the seed, and the engine build in use (CPU or
+graphics card, and which build of it) and model versions, so the same book with the same
+settings resumes in the same folder, and a resumed book never mixes two voices, models or
+engine builds.
 Folders left unused for :data:`STALE_WORK_DAYS` are removed.
 """
 
@@ -17,6 +18,7 @@ import time
 from collections.abc import Iterator
 from pathlib import Path
 
+from tomecast.downloads import installed_sha256
 from tomecast.engines.audiocpp import AUDIOCPP_VERSION, DEFAULT_SEED, required_assets
 
 # Unfinished conversions are kept so they can be resumed; after this long they're removed.
@@ -45,9 +47,10 @@ def work_folder(
         while block := f.read(1024 * 1024):
             digest.update(block)
     # Anything that changes how the audio sounds goes in the key, so a resumed book never
-    # mixes two voices, speeds or model versions.
+    # mixes two voices, speeds or model versions. The builds are the ones in use, which are
+    # the pinned ones unless an update didn't work on this computer (or isn't installed yet).
     settings = [voice, str(speed), f"seed={DEFAULT_SEED}", f"audiocpp-{AUDIOCPP_VERSION}"]
-    settings += [asset.sha256 for asset in required_assets(use_gpu)]
+    settings += [installed_sha256(a, root) or a.sha256 for a in required_assets(use_gpu)]
     digest.update("|".join(settings).encode())
     folder = cache / f"convert-{digest.hexdigest()[:16]}"
     folder.mkdir(exist_ok=True)
