@@ -103,5 +103,23 @@
  ],
  "ch3_sentence": "They were indeed a queer-looking party that assembled on the bank—the birds with draggled feathers, the animals with their fur clinging close to them, and all dripping wet, cross, and uncomfortable.",
  "wpm": 158,
- "speedup": 4.7
+ "speedup": 4.7,
+ "names": [
+  ["Alice", 399],
+  ["Gryphon", 55],
+  ["Dinah", 14],
+  ["Dodo", 13],
+  ["William", 8],
+  ["Cheshire", 7],
+  ["Lory", 7],
+  ["Soo", 7],
+  ["English", 6],
+  ["Ann", 4],
+  ["Caucus", 4],
+  ["French", 4],
+  ["Mabel", 4],
+  ["Mary", 4],
+  ["Eaglet", 3],
+  ["Wonderland", 3]
+ ]
 }

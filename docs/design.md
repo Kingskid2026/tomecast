@@ -14,6 +14,7 @@
 | Motion | **One living element:** the sentence-dot grid while converting. Everything else animates only on state changes. |
 | App icon | **The sentence grid** (the maintainer's option "A · Sentence grid"): a 5 × 5 grid of dots on near-black, in reading order. The first twelve are light (voiced), the centre one is the accent (being spoken), the rest are dim (waiting). See *App icon* below. |
 | Artwork | **The book's own cover**, rendered in dots on the chapter, converting and done screens. **The drop screen**, where no book is loaded yet, shows **Luca della Robbia's *Cantoria*** (1431–38, marble children singing: a Renaissance image of voices) in the same dots. |
+| Pronunciation editor | **Option B: a Names step of its own, after Voice** (mockup `Names-B-own-step.dc.html`, chosen 2026-11-08). It appears only when the name finder finds something; otherwise Voice keeps Start converting and the step is skipped. Skipping the fixes is one click: Start converting on the Names screen. |
 
 ## Palette
 
@@ -66,9 +67,10 @@ The PNG sizes (16, 24, 32, 48, 64, 128, 256) in `src/tomecast/gui/icons/png/` ar
 
 1. **Drop:** a near-black field with no outline. While a book is dragged over the window, "DROP A BOOK HERE" turns the accent colour. Inside: the *Cantoria* in dots (no credit line on screen; the source is listed below and in `THIRD_PARTY.md`), "DROP A BOOK HERE", the formats that work today (only EPUB for now; others are added as their readers land) and Choose a book. The hardware result sits quietly in a corner ("CPU · about 4.7× real time").
 2. **Chapters:** a spec-table layout (`[ 03 ]`, title, words, estimated minutes) with checkboxes and a dot meter for each chapter's length. The skip switches (page numbers, footnotes, front matter…) appear as toggles.
-3. **Voice:** a voice menu grouped by language and gender ("American · female"), speed as a dot meter, and Preview with the round player.
-4. **Converting:** time left in Doto, "4.7× real time", the sentence grid, the live caption, Pause, and the dotted cover.
-5. **Done:** the full grid lit, the file name, length and size, and Open folder.
+3. **Voice:** a voice menu grouped by language and gender ("American · female"), speed as a dot meter, and Preview with the round player. When the book has names to check, the primary button is **Next** (to Names) instead of Start converting.
+4. **Names** (only for books where the name finder found something): Back and Start converting (the accent). A muted line explains the step ("These words aren't in the dictionary, so the voice guesses how to say them. Press play to hear one. If it sounds wrong, type it the way it sounds."), then a table with a mono caps header (NAME · IN THE BOOK · SAY IT AS) and one row per name, most frequent first: the name in Plex Sans 16, the count ("14×") with an 11-dot meter log-scaled to the most frequent name, a "say it as" field that is only a 1 px line (the text colour when there's a fix, the line colour when empty, placeholder "as written", Plex Mono 15), and a 44 px round play button that turns the accent while it plays. Rows are at least 60 px with 1 px rules; 8 show first, with a "Show all N names" / "Show fewer" pill. Beside the table: TRY ANY WORD (a field and the 56 px round player), the dotted waveform, "HEARD AS <voice> · <speed>×", a 1 px line, then YOUR FIXES · n, each fix as *Word → respelling* with a THIS BOOK / EVERY BOOK pill and a muted Remove, and a mono footnote saying where they're saved. At 680 px and under the count column goes and the side panel moves under the table.
+5. **Converting:** time left in Doto, "4.7× real time", the sentence grid, the live caption, Pause, and the dotted cover.
+6. **Done:** the full grid lit, the file name, length and size, and Open folder.
 
 ## Artwork sources
 

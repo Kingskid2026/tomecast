@@ -369,7 +369,12 @@ def test_voice_and_speed_controls(app_window: Window, messages: Messages) -> Non
     assert preview.property("glyph") == "pause"
     assert preview.property("text") == "Pause preview"
 
-    app_window.click("startConvertingButton")
+    # Alice has names to check, so Next leads to them, and Start converting is there.
+    assert not app_window.get("startConvertingButton").isVisible()
+    app_window.click("voiceNextButton")
+    app_window.qtbot.waitUntil(lambda: app_window.find("namesScreen") is not None)
+    assert app_window.backend.property("previewPlaying") is False  # stopped on leaving
+    app_window.click("namesStartButton")
     app_window.qtbot.waitUntil(lambda: app_window.find("convertingScreen") is not None)
     assert_clean(messages)
 
@@ -644,6 +649,7 @@ def test_backend_property_list_matches_the_contract(backend: DemoBackend) -> Non
         "chunksDone", "chunksTotal",
         "chapterLabel", "timeLeft", "progressLabel", "speedLabel", "nowSpeaking", "paused",
         "outputPath", "audioLength", "doneSummary", "warnings",
+        "names", "nameFixes", "fixes", "bookListName", "playingName", "tryPlaying",
     }  # fmt: skip
     meta = backend.metaObject()
     names = {meta.property(i).name() for i in range(meta.propertyCount())}
@@ -661,6 +667,7 @@ def test_backend_property_list_matches_the_contract(backend: DemoBackend) -> Non
         "togglePreview",
         "startConversion", "pauseConversion", "resumeConversion", "cancelConversion",
         "openOutputFolder", "convertAnother",
+        "setNameFix", "removeFix", "toggleFixScope", "playName", "playText",
     }  # fmt: skip
     methods = {bytes(meta.method(i).name().data()).decode() for i in range(meta.methodCount())}
     assert slots <= methods
@@ -777,8 +784,10 @@ def test_a_paused_conversion_can_always_be_resumed(app_window: Window, messages:
 def test_start_is_disabled_while_a_book_is_being_read(
     app_window: Window, messages: Messages
 ) -> None:
+    app_window.backend.set_names([])  # no names: Voice starts the conversion itself
     app_window.show("voice")
     start = app_window.get("startConvertingButton")
+    assert start.isVisible() and not app_window.get("voiceNextButton").isVisible()
     assert start.property("enabled") is True
     app_window.backend.set_loading(True)
     app_window.settle()
@@ -786,6 +795,14 @@ def test_start_is_disabled_while_a_book_is_being_read(
     app_window.backend.set_loading(False)
     app_window.settle()
     assert start.property("enabled") is True
+
+    app_window.backend.set_names([["Gryphon", 55]])
+    app_window.show("names")
+    names_start = app_window.get("namesStartButton")
+    app_window.backend.set_loading(True)
+    app_window.settle()
+    assert names_start.property("enabled") is False
+    app_window.backend.set_loading(False)
     assert_clean(messages)
 
 
@@ -827,8 +844,8 @@ def test_voice_screen_shows_what_start_will_download(
     app_window.settle()
     assert note.isVisible()
     assert app_window.text("downloadNote") == "STARTING DOWNLOADS THE VOICE ONCE · 271 MB"
-    start = app_window.get("startConvertingButton")
-    # Right above Start converting, not somewhere else on the page.
+    start = app_window.get("voiceNextButton")  # Alice has names: Next is the primary button
+    # Right above the primary button, not somewhere else on the page.
     assert note.mapToScene(QPointF(0, 0)).y() + note.height() <= start.mapToScene(QPointF(0, 0)).y()
     app_window.backend.set_download_note("")
     app_window.settle()
@@ -1017,4 +1034,237 @@ def test_skip_switches_wrap_as_in_the_mockup(
         assert notes[1] - (pages[1] + pages[3]) == 10
     assert all(box[3] == 44 for box in (pages, front, notes))
     assert sticks_out(page, width) == []
+    assert_clean(messages)
+
+
+# -- the Names step ------------------------------------------------------------------------------
+
+
+def _type(window: Window, text: str) -> None:
+    """Type ``text`` into the focused field (QTest.keyClicks only takes widgets)."""
+    for char in text:
+        # PySide6's stubs leave out the character overload; at runtime it types the character.
+        QTest.keyClick(window.window, char)  # type: ignore[call-overload]
+    window.settle()
+
+
+def _y(window: Window, name: str) -> float:
+    return float(window.get(name).mapToScene(QPointF(0, 0)).y())
+
+
+def _x(window: Window, name: str) -> float:
+    return float(window.get(name).mapToScene(QPointF(0, 0)).x())
+
+
+def test_names_screen_texts(app_window: Window, messages: Messages) -> None:
+    app_window.show("names")
+    assert app_window.text("screenTitle") == "NAMES"
+    assert app_window.text("namesIntro") == (
+        "These words aren't in the dictionary, so the voice guesses how to say them. "
+        "Press play to hear one. If it sounds wrong, type it the way it sounds."
+    )
+    assert app_window.get("namesStartButton").property("text") == "Start converting"
+    assert app_window.get("namesBackButton").property("text") == "Back"
+    # The 8 most frequent names first, as in the mockup.
+    assert app_window.find("nameRow7") is not None and app_window.find("nameRow8") is None
+    assert app_window.text("nameWord0") == "Alice"
+    assert app_window.get("nameMeter0").property("lit") == 11
+    assert app_window.get("nameMeter1").property("lit") == 7  # Gryphon, 55 of 399, log-scaled
+    gryphon, dinah = app_window.get("nameField1"), app_window.get("nameField2")
+    assert gryphon.property("text") == "GRIFF-on"
+    assert gryphon.property("lineColor") == QColor("#F2F2F2")  # a fix: the text colour
+    assert dinah.property("text") == "" and dinah.property("placeholderText") == "as written"
+    assert dinah.property("lineColor") == QColor("#2A2A2E")  # none: the line colour
+    assert app_window.get("namePlay0").property("text") == "Hear Alice"
+    assert app_window.get("namePlay0").property("width") == 44
+    assert app_window.text("showAllNames") == "Show all 16 names"
+    assert app_window.text("heardAs") == "HEARD AS HEART · AMERICAN · FEMALE · 1.00×"
+    assert app_window.text("fixesCount") == "YOUR FIXES · 3"
+    assert app_window.get("fixScope0").property("text") == "This book"
+    assert app_window.get("fixScope2").property("text") == "Every book"
+    assert app_window.text("fixesNote") == (
+        "This book: saved next to the book, as alice.pronunciations.txt. "
+        "Every book: used for all your books."
+    )
+    assert app_window.get("tryButton").property("enabled") is False  # nothing typed yet
+    assert_clean(messages)
+
+
+def test_voice_leads_to_names_only_when_there_are_some(
+    app_window: Window, messages: Messages
+) -> None:
+    app_window.show("voice")
+    assert app_window.get("voiceNextButton").isVisible()
+    app_window.click("voiceNextButton")
+    app_window.qtbot.waitUntil(lambda: app_window.find("namesScreen") is not None)
+    app_window.click("namesBackButton")
+    app_window.qtbot.waitUntil(lambda: app_window.find("voiceScreen") is not None)
+
+    app_window.backend.set_names([])
+    app_window.settle()
+    assert not app_window.get("voiceNextButton").isVisible()
+    app_window.click("startConvertingButton")  # skipped: Start converting is on Voice
+    app_window.qtbot.waitUntil(lambda: app_window.find("convertingScreen") is not None)
+    assert ("goTo", ("names",)) not in app_window.backend.calls[-2:]
+    assert_clean(messages)
+
+
+def test_show_all_names(app_window: Window, messages: Messages) -> None:
+    app_window.show("names")
+    app_window.click("showAllNames")
+    app_window.qtbot.waitUntil(lambda: app_window.find("nameRow15") is not None)
+    assert app_window.text("nameWord15") == "Wonderland"
+    assert app_window.text("showAllNames") == "Show fewer"
+    app_window.click("showAllNames")
+    app_window.qtbot.waitUntil(lambda: app_window.find("nameRow8") is None)
+    app_window.backend.set_names([["Zorp", 5], ["Mira", 3]])
+    app_window.settle()
+    assert not app_window.get("showAllNames").isVisible()  # nothing more to show
+    assert_clean(messages)
+
+
+def test_a_fix_is_saved_when_editing_finishes(app_window: Window, messages: Messages) -> None:
+    app_window.show("names")
+    field = app_window.get("nameField2")  # Dinah
+    app_window.click(field)
+    _type(app_window, "DIE-nuh")
+    assert ("setNameFix", ("Dinah", "DIE-nuh")) not in app_window.backend.calls  # not yet
+    assert field.property("lineColor") == QColor("#F2F2F2")
+    QTest.keyClick(app_window.window, Qt.Key.Key_Return)
+    app_window.settle()
+    assert ("setNameFix", ("Dinah", "DIE-nuh")) in app_window.backend.calls
+    assert app_window.text("fixesCount") == "YOUR FIXES · 4"
+
+    # Clearing it and moving on (Tab) removes the fix.
+    QTest.keyClick(app_window.window, Qt.Key.Key_A, Qt.KeyboardModifier.ControlModifier)
+    QTest.keyClick(app_window.window, Qt.Key.Key_Backspace)
+    QTest.keyClick(app_window.window, Qt.Key.Key_Tab)
+    app_window.settle()
+    assert ("setNameFix", ("Dinah", "")) in app_window.backend.calls
+    assert app_window.text("fixesCount") == "YOUR FIXES · 3"
+    assert app_window.window.activeFocusItem().objectName() == "namePlay2"
+    assert_clean(messages)
+
+
+def test_a_fix_removed_in_the_list_clears_its_row(app_window: Window, messages: Messages) -> None:
+    app_window.show("names")
+    assert app_window.get("nameField1").property("text") == "GRIFF-on"
+    app_window.click("fixRemove0")
+    assert ("removeFix", ("book", "Gryphon")) in app_window.backend.calls
+    assert app_window.get("nameField1").property("text") == ""
+    assert app_window.text("fixesCount") == "YOUR FIXES · 2"
+    assert_clean(messages)
+
+
+def test_the_scope_switch_keeps_keyboard_focus(app_window: Window, messages: Messages) -> None:
+    app_window.show("names")
+    pill = app_window.get("fixScope0")
+    pill.forceActiveFocus(Qt.FocusReason.TabFocusReason)
+    app_window.settle()
+    QTest.keyClick(app_window.window, Qt.Key.Key_Space)
+    app_window.settle()
+    assert ("toggleFixScope", ("book", "Gryphon")) in app_window.backend.calls
+    focused = app_window.window.activeFocusItem()
+    assert focused is not None and focused.property("text") == "Every book"
+    assert focused.property("visualFocus") is True
+    assert app_window.backend.property("fixes")[0]["scope"] == "all"
+    assert_clean(messages)
+
+
+def test_one_name_plays_at_a_time(app_window: Window, messages: Messages) -> None:
+    app_window.show("names")
+    alice, gryphon = app_window.get("namePlay0"), app_window.get("namePlay1")
+    app_window.click(alice)
+    assert app_window.backend.property("playingName") == "Alice"
+    assert (alice.property("glyph"), alice.property("text")) == ("pause", "Stop Alice")
+    assert alice.property("ink") == QColor("#7C8CFF")  # the accent: what's playing
+    assert gryphon.property("ink") == QColor("#F2F2F2")
+    app_window.click(gryphon)
+    assert app_window.backend.property("playingName") == "Gryphon"
+    assert alice.property("glyph") == "play"
+    app_window.click(gryphon)  # a second press stops it
+    assert app_window.backend.property("playingName") == ""
+    assert_clean(messages)
+
+
+def test_try_any_word(app_window: Window, messages: Messages) -> None:
+    app_window.show("names")
+    app_window.click("tryField")
+    _type(app_window, "Wonderland")
+    button = app_window.get("tryButton")
+    assert button.property("enabled") is True
+    app_window.click(button)
+    assert ("playText", ("Wonderland",)) in app_window.backend.calls
+    assert app_window.backend.property("tryPlaying") is True
+    assert (button.property("glyph"), button.property("text")) == ("pause", "Stop")
+    wave = app_window.get("tryWave")
+    color_at = wave.property("colorAt")
+    assert color_at is not None
+    app_window.click(button)
+    assert app_window.backend.property("tryPlaying") is False
+    # Enter in the field plays it too.
+    app_window.click("tryField")
+    QTest.keyClick(app_window.window, Qt.Key.Key_Return)
+    app_window.settle()
+    assert app_window.backend.property("tryPlaying") is True
+    assert_clean(messages)
+
+
+def test_names_without_an_audio_player(app_window: Window, messages: Messages) -> None:
+    app_window.backend.set_preview_available(False)
+    app_window.show("names")
+    assert app_window.get("namePlay0").property("enabled") is False
+    assert app_window.get("tryButton").property("enabled") is False
+    assert app_window.get("tryUnavailable").isVisible()
+    assert not app_window.get("tryWave").isVisible()
+    assert_clean(messages)
+
+
+@pytest.mark.parametrize("width", [1200, 900, 681, 680, 520, 400])
+def test_the_names_screen_reflows(app_window: Window, messages: Messages, width: int) -> None:
+    app_window.window.resize(width, 780)
+    page = app_window.show("names")
+    narrow = width <= 680
+    assert app_window.get("nameCount0").isVisible() is not narrow
+    assert sticks_out(page, width) == []
+    row = app_window.get("nameRow0")
+    assert row.height() == 61  # 60 px and its rule
+    side_by_side = width - 2 * (20 if narrow else 40) >= 928
+    if side_by_side:
+        assert _y(app_window, "namesSide") == _y(app_window, "namesTable")
+        assert app_window.get("namesSide").width() == pytest.approx(360, abs=1)
+    else:
+        assert _y(app_window, "namesSide") > _y(app_window, "showAllNames")
+        assert _x(app_window, "namesSide") == _x(app_window, "namesTable")
+        assert app_window.get("namesSide").width() <= 440
+    # The say-it-as field and the 44 px player share the row with the name.
+    field, play = app_window.get("nameField0"), app_window.get("namePlay0")
+    assert _x(app_window, "namePlay0") + play.width() == pytest.approx(
+        _x(app_window, "nameRow0") + row.width(), abs=0.5
+    )
+    assert field.width() > 0
+    assert_clean(messages)
+
+
+def test_every_dot_on_the_names_screen_is_five_pixels(
+    app_window: Window, messages: Messages
+) -> None:
+    app_window.show("names")
+    for index in range(8):
+        meter = app_window.get(f"nameMeter{index}")
+        assert (meter.property("dotSize"), meter.property("dotSpacing")) == (5, 3)
+        assert meter.property("count") == 11
+    wave = app_window.get("tryWave")
+    assert (wave.property("dotSize"), wave.property("dotSpacing")) == (5, 3)
+    assert wave.property("count") == 40
+    assert wave.height() == 5  # one line
+    assert_clean(messages)
+
+
+def test_the_names_screen_in_the_light_theme(app_window: Window, messages: Messages) -> None:
+    app_window.show("names", "light")
+    assert app_window.get("nameField1").property("lineColor") == QColor("#0B0B0C")
+    assert app_window.get("nameField2").property("lineColor") == QColor("#D9D9DE")
+    app_window.click("namePlay0")
+    assert app_window.get("namePlay0").property("ink") == QColor("#4A5CF2")
     assert_clean(messages)

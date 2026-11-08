@@ -38,9 +38,16 @@ MIN_SPEED, MAX_SPEED, SPEED_STEP = 0.5, 3.0, 0.25  # as in tomecast.gui.backend
 
 QML_URI = "TomecastNative"
 DATA_PATH = Path(__file__).resolve().parent / "data" / "alice_demo.json"
-SCREENS = ("drop", "chapters", "voice", "converting", "done")
+SCREENS = ("drop", "chapters", "voice", "names", "converting", "done")
 STAGES = ("downloading", "starting", "voicing", "packaging")
 METER_DOTS = 17
+NAME_METER_DOTS = 11
+# The fixes the mockup shows (Names-B-own-step.dc.html): two in Alice's list, one global.
+DEMO_FIXES = (
+    {"word": "Gryphon", "say": "GRIFF-on", "scope": "book"},
+    {"word": "Lory", "say": "LOR-ee", "scope": "book"},
+    {"word": "Hermione", "say": "her-MY-oh-nee", "scope": "all"},
+)
 
 VOICE_CATALOG = (
     (
@@ -186,6 +193,17 @@ class DemoChapterModel(QAbstractListModel):
         return True
 
 
+def name_rows(names: list[list[Any]]) -> list[dict[str, Any]]:
+    """``{word, count, countLabel, meterLit}`` rows, the meter log-scaled to the top name."""
+    top = math.log(names[0][1]) if names and names[0][1] > 1 else 0.0
+    rows = []
+    for word, count in names:
+        share = math.log(count) / top if top > 0 else 1.0
+        lit = max(1, min(NAME_METER_DOTS, _half_up(share * NAME_METER_DOTS)))
+        rows.append({"word": word, "count": count, "countLabel": f"{count}×", "meterLit": lit})
+    return rows
+
+
 def _notify(name: str) -> Callable[[DemoBackend], None]:
     def emit(backend: DemoBackend) -> None:
         getattr(backend, f"{name}Changed").emit()
@@ -226,6 +244,12 @@ class DemoBackend(QObject):
     previewTextChanged = Signal()
     previewPlayingChanged = Signal()
     previewAvailableChanged = Signal()
+    namesChanged = Signal()
+    nameFixesChanged = Signal()
+    fixesChanged = Signal()
+    bookListNameChanged = Signal()
+    playingNameChanged = Signal()
+    tryPlayingChanged = Signal()
     downloadNoteChanged = Signal()
     stageChanged = Signal()
     downloadLabelChanged = Signal()
@@ -320,6 +344,12 @@ class DemoBackend(QObject):
             "previewPlaying": False,
             "previewAvailable": True,
             "downloadNote": "",
+            "names": name_rows(data["names"]),
+            "nameFixes": {},
+            "fixes": [dict(fix) for fix in DEMO_FIXES],
+            "bookListName": "alice.pronunciations.txt",
+            "playingName": "",
+            "tryPlaying": False,
             "stage": "voicing",
             "downloadLabel": ("DOWNLOADING ONCE · KOKORO VOICE MODEL (82M, 8-BIT) · 45% OF 190 MB"),
             "chunksDone": chunks_done,
@@ -341,6 +371,7 @@ class DemoBackend(QObject):
         values["voiceLabel"] = self._label_for(values["voice"])
         values["selectionSummary"] = self._summary()
         values["artSource"] = self._art_url("dark")
+        values["nameFixes"] = self._name_fixes(values["names"], values["fixes"])
         changed = [k for k, v in values.items() if self._values.get(k) != v]
         self._values = values
         self.calls.clear()
@@ -402,6 +433,25 @@ class DemoBackend(QObject):
             "make": f"ABOUT {make} MIN TO MAKE HERE" if chosen else "NOTHING TO MAKE",
         }
 
+    @staticmethod
+    def _name_fixes(names: list[dict[str, Any]], fixes: list[dict[str, str]]) -> dict[str, str]:
+        found = {}
+        for row in names:
+            for fix in fixes:
+                if fix["word"].lower() == row["word"].lower():
+                    found[row["word"]] = fix["say"]
+                    break
+        return found
+
+    def _set_fixes(self, fixes: list[dict[str, str]]) -> None:
+        self._set("fixes", fixes)
+        self._set("nameFixes", self._name_fixes(self._get("names"), fixes))
+
+    def _stop_playing(self) -> None:
+        self._set("previewPlaying", False)
+        self._set("playingName", "")
+        self._set("tryPlaying", False)
+
     def _on_selection_changed(self) -> None:
         self._set("selectionSummary", self._summary())
         fronts = [s for s in self._chapters.sections if s.front_matter]
@@ -443,6 +493,14 @@ class DemoBackend(QObject):
     def set_book_has_pages(self, on: bool) -> None:
         self._set("bookHasPages", on)
 
+    def set_names(self, names: list[list[Any]]) -> None:
+        """Pretend the name finder found these ``[word, count]`` pairs (none: no Names step)."""
+        self._set("names", name_rows(names))
+        self._set("nameFixes", self._name_fixes(self._get("names"), self._get("fixes")))
+
+    def set_fixes(self, fixes: list[dict[str, str]]) -> None:
+        self._set_fixes([dict(fix) for fix in fixes])
+
     def show(self, screen: str, theme: str | None = None) -> None:
         """Jump straight to any screen (and theme), opening Alice first if needed.
 
@@ -454,8 +512,8 @@ class DemoBackend(QObject):
             self.setThemeSetting(theme)
         if screen != "drop" and not self._get("bookLoaded"):
             self._load_book()
-        if screen != "voice":
-            self._set("previewPlaying", False)
+        if screen != self._get("screen"):
+            self._stop_playing()
         self._set("screen", screen)
 
     def _load_book(self) -> None:
@@ -488,8 +546,10 @@ class DemoBackend(QObject):
         if screen == "voice" and not any(s.selected for s in self._chapters.sections):
             self._set("errorMessage", "Tick at least one section to make an audiobook.")
             return
-        if screen != "voice":
-            self._set("previewPlaying", False)
+        if screen == "names" and (current != "voice" or not self._get("names")):
+            return
+        if screen != current:
+            self._stop_playing()
         self._set("screen", screen)
 
     @Slot(result=str)
@@ -568,13 +628,62 @@ class DemoBackend(QObject):
     @Slot()
     def togglePreview(self) -> None:
         self._record("togglePreview")
-        if self._get("previewAvailable"):
-            self._set("previewPlaying", not self._get("previewPlaying"))
+        playing = self._get("previewPlaying")
+        self._stop_playing()
+        if not playing and self._get("previewAvailable"):
+            self._set("previewPlaying", True)
+
+    # -- Names ----------------------------------------------------------------------------------
+
+    @Slot(str, str)
+    def setNameFix(self, word: str, say: str) -> None:
+        self._record("setNameFix", word, say)
+        say = say.strip()
+        fixes = [dict(f) for f in self._get("fixes")]
+        current = next((f for f in fixes if f["word"].lower() == word.lower()), None)
+        if not say:
+            fixes = [f for f in fixes if f is not current]
+        elif current is not None:
+            current["say"] = say
+        else:
+            fixes.append({"word": word, "say": say, "scope": "book"})
+        self._set_fixes(fixes)
+
+    @Slot(str, str)
+    def removeFix(self, scope: str, word: str) -> None:
+        self._record("removeFix", scope, word)
+        fixes = [f for f in self._get("fixes") if (f["scope"], f["word"]) != (scope, word)]
+        self._set_fixes([dict(f) for f in fixes])
+
+    @Slot(str, str)
+    def toggleFixScope(self, scope: str, word: str) -> None:
+        self._record("toggleFixScope", scope, word)
+        fixes = [dict(f) for f in self._get("fixes")]
+        for fix in fixes:
+            if (fix["scope"], fix["word"]) == (scope, word):
+                fix["scope"] = "all" if scope == "book" else "book"
+        self._set_fixes(fixes)
+
+    @Slot(str)
+    def playName(self, word: str) -> None:
+        self._record("playName", word)
+        playing = self._get("playingName") == word
+        self._stop_playing()
+        if not playing and self._get("previewAvailable"):
+            self._set("playingName", word)
+
+    @Slot(str)
+    def playText(self, text: str) -> None:
+        self._record("playText", text)
+        playing = self._get("tryPlaying")
+        self._stop_playing()
+        if not playing and text.strip() and self._get("previewAvailable"):
+            self._set("tryPlaying", True)
 
     @Slot()
     def startConversion(self) -> None:
         self._record("startConversion")
-        self._set("previewPlaying", False)
+        self._stop_playing()
         self._set("paused", False)
         self._set("stage", "voicing")
         self._set("screen", "converting")
@@ -673,6 +782,12 @@ class DemoBackend(QObject):
     previewAvailable = Property(
         bool, lambda self: self._get("previewAvailable"), notify=previewAvailableChanged
     )
+    names = Property(list, lambda self: self._get("names"), notify=namesChanged)
+    nameFixes = Property(dict, lambda self: self._get("nameFixes"), notify=nameFixesChanged)
+    fixes = Property(list, lambda self: self._get("fixes"), notify=fixesChanged)
+    bookListName = Property(str, lambda self: self._get("bookListName"), notify=bookListNameChanged)
+    playingName = Property(str, lambda self: self._get("playingName"), notify=playingNameChanged)
+    tryPlaying = Property(bool, lambda self: self._get("tryPlaying"), notify=tryPlayingChanged)
     downloadNote = Property(str, lambda self: self._get("downloadNote"), notify=downloadNoteChanged)
     stage = Property(str, lambda self: self._get("stage"), notify=stageChanged)
     downloadLabel = Property(

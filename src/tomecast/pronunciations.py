@@ -23,11 +23,18 @@ because the pronouncer (eSpeak NG) would spell out a word in capitals letter by 
 Exact phonetic spellings in ``/slashes/`` are not supported: audio.cpp's server can't take
 phonemes (checked in v0.9.4; see docs/architecture.md, section 10). Such a line is skipped
 with a warning.
+
+The window edits these files with :func:`edit` and :func:`save`, which change only the line
+for the word being fixed and keep every other line and comment as the user wrote it.
 """
 
 from __future__ import annotations
 
+import contextlib
+import os
 import re
+import secrets
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -178,3 +185,93 @@ def load_for_book(data_folder: Path, book: Path | None) -> tuple[Pronunciations,
         combined = combined.then(own)
         warnings += own_warnings
     return combined, warnings
+
+
+# --- Editing a list file ------------------------------------------------------------------------
+
+
+def same_written(written: str, other: str) -> bool:
+    """True if the left sides ``written`` and ``other`` are the same, apart from spacing."""
+    return _normalise_key(written) == _normalise_key(other)
+
+
+def matches(written: str, word: str) -> bool:
+    """True if a fix whose left side is ``written`` applies to the whole of ``word``.
+
+    The same rule :class:`Pronunciations` uses: a lowercase left side matches any case, one
+    with a capital matches that spelling and its ALL-CAPS version.
+    """
+    key, word = _normalise_key(written), _normalise_key(word)
+    if key == key.lower():
+        return word.lower() == key
+    return word == key or (len(key) > 1 and word == key.upper())
+
+
+def edit(text: str, written: str, spoken: str | None) -> str:
+    """``text`` (a list file's contents) with the fix for ``written`` set to ``spoken``, or
+    removed when ``spoken`` is ``None``. Every other line, comment and blank line is kept.
+
+    Lines are found by their left side (:func:`same_written`). Changing a fix that is there
+    rewrites the right side of its last line (the one that wins), keeping the left side, the
+    arrow, the spacing and any comment; a new fix goes at the end as ``written → spoken``.
+    Removing a fix removes every line for it, so no older line takes its place.
+    """
+    lines = text.splitlines(keepends=True)
+    found = [i for i, line in enumerate(lines) if _left_side(line) == _normalise_key(written)]
+    if spoken is None:
+        return "".join(line for i, line in enumerate(lines) if i not in found)
+    if found:
+        lines[found[-1]] = _with_right_side(lines[found[-1]], spoken)
+        return "".join(lines)
+    newline = "\r\n" if "\r\n" in text else "\n"
+    if text and not text.endswith(("\n", "\r")):
+        text += newline
+    return f"{text}{_normalise_key(written)} → {spoken}{newline}"
+
+
+def _left_side(line: str) -> str | None:
+    """The left side of a fix line (spacing normalised), or None for comments and blanks."""
+    content = _COMMENT.sub("", line.rstrip("\r\n")).strip()
+    parts = _SEPARATOR.split(content, maxsplit=1)
+    if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
+        return None
+    return _normalise_key(parts[0])
+
+
+def _with_right_side(line: str, spoken: str) -> str:
+    body = line.rstrip("\r\n")
+    ending = line[len(body) :]
+    comment = _COMMENT.search(body)
+    content, tail = (body[: comment.start()], body[comment.start() :]) if comment else (body, "")
+    arrow = _SEPARATOR.search(content)
+    assert arrow is not None  # only called for lines that have a left side
+    right = content[arrow.end() :]
+    padding = right[len(right.rstrip()) :]  # keeps a comment lined up where it was
+    return content[: arrow.end()] + spoken + padding + tail + ending
+
+
+def save(path: Path, text: str) -> None:
+    """Write a list file: to a temporary file next to it, then moved into place, so a list is
+    never left half written. A list that is a symbolic link stays one (the file it points to
+    is written), and a list left with nothing in it is removed rather than kept empty.
+
+    Raises:
+        OSError: if the folder can't be written to.
+    """
+    if not text.strip() and not path.is_symlink():
+        path.unlink(missing_ok=True)
+        return
+    target = path.resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    # A plain open (not mkstemp), so a new list gets the usual permissions for the user.
+    temporary = target.with_name(f".{target.name}.{secrets.token_hex(4)}.tmp")
+    try:
+        with temporary.open("x", encoding="utf-8", newline="") as file:
+            file.write(text)
+        if target.exists():
+            shutil.copymode(target, temporary)
+        os.replace(temporary, target)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            temporary.unlink()
+        raise

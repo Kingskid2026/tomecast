@@ -1,5 +1,6 @@
 // Voice: the voice menu grouped by accent and gender, and a preview with speed (Voice.dc.html).
-// In a narrow window the preview panel moves under the voice menu.
+// In a narrow window the preview panel moves under the voice menu. When the book has names to
+// check, the primary button is Next (to the Names step) instead of Start converting.
 import QtQuick
 import QtQuick.Layouts
 import TomecastNative
@@ -207,8 +208,19 @@ ScreenPage {
                     onClicked: Backend.goTo("chapters")
                 }
 
+                // A book with names to check goes on to the Names step; one without starts here.
+                PillButton {
+                    objectName: "voiceNextButton"
+                    visible: Backend.names.length > 0
+                    variant: "filled"
+                    text: "Next"
+                    enabled: !Backend.loading
+                    onClicked: Backend.goTo("names")
+                }
+
                 PillButton {
                     objectName: "startConvertingButton"
+                    visible: Backend.names.length === 0
                     variant: "filled"
                     text: "Start converting"
                     enabled: !Backend.loading

@@ -162,3 +162,101 @@ def test_the_books_own_list_wins_over_the_global_one(tmp_path: Path) -> None:
     assert combined.apply("Rowan and Zed") == "row-an and zed"
     only_global, _ = pronunciations.load_for_book(data, None)
     assert only_global.apply("Rowan") == "ro-an"
+
+
+# --- editing a list file (the window's Names screen) --------------------------------------------
+
+HAND_MADE = """\
+# Fixes for this book.
+Hermione  →  her-MY-oh-nee   # checked with tomecast preview
+Lothlórien -> loth-LOR-ee-en
+
+# Places
+New  Zealand → noo zee-lund
+"""
+
+
+def test_editing_a_fix_keeps_every_other_line_and_comment() -> None:
+    edited = pronunciations.edit(HAND_MADE, "Hermione", "her-MY-uh-nee")
+    assert edited == HAND_MADE.replace("her-MY-oh-nee", "her-MY-uh-nee")
+    # The left side, the arrow, the spacing and the comment are the user's.
+    assert "Hermione  →  her-MY-uh-nee   # checked with tomecast preview\n" in edited
+
+
+def test_a_new_fix_goes_at_the_end() -> None:
+    edited = pronunciations.edit(HAND_MADE, "Gryphon", "GRIFF-on")
+    assert edited == HAND_MADE + "Gryphon → GRIFF-on\n"
+    assert pronunciations.edit("", "Gryphon", "GRIFF-on") == "Gryphon → GRIFF-on\n"
+    # A file without a final newline gets one first; Windows line endings are kept.
+    assert pronunciations.edit("Zed → zed", "Gryphon", "x") == "Zed → zed\nGryphon → x\n"
+    assert pronunciations.edit("Zed → zed\r\n", "Gryphon", "x") == "Zed → zed\r\nGryphon → x\r\n"
+
+
+def test_removing_a_fix_removes_only_its_lines() -> None:
+    edited = pronunciations.edit(HAND_MADE, "Lothlórien", None)
+    assert edited == HAND_MADE.replace("Lothlórien -> loth-LOR-ee-en\n", "")
+    # Spacing inside the left side doesn't matter; a word with no fix changes nothing.
+    assert "Zealand" not in pronunciations.edit(HAND_MADE, "New Zealand", None)
+    assert pronunciations.edit(HAND_MADE, "Gryphon", None) == HAND_MADE
+    # A comment that mentions the word is not a fix line.
+    text = "# Hermione → not a fix\nHermione → her\n"
+    assert pronunciations.edit(text, "Hermione", None) == "# Hermione → not a fix\n"
+
+
+def test_duplicates_the_last_line_is_changed_and_all_are_removed() -> None:
+    text = "Zed → zee\nZed → zed\n"  # the later line wins when converting
+    assert pronunciations.edit(text, "Zed", "zehd") == "Zed → zee\nZed → zehd\n"
+    assert pronunciations.edit(text, "Zed", None) == ""
+
+
+def test_an_edited_list_reads_back_as_the_fixes_the_window_shows() -> None:
+    edited = pronunciations.edit(HAND_MADE, "Hermione", "her-MY-uh-nee")
+    edited = pronunciations.edit(edited, "Gryphon", "GRIFF-on")
+    edited = pronunciations.edit(edited, "Lothlórien", None)
+    found, warnings = parse(edited)
+    assert warnings == []
+    assert found.entries == (
+        Pronunciation("Hermione", "her-MY-uh-nee"),
+        Pronunciation("New  Zealand", "noo zee-lund"),
+        Pronunciation("Gryphon", "GRIFF-on"),
+    )
+
+
+def test_matches_follows_the_case_rules() -> None:
+    assert pronunciations.matches("siobhan", "Siobhan")
+    assert pronunciations.matches("siobhan", "SIOBHAN")
+    assert pronunciations.matches("Mark", "Mark")
+    assert pronunciations.matches("Mark", "MARK")
+    assert not pronunciations.matches("Mark", "mark")
+    assert not pronunciations.matches("Ron", "Ronald")
+    assert pronunciations.matches("New  Zealand", "New Zealand")
+
+
+def test_save_writes_the_whole_list_and_keeps_its_permissions(tmp_path: Path) -> None:
+    path = tmp_path / "Book.pronunciations.txt"
+    pronunciations.save(path, "Zed → zed\n")
+    assert path.read_text(encoding="utf-8") == "Zed → zed\n"
+    path.chmod(0o640)
+    pronunciations.save(path, "Zed → zehd\n")
+    assert path.read_text(encoding="utf-8") == "Zed → zehd\n"
+    assert path.stat().st_mode & 0o777 == 0o640
+    assert [p.name for p in tmp_path.iterdir()] == [path.name]  # no temporary file left
+
+
+def test_save_writes_through_a_link_and_removes_an_empty_list(tmp_path: Path) -> None:
+    real = tmp_path / "dotfiles" / "pronunciations.txt"
+    real.parent.mkdir()
+    real.write_text("Zed → zed\n", encoding="utf-8")
+    link = tmp_path / "data" / "pronunciations.txt"
+    link.parent.mkdir()
+    link.symlink_to(real)
+    pronunciations.save(link, "Zed → zehd\n")
+    assert link.is_symlink()
+    assert real.read_text(encoding="utf-8") == "Zed → zehd\n"
+
+    plain = tmp_path / "Book.pronunciations.txt"
+    plain.write_text("Zed → zed\n", encoding="utf-8")
+    pronunciations.save(plain, "")
+    assert not plain.exists()  # nothing left: no empty file next to the book
+    pronunciations.save(tmp_path / "never.txt", "")
+    assert not (tmp_path / "never.txt").exists()

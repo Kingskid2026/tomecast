@@ -19,6 +19,7 @@ import pytest
 from PySide6.QtCore import QSettings, QUrl
 from pytestqt.qtbot import QtBot
 
+from tomecast import pronunciations
 from tomecast.audio import wav_info
 from tomecast.book import Book, Chapter
 from tomecast.cleanup import is_numbered_chapter
@@ -33,9 +34,11 @@ from tomecast.engines.audiocpp import (
     split_speed,
 )
 from tomecast.gui import backend as backend_module
+from tomecast.gui import fixes as fixes_module
 from tomecast.gui.backend import STOPPED_MESSAGE, Backend, safe_file_name, unique_output
 from tomecast.gui.models import ChapterModel, display_title, summarize
-from tomecast.gui.worker import TimedControl, preview_file
+from tomecast.gui.worker import BookRead, TimedControl, preview_file
+from tomecast.names import Name
 from tomecast.textprep import TextPrep
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # for epub_factory, pdf_factory
@@ -1171,7 +1174,7 @@ def test_a_book_read_finishing_mid_conversion_is_dropped(
     stranger = Book("Stranger", ("Z",), None, (Chapter("Elsewhere", ("Not this one.",)),))
     backend._read_job = 99
     backend._update("loading", True)
-    backend._worker.bookRead.emit(99, stranger)
+    backend._worker.bookRead.emit(99, BookRead(stranger))
     qtbot.waitUntil(lambda: not backend.loading)
 
     assert backend.screen == "converting"  # the conversion is not stranded…
@@ -1199,7 +1202,7 @@ def test_shutdown_after_a_dropped_read_does_not_wait_for_the_conversion(
     qtbot.waitUntil(engines.blocked.is_set)
     control = _control(backend)
     backend._read_job = 99
-    backend._worker.bookRead.emit(99, Book("Stranger", ("Z",), None, ()))
+    backend._worker.bookRead.emit(99, BookRead(Book("Stranger", ("Z",), None, ())))
 
     engines.release.set()
     backend.shutdown()
@@ -1819,3 +1822,273 @@ def test_a_pdf_is_voiced_without_its_page_furniture(
     # Spoken as text prep says it ("III." as "three.", "$8 flat" as "eight-dollar flat").
     prep = TextPrep.for_language("en")
     assert voiced == " ".join([prep.heading(title), *(prep.body(plain(p)) for p in paragraphs)])
+
+
+# --- Names: the name finder and the pronunciation lists -------------------------------------------
+
+
+def _names_book(folder: Path) -> Path:
+    """A short book with three made-up names: Zorp (5 times), Glimmerdale and Mira (3 each)."""
+    pages = [
+        Page("c1.xhtml", "<p>Zorp walked to Glimmerdale with Mira. Later, Zorp and Mira rested.</p>"
+                         "<p>At Glimmerdale the river ran fast, and Zorp swam.</p>"),
+        Page("c2.xhtml", "<p>Mira laughed. Zorp laughed too, far from Glimmerdale.</p>"),
+    ]  # fmt: skip
+    toc = [NavPoint("Chapter 1: Zorp", "c1.xhtml"), NavPoint("Chapter 2", "c2.xhtml")]
+    return build_epub(folder / "names.epub", pages, toc=toc, title="Names Book")
+
+
+def _sleepy_player(folder: Path) -> str:
+    """A stand-in audio player that takes its time, so "playing" can be seen."""
+    script = folder / "slow-player"
+    script.write_text("#!/bin/sh\nsleep 5\n", encoding="utf-8")
+    script.chmod(0o755)
+    return str(script)
+
+
+def _book_list(folder: Path) -> Path:
+    return folder / "names.pronunciations.txt"
+
+
+def test_the_name_rows_are_log_scaled_like_the_mockup() -> None:
+    rows = backend_module.name_rows(
+        [Name("Alice", 399), Name("Gryphon", 55), Name("Dinah", 14), Name("Eaglet", 3)]
+    )
+    assert [(r["word"], r["countLabel"], r["meterLit"]) for r in rows] == [
+        ("Alice", "399×", 11), ("Gryphon", "55×", 7), ("Dinah", "14×", 5), ("Eaglet", "3×", 2),
+    ]  # fmt: skip
+    assert backend_module.name_rows([]) == []
+
+
+def test_a_book_with_names_has_a_names_step_after_voice(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    backend = make_backend()
+    _open(qtbot, backend, _names_book(tmp_path))
+    assert [(r["word"], r["count"]) for r in backend.names] == [
+        ("Zorp", 5), ("Glimmerdale", 3), ("Mira", 3),
+    ]  # fmt: skip
+    assert backend.bookListName == "names.pronunciations.txt"
+    assert backend.fixes == [] and backend.nameFixes == {}
+
+    backend.goTo("names")  # only from Voice
+    assert backend.screen == "chapters"
+    backend.goTo("voice")
+    backend.goTo("names")
+    assert backend.screen == "names"
+    backend.goTo("voice")  # Back
+    assert backend.screen == "voice"
+
+
+def test_a_book_without_names_skips_the_step(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    backend = make_backend()
+    _open(qtbot, backend, _short_book(tmp_path))
+    assert backend.names == []
+    backend.goTo("voice")
+    backend.goTo("names")
+    assert backend.screen == "voice"
+
+
+def test_a_fix_made_in_the_window_reaches_the_spoken_text(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    engines = Engines()
+    backend = make_backend(engines)
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "pronunciations.txt").write_text(
+        "# mine\nMira → MEER-uh\n", encoding="utf-8"
+    )
+    _open(qtbot, backend, _names_book(tmp_path))
+    assert backend.nameFixes == {"Mira": "MEER-uh"}  # the global list already has one
+
+    backend.setNameFix("Zorp", "ZAWRP")
+    assert backend.errorMessage == ""
+    assert _book_list(tmp_path).read_text(encoding="utf-8") == "Zorp → ZAWRP\n"
+    assert backend.nameFixes == {"Zorp": "ZAWRP", "Mira": "MEER-uh"}
+    assert backend.fixes == [
+        {"word": "Zorp", "say": "ZAWRP", "scope": "book"},
+        {"word": "Mira", "say": "MEER-uh", "scope": "all"},
+    ]
+
+    backend.goTo("voice")
+    backend.goTo("names")
+    backend.startConversion()  # from the Names screen, as from Voice
+    assert backend.screen == "converting"
+    qtbot.waitUntil(lambda: backend.screen != "converting", timeout=CONVERSION_TIMEOUT)
+    assert backend.screen == "done", backend.errorMessage
+
+    spoken = " ".join(engines.texts)
+    assert "Zorp" not in spoken and "Mira" not in spoken
+    assert "zawrp walked to Glimmerdale with meer-uh." in spoken
+    # Every sentence was still spoken: the same pieces as the command line makes with the lists.
+    prep = TextPrep.for_language(
+        "en", pronunciations.load_for_book(tmp_path / "data", tmp_path / "names.epub")[0]
+    )
+    book = backend._book
+    assert book is not None
+    expected = [c.text for chunks in plan_chunks(book, FakeEngine.max_chars, prep=prep)
+                for c in chunks if c.speakable]  # fmt: skip
+    assert engines.texts == expected
+
+
+def test_editing_moving_and_removing_fixes(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    backend = make_backend()
+    _open(qtbot, backend, _names_book(tmp_path))
+    global_list = tmp_path / "data" / "pronunciations.txt"
+
+    backend.setNameFix("Zorp", "ZAWRP")
+    backend.toggleFixScope("book", "Zorp")  # to every book
+    assert global_list.read_text(encoding="utf-8") == "Zorp → ZAWRP\n"
+    assert not _book_list(tmp_path).exists()  # nothing left in it: no empty file
+    assert backend.fixes == [{"word": "Zorp", "say": "ZAWRP", "scope": "all"}]
+
+    backend.setNameFix("Zorp", "ZORP")  # changed where it is: the global list
+    assert global_list.read_text(encoding="utf-8") == "Zorp → ZORP\n"
+    backend.toggleFixScope("all", "Zorp")  # back to this book only
+    assert _book_list(tmp_path).read_text(encoding="utf-8") == "Zorp → ZORP\n"
+    assert backend.fixes == [{"word": "Zorp", "say": "ZORP", "scope": "book"}]
+
+    backend.setNameFix("Zorp", "   ")  # clearing the field removes it
+    assert backend.fixes == [] and backend.nameFixes == {}
+    backend.setNameFix("Mira", "MEER-uh")
+    backend.removeFix("book", "Mira")
+    assert backend.fixes == []
+    backend.setNameFix("Nobody", "x")  # not a listed name: ignored
+    backend.removeFix("nowhere", "Zorp")
+    assert backend.fixes == [] and backend.errorMessage == ""
+
+
+def test_a_respelling_the_list_cant_hold_is_explained_and_not_saved(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    backend = make_backend()
+    _open(qtbot, backend, _names_book(tmp_path))
+    backend.setNameFix("Zorp", "/zɔrp/")
+    assert backend.errorMessage == fixes_module.SLASHES
+    assert backend.nameFixes == {}
+    assert not _book_list(tmp_path).exists()
+    backend.setNameFix("Zorp", "zawrp")  # a good one clears the banner the bad one put up
+    assert backend.errorMessage == ""
+    assert backend.nameFixes == {"Zorp": "zawrp"}
+
+
+def test_a_read_only_book_folder_keeps_the_fix_for_the_session(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    if os.geteuid() == 0:
+        pytest.skip("root can write to read-only folders")
+    engines = Engines()
+    backend = make_backend(engines, player=_sleepy_player(tmp_path))
+    books = tmp_path / "books"
+    books.mkdir()
+    _open(qtbot, backend, _names_book(books))
+    books.chmod(0o555)
+    try:
+        backend.setNameFix("Zorp", "ZAWRP")
+        assert backend.errorMessage.startswith(
+            f"Tomecast couldn't save names.pronunciations.txt in {books} (permission denied)."
+        )
+        assert backend.errorMessage.endswith("The change works until you close Tomecast.")
+        assert backend.nameFixes == {"Zorp": "ZAWRP"}  # kept for now…
+        assert not _book_list(books).exists()  # …but not saved
+        backend.playName("Zorp")  # and the players use it
+        qtbot.waitUntil(lambda: bool(engines.texts))
+        assert engines.texts == ["zawrp"]
+    finally:
+        books.chmod(0o755)
+        backend.playName("Zorp")
+
+
+def test_a_fix_that_couldnt_be_saved_still_reaches_the_conversion(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    if os.geteuid() == 0:
+        pytest.skip("root can write to read-only folders")
+    engines = Engines()
+    backend = make_backend(engines)
+    # The global list is a link into a read-only folder: it can't be saved, while the data
+    # folder (which holds the work in progress) and the book's folder are fine.
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    (locked / "pronunciations.txt").write_text("Zorp → zorp-o\n", encoding="utf-8")
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "pronunciations.txt").symlink_to(locked / "pronunciations.txt")
+    _open(qtbot, backend, _names_book(tmp_path))
+    locked.chmod(0o555)
+    try:
+        backend.setNameFix("Zorp", "ZAWRP")  # a global fix, changed in the global list
+        assert "couldn't save pronunciations.txt" in backend.errorMessage
+        _convert(qtbot, backend)
+    finally:
+        locked.chmod(0o755)
+    assert backend.screen == "done", backend.errorMessage
+    assert any(text.startswith("zawrp") for text in engines.texts)
+    assert (locked / "pronunciations.txt").read_text(encoding="utf-8") == "Zorp → zorp-o\n"
+
+
+def test_list_lines_that_cant_be_used_are_noted_on_the_done_screen(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    backend = make_backend()
+    book = _names_book(tmp_path)
+    _book_list(tmp_path).write_text("Zorp → /zɔrp/\n", encoding="utf-8")
+    _open(qtbot, backend, book)
+    _convert(qtbot, backend)
+    assert backend.screen == "done"
+    assert any(
+        w.startswith("Pronunciation list: names.pronunciations.txt, line 1: exact phonetic")
+        for w in backend.warnings
+    ), backend.warnings
+
+
+def test_one_thing_plays_at_a_time_with_the_fixes(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    engines = Engines()
+    backend = make_backend(engines, player=_sleepy_player(tmp_path))
+    _open(qtbot, backend, _names_book(tmp_path))
+    backend.setNameFix("Zorp", "ZAWRP")
+    backend.goTo("voice")
+    backend.goTo("names")
+
+    backend.playName("Zorp")
+    assert backend.playingName == "Zorp"
+    qtbot.waitUntil(lambda: backend._playback is not None)
+    backend.playName("Mira")  # another row: switches to it
+    assert backend.playingName == "Mira"
+    qtbot.waitUntil(lambda: backend._playback is not None)
+    backend.playText("Zorp met Mira on 4 July.")  # TRY ANY WORD: switches again
+    assert (backend.playingName, backend.tryPlaying) == ("", True)
+    qtbot.waitUntil(lambda: len(engines.texts) == 3)
+    backend.playText("anything")  # a second press stops it
+    assert backend.tryPlaying is False and backend._playback is None
+    # Each was voiced as the book will be: with the fixes and the number rules.
+    assert engines.texts == ["zawrp", "Mira", "zawrp met Mira on the fourth of July."]
+
+    backend.playName("Zorp")  # voiced already: played from the cache
+    assert backend.playingName == "Zorp"
+    backend.goTo("voice")  # leaving the screen stops it
+    assert backend.playingName == "" and backend._playback is None
+    assert len(engines.texts) == 3
+    backend.playText("   ")  # nothing to say
+    assert backend.tryPlaying is False
+
+
+def test_the_voice_preview_uses_the_fixes_too(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    engines = Engines()
+    backend = make_backend(engines, player=shutil.which("true"))
+    if backend.previewAvailable is False:
+        pytest.skip("needs the `true` command as a stand-in audio player")
+    _open(qtbot, backend, _names_book(tmp_path))
+    backend.setNameFix("Zorp", "ZAWRP")
+    backend.goTo("voice")
+    assert backend.previewText == "Zorp walked to Glimmerdale with Mira."  # shown as written
+    backend.togglePreview()
+    qtbot.waitUntil(lambda: not backend.previewPlaying)
+    assert engines.texts == ["zawrp walked to Glimmerdale with Mira."]  # spoken with the fix
