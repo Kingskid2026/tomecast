@@ -166,6 +166,19 @@ def test_png_sizes_are_real_pngs_of_the_right_size(size: int) -> None:
     assert int.from_bytes(data[20:24], "big") == size
 
 
+@pytest.mark.parametrize("size", [16, 24])
+def test_small_icon_drawings_are_the_same_grid_snapped_to_pixels(size: int) -> None:
+    # Same design as tomecast.svg: 25 dots, 12 voiced, the centre one speaking, 12 waiting.
+    icons = desktop._ICON_SOURCE.parent
+    text = (icons / f"tomecast-{size}.svg").read_text(encoding="utf-8")
+    assert "<title>Tomecast</title>" in text
+    assert text.count("<circle") == 25
+    assert text.count('fill="#F2F2F2"') == 12
+    assert text.count('fill="#7C8CFF"') == 1
+    assert text.count('fill="#2A2A2E"') == 12
+    assert f'viewBox="0 0 {size} {size}"' in text
+
+
 NASTY_PATHS = ['/x/a"b', "/x/a`b", "/x/a$b", "/x/a\\b", '/x/$HOME/"q"/`id`/\\n a b', "/x/100%/y"]
 
 

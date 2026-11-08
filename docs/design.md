@@ -61,7 +61,9 @@ The icon is the sentence grid, frozen at the moment of speaking. It's drawn in `
 - Twenty-five circles of radius 14, centred at 48, 88, 128, 168 and 208 on both axes, in reading order (left to right, then top to bottom).
 - Dots 1–12 are `#F2F2F2` (voiced), dot 13 at the centre is `#7C8CFF` (the accent: being spoken), and dots 14–25 are `#2A2A2E` (waiting).
 
-The PNG sizes (16, 24, 32, 48, 64, 128, 256) in `src/tomecast/gui/icons/png/` are rendered from the SVG by `scripts/render_icons.py`, so re-run it after any change to the SVG. The installer copies them alongside the SVG, and the window sets the 256 px PNG as its icon.
+At 16 and 24 px, the scaled-down grid falls between pixels and blurs into a plaid. So those two sizes have their own drawing, `tomecast-16.svg` and `tomecast-24.svg`: the same 25 dots in the same colours and order, snapped to whole pixels. At 16 px the dots are 2 px wide and 3 px apart, and at 24 px they're 4 px apart.
+
+The PNG sizes (16, 24, 32, 48, 64, 128, 256) in `src/tomecast/gui/icons/png/` are rendered by `scripts/render_icons.py`, from the snapped drawing where a size has one and from `tomecast.svg` otherwise. Re-run it after changing any of them, and change all three together. The installer copies them alongside the SVG, and the window sets the 256 px PNG as its icon.
 
 ## Screens
 
