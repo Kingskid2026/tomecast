@@ -37,7 +37,7 @@ If your change affects audio, **listen to the result** and say what you checked 
 
 1. **Every sentence gets spoken.** Never send a whole page or chapter to a voice model in one go, because models silently cut off long input. Text goes to the voice in small, size-capped chunks, and every chunk is checked for audio before packaging. See "Every sentence gets spoken" in [docs/architecture.md](docs/architecture.md).
 2. **No copyrighted books in the repo.** Test books come only from the public domain ([Project Gutenberg](https://www.gutenberg.org/), [Standard Ebooks](https://standardebooks.org/), the [Internet Archive](https://archive.org/)'s public-domain scans). Keep your own books in `local/`, which git ignores.
-3. **No model or engine files in the repo.** Tomecast downloads them from their official sources, pinned by version and SHA-256 checksum.
+3. **No model or engine files in the repo.** Tomecast downloads them from their official sources, pinned by version and SHA-256 checksum. The one exception to "official" is the audio.cpp voice engine, which our CI builds from audio.cpp's official source (see below).
 4. **Unit tests don't use the network.** Anything that downloads goes in a separately marked integration test.
 5. **Built-in voices only.** No cloning of real people's voices.
 6. **Keep the docs true.** If you change the design, update [docs/architecture.md](docs/architecture.md) in the same pull request.
@@ -67,3 +67,7 @@ Maintainers don't tag releases by hand:
 GitHub doesn't run CI on pull requests a bot opened, so the release pull request shows no checks. It only changes the version number and the changelog, made from code that already passed, so a maintainer merges it using the admin bypass on the `main` branch rules.
 
 Before a release, a maintainer runs the GPU checks on real hardware, because GitHub's CI machines have no graphics card.
+
+### Voice engine builds
+
+audio.cpp's own Linux binaries need a very new glibc, so [`engine-build.yml`](.github/workflows/engine-build.yml) builds audio.cpp's tagged release, unmodified, on an older base system. Pushing a tag like `audiocpp-v0.9.4-tc1` publishes those builds as a separate release named "audio.cpp 0.9.4 engine builds". It's never marked "latest" and doesn't touch the app's releases. Then a normal pull request pins the new tarballs' URLs and SHA-256s in `src/tomecast/engines/audiocpp.py`, and the integration workflow converts a book with them on each supported distro. Bump the `-tcN` number for each new build of the same audio.cpp version.

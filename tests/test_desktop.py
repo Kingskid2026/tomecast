@@ -49,6 +49,9 @@ def test_install_writes_entry_and_icon(
     icon = data_home / "icons" / "hicolor" / "scalable" / "apps" / "tomecast.svg"
     assert icon.read_text().startswith("<?xml")
     assert "<svg" in icon.read_text()
+    for size in desktop.ICON_SIZES:
+        png = data_home / "icons" / "hicolor" / f"{size}x{size}" / "apps" / "tomecast.png"
+        assert png.read_bytes() == (desktop._PNG_SOURCES[size]).read_bytes()
     assert any("app launcher" in message for message in messages)
 
 
@@ -72,12 +75,14 @@ def test_falls_back_to_argv0(
     assert desktop.find_executable() == str(program.resolve())
 
 
-def test_uninstall_removes_both_files(data_home: Path) -> None:
+def test_uninstall_removes_entry_icon_and_pngs(data_home: Path) -> None:
     desktop.install()
     messages = desktop.uninstall()
     assert not (data_home / "applications" / "tomecast.desktop").exists()
     assert not (data_home / "icons/hicolor/scalable/apps/tomecast.svg").exists()
-    assert len(messages) == 2
+    for size in desktop.ICON_SIZES:
+        assert not (data_home / "icons" / "hicolor" / f"{size}x{size}/apps/tomecast.png").exists()
+    assert len(messages) == 3  # the entry, the SVG, and one line for the PNGs
 
 
 def test_uninstall_with_nothing_installed(data_home: Path) -> None:
@@ -95,6 +100,16 @@ def test_uninstall_leaves_someone_elses_files(data_home: Path) -> None:
     assert entry.exists()
     assert icon.exists()
     assert all("alone" in message for message in messages)
+
+
+def test_uninstall_leaves_someone_elses_png_alone(data_home: Path) -> None:
+    desktop.install()
+    other = data_home / "icons/hicolor/256x256/apps/tomecast.png"
+    other.write_bytes(b"not ours")
+    messages = desktop.uninstall()
+    assert other.read_bytes() == b"not ours"
+    assert any("256x256" in message and "alone" in message for message in messages)
+    assert not (data_home / "icons/hicolor/16x16/apps/tomecast.png").exists()
 
 
 def test_missing_cache_tools_are_fine(data_home: Path) -> None:
@@ -135,9 +150,20 @@ def test_generated_entry_passes_desktop_file_validate(tmp_path: Path) -> None:
 
 def test_icon_is_a_clean_svg() -> None:
     text = (Path(desktop.__file__).parent / "gui/icons/tomecast.svg").read_text()
-    assert "PLACEHOLDER" in text
+    assert "PLACEHOLDER" not in text
+    assert "<title>Tomecast</title>" in text  # how uninstall recognises the installed copy
+    assert text.count("<circle") == 25
     assert "<script" not in text
     assert "http" not in text.replace("http://www.w3.org/2000/svg", "")
+
+
+@pytest.mark.parametrize("size", desktop.ICON_SIZES)
+def test_png_sizes_are_real_pngs_of_the_right_size(size: int) -> None:
+    data = (desktop._PNG_SOURCES[size]).read_bytes()
+    assert data[:8] == b"\x89PNG\r\n\x1a\n"
+    # The IHDR chunk comes first: width and height are big-endian 32-bit ints at byte 16.
+    assert int.from_bytes(data[16:20], "big") == size
+    assert int.from_bytes(data[20:24], "big") == size
 
 
 NASTY_PATHS = ['/x/a"b', "/x/a`b", "/x/a$b", "/x/a\\b", '/x/$HOME/"q"/`id`/\\n a b', "/x/100%/y"]

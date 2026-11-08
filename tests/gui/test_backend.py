@@ -25,7 +25,14 @@ from tomecast.book import Book, Chapter
 from tomecast.cleanup import is_numbered_chapter
 from tomecast.convert import plan_chunks
 from tomecast.downloads import Asset, is_installed
-from tomecast.engines.audiocpp import EngineError, split_speed
+from tomecast.engines.audiocpp import (
+    AUDIOCPP_CPU,
+    AUDIOCPP_VULKAN,
+    ESPEAK_NG,
+    KOKORO_Q8,
+    EngineError,
+    split_speed,
+)
 from tomecast.gui import backend as backend_module
 from tomecast.gui import fixes as fixes_module
 from tomecast.gui.backend import STOPPED_MESSAGE, Backend, safe_file_name, unique_output
@@ -1536,18 +1543,32 @@ def test_turning_the_card_off_shows_the_cpu_label(qtbot: QtBot, make_backend: Ma
     assert backend.hardwareLabel == "NVIDIA RTX PRO 1000"
 
 
+# What a fresh install downloads for each choice: one engine build, plus eSpeak and Kokoro.
+GPU_DOWNLOADS = (AUDIOCPP_VULKAN, ESPEAK_NG, KOKORO_Q8)
+CPU_DOWNLOADS = (AUDIOCPP_CPU, ESPEAK_NG, KOKORO_Q8)
+
+
+def _note_for(assets: tuple[Asset, ...]) -> str:
+    """The voice screen's note for downloading ``assets``, from their pinned sizes (rounded up
+    to whole MB, as test_download_note_says_what_start_will_download checks)."""
+    mb = math.ceil(sum(asset.size for asset in assets) / 1_000_000)
+    return f"STARTING DOWNLOADS THE VOICE ONCE · {mb:,} MB"
+
+
 def test_the_download_note_follows_the_engine_the_choice_needs(
     qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
 ) -> None:
+    # The two engine builds differ in size, so the note tells them apart.
+    assert _note_for(GPU_DOWNLOADS) != _note_for(CPU_DOWNLOADS)
     backend = make_backend(gpu=True, assets=None)
     _open(qtbot, backend, _short_book(tmp_path))
 
-    backend.goTo("voice")  # nothing installed: Vulkan build + eSpeak + Kokoro
-    assert backend.downloadNote == "STARTING DOWNLOADS THE VOICE ONCE · 317 MB"
-    backend.setUseGpu(False)  # CPU build + eSpeak + Kokoro
-    assert backend.downloadNote == "STARTING DOWNLOADS THE VOICE ONCE · 264 MB"
+    backend.goTo("voice")  # nothing installed
+    assert backend.downloadNote == _note_for(GPU_DOWNLOADS)
+    backend.setUseGpu(False)
+    assert backend.downloadNote == _note_for(CPU_DOWNLOADS)
     backend.setUseGpu(True)
-    assert backend.downloadNote == "STARTING DOWNLOADS THE VOICE ONCE · 317 MB"
+    assert backend.downloadNote == _note_for(GPU_DOWNLOADS)
 
 
 def test_without_a_driver_the_cpu_engine_is_what_gets_downloaded(
@@ -1556,7 +1577,21 @@ def test_without_a_driver_the_cpu_engine_is_what_gets_downloaded(
     backend = make_backend(gpu=False, assets=None)
     _open(qtbot, backend, _short_book(tmp_path))
     backend.goTo("voice")
-    assert backend.downloadNote == "STARTING DOWNLOADS THE VOICE ONCE · 264 MB"
+    assert backend.downloadNote == _note_for(CPU_DOWNLOADS)
+
+
+def test_an_installed_engine_build_is_not_downloaded_again(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    installed = {AUDIOCPP_VULKAN.path}
+    monkeypatch.setattr(backend_module, "is_installed", lambda a, root: a.path in installed)
+    backend = make_backend(gpu=True, assets=None)
+    _open(qtbot, backend, _short_book(tmp_path))
+
+    backend.goTo("voice")  # the Vulkan build is there; eSpeak and Kokoro aren't
+    assert backend.downloadNote == _note_for((ESPEAK_NG, KOKORO_Q8))
+    backend.setUseGpu(False)  # the CPU build is a separate download
+    assert backend.downloadNote == _note_for(CPU_DOWNLOADS)
 
 
 def test_a_conversion_on_the_card_reports_its_name_and_speed(

@@ -12,6 +12,7 @@
 | Inspiration | The maintainer's own earlier "blueprint" site (one blue accent on near-black); Gradium Phonon's dot-matrix player; the print discipline of Nous Research's work. Tomecast is *inspired by* these, not a copy: it doesn't use Phonon's lime accent or the same artworks. |
 | Themes | **Light and dark, following the desktop's setting**, with a manual switch in the app. Each is designed as its own palette, not an automatic inversion. |
 | Motion | **One living element:** the sentence-dot grid while converting. Everything else animates only on state changes. |
+| App icon | **The sentence grid** (the maintainer's option "A · Sentence grid"): a 5 × 5 grid of dots on near-black, in reading order. The first twelve are light (voiced), the centre one is the accent (being spoken), the rest are dim (waiting). See *App icon* below. |
 | Artwork | **The book's own cover**, rendered in dots on the chapter, converting and done screens. **The drop screen**, where no book is loaded yet, shows **Luca della Robbia's *Cantoria*** (1431–38, marble children singing: a Renaissance image of voices) in the same dots. |
 | Pronunciation editor | **Option B: a Names step of its own, after Voice** (mockup `Names-B-own-step.dc.html`, chosen 2026-11-08). It appears only when the name finder finds something; otherwise Voice keeps Start converting and the step is skipped. Skipping the fixes is one click: Start converting on the Names screen. |
 
@@ -51,6 +52,16 @@ All three are open-licensed (SIL OFL) and get bundled with the app.
 - **A round play/pause** for the voice preview, with a row of dots as its waveform.
 - **No boxes:** sections are separated by space, or a plain 1 px line where a list needs one. No dotted outlines and no crop-mark corners.
 - **Images in dots (covers and art):** a classic halftone, drawn the same way as the art on the maintainer's site: round dots on a grid turned about 29° (so they never line up into rows and columns like a pixel screen), **3.4 px apart**, with each dot's *area* following the ink (radius = half the spacing × √ink). The biggest dots just touch, so every dot stays a whole circle. Each dot shows the average tone of its whole cell, after an autocontrast so dull covers still use every dot size. The image keeps its own shape. Dark theme: light dots on near-black, never inverted (inverted faces look like ghosts). Light theme: dark dots on paper. Drawn with Qt (no Pillow) once per book and size, not live. Fine line engravings don't survive this (their hatching is smaller than a dot), so artwork should be paintings or sculpture.
+
+## App icon
+
+The icon is the sentence grid, frozen at the moment of speaking. It's drawn in `src/tomecast/gui/icons/tomecast.svg` on a 256 × 256 viewBox:
+
+- A rounded square (`rx` 56), filled `#0B0B0C`.
+- Twenty-five circles of radius 14, centred at 48, 88, 128, 168 and 208 on both axes, in reading order (left to right, then top to bottom).
+- Dots 1–12 are `#F2F2F2` (voiced), dot 13 at the centre is `#7C8CFF` (the accent: being spoken), and dots 14–25 are `#2A2A2E` (waiting).
+
+The PNG sizes (16, 24, 32, 48, 64, 128, 256) in `src/tomecast/gui/icons/png/` are rendered from the SVG by `scripts/render_icons.py`, so re-run it after any change to the SVG. The installer copies them alongside the SVG, and the window sets the 256 px PNG as its icon.
 
 ## Screens
 

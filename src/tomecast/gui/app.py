@@ -11,7 +11,7 @@ from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 
 from PySide6.QtCore import QSocketNotifier, QUrl
-from PySide6.QtGui import QFontDatabase, QGuiApplication
+from PySide6.QtGui import QFontDatabase, QGuiApplication, QIcon
 from PySide6.QtQml import (
     QQmlApplicationEngine,
     QQmlImageProviderBase,
@@ -23,6 +23,8 @@ from tomecast.gui.backend import Backend
 _HERE = Path(__file__).resolve().parent
 QML_MAIN = _HERE / "qml" / "Main.qml"
 FONTS = _HERE / "fonts"
+# The 256 px PNG: the window icon, for window managers that don't use the desktop entry.
+WINDOW_ICON = _HERE / "icons" / "png" / "tomecast-256.png"
 
 
 def load_fonts(folder: Path = FONTS) -> int:
@@ -100,6 +102,7 @@ def run(argv: Sequence[str] | None = None) -> int:
     app.setApplicationName("Tomecast")
     app.setOrganizationName("Tomecast")
     app.setDesktopFileName("tomecast")  # the Wayland app-id, which finds the launcher icon
+    app.setWindowIcon(QIcon(str(WINDOW_ICON)))
     load_fonts()
 
     provider, cover_sink = _image_provider()
