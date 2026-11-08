@@ -1,6 +1,6 @@
 # Tomecast architecture
 
-*How Tomecast is designed, and why. Kept up to date as the design changes. Last updated 2026-11-05.*
+*How Tomecast is designed, and why. Kept up to date as the design changes. Last updated 2026-11-08.*
 
 ## Goal
 
@@ -140,7 +140,7 @@ Text prep turns written text into speakable text, deterministically, in **one pl
 ### 4. Voice engines
 Both sit behind one small interface (`voices()`, `languages()`, `synthesize(chunk, voice, speed)`), so more engines can be added later.
 
-**Both voices run on audio.cpp.** It's a C++ engine for voice models (Apache 2.0, v0.9.4, 4,000+ GitHub stars, updated daily) that runs Kokoro and Ming from GGUF files. Tomecast uses its own unmodified builds of audio.cpp's releases, for CPU ({CPU_MB}) and Vulkan ({VULKAN_MB}), because upstream's Linux builds only run on the newest distros (section 9).
+**Both voices run on audio.cpp.** It's a C++ engine for voice models (Apache 2.0, v0.9.4, 4,000+ GitHub stars, updated daily) that runs Kokoro and Ming from GGUF files. Tomecast uses its own unmodified builds of audio.cpp's releases, for CPU (27 MB) and Vulkan (45 MB), because upstream's Linux builds only run on the newest distros (section 9).
 - **No Python and no PyTorch.**
 - **Vulkan means NVIDIA *and* AMD graphics cards work the same way.**
 - Risk: it's young (first release June 2026) and run by one company, so we pin a tested version (v0.9.3 or newer, for Ming).
@@ -150,7 +150,8 @@ Both sit behind one small interface (`voices()`, `languages()`, `synthesize(chun
   - Tomecast runs audio.cpp's **local HTTP server** once per book, so the model loads one time, and sends one chunk per request. That's about 30% faster than one process per sentence on short sentences.
   - There's no silent truncation: more than **510 phonemes** in one request is a hard error. Tomecast keeps chunks at **200 characters**, and if a chunk still hits the limit (long numbers, mostly), it splits that chunk and joins the audio.
   - Memory: about 1 GB while voicing, measured on a Ryzen AI 7 PRO 350 at about 4× faster than real time on 8 CPU threads.
-- Fallback if it breaks: Kokoro through `kokoro-onnx` (FP16-stored weights, never the INT8 file, see section 10), and Ming through its official Python repo in a sandbox.
+- **No second Kokoro engine.** A `kokoro-onnx` fallback was planned for systems audio.cpp's downloads couldn't run on. Its main job was distros older than glibc 2.43, which Tomecast's own build now covers (section 9), so it was dropped (2026-11-08). That leaves ARM Linux without a voice engine for now (see the honest limits). If a new audio.cpp release breaks something, Tomecast stays on the build it has pinned and tested (section 11).
+- Fallback for Ming if audio.cpp can't run it: its official Python repo in a sandbox.
 
 **Kokoro (default, every machine)**
 - 82M parameters, Apache 2.0, 54 voices. Languages: English (US/UK), Spanish, French, Italian, Portuguese, Hindi, Japanese, Chinese.
@@ -163,7 +164,7 @@ Both sit behind one small interface (`voices()`, `languages()`, `synthesize(chun
 - Uses the official audio.cpp **Q8_0** file (1.74 GB). Measured on an RTX 5090: about 6× faster than real time, using ~1.9 GB of graphics memory. audio.cpp also reports valid output on CPU and Vulkan.
 - NVIDIA and AMD both run it through Vulkan. On CPU it's offered only if step-2 testing shows a usable speed.
 - Our text-prep step replaces its built-in number/date normalizer.
-- Installed only when the user opts in ("Install premium voice, about 1.9 GB, needs a graphics card").
+- Installed only when the user opts in ("Install premium voice, about 1.8 GB, needs a graphics card").
 
 **Language routing:** if a book's language isn't covered by the chosen engine, the app says so and switches to the one that covers it. Italian, Portuguese and Hindi go to Kokoro. German and Korean go to Ming.
 
@@ -186,7 +187,7 @@ Both sit behind one small interface (`voices()`, `languages()`, `synthesize(chun
 
 - `tomecast.hardware.vulkan_possible()` is a cheap check with no download: `libvulkan.so.1` can be loaded and a graphics device node exists (`/dev/dri/renderD*` or `/dev/nvidia0`). The window shows the "Use graphics card" row only when it is true, and `tomecast convert` defaults to the card only then.
 - Which devices exist is asked of audio.cpp itself: `audiocpp_server --backend vulkan --list-devices --json` (the last stdout line that parses as JSON; `list_devices()` never raises, a failure means no devices). `pick_device()` takes the discrete `gpu` with the most free memory, else an `igpu` with at least 2 GB free, else nothing.
-- **One engine build per choice.** Using the card needs only the Vulkan build (`AUDIOCPP_VULKAN`, 117 MB), which also contains the CPU backend. Not using it needs only the CPU build. So the required files are `required_assets(use_gpu)`: that build, eSpeak and Kokoro.
+- **One engine build per choice.** Using the card needs only the Vulkan build (`AUDIOCPP_VULKAN`, 45 MB), which also contains the CPU backend. Not using it needs only the CPU build. So the required files are `required_assets(use_gpu)`: that build, eSpeak and Kokoro.
 - **Fallback.** `AutoKokoro` (used by both the command line and the window) starts the Vulkan build on the picked device and checks that `/health` reports the `vulkan` backend. If no device is found, the server won't start, or it reports another backend, it raises `GpuUnavailable` internally and starts again with `"backend": "cpu"` on the same binary, with the warning "The graphics card didn't work, so Tomecast used the CPU." (or "No usable graphics card was found…"). The warning is shown as a note on the command line and on the done screen.
 - **Resuming.** The work-folder key includes which engine build is used, so card and CPU audio never mix in one book.
 - `tomecast doctor` prints the distro, glibc, CPU threads, `vulkan_possible()`, the Vulkan devices (once the Vulkan build is installed) and which engines and models are installed, for bug reports.
@@ -246,8 +247,9 @@ On first launch the app runs the hardware scan, lists what it needs to download 
   - **No graphics card:** the CPU build, **23 MB**.
   - The CUDA build (~170 MB + 440 MB runtime) isn't needed for models this small.
   - The app starts `llama-server` in the background only while it's needed, and stops it afterwards.
-- **audio.cpp** (the voice engine): Tomecast's own build of audio.cpp's tagged release, fetched from this repository's releases and checked against its pinned SHA-256. CPU build {CPU_MB}, or Vulkan build {VULKAN_MB} for any graphics card.
-  - **Why our own build:** upstream builds its Linux binaries on the newest Ubuntu, so they need glibc 2.43 and don't start on Ubuntu 22.04/24.04 or Debian 12/13. Ours are built in GitHub Actions on `manylinux_2_28` (AlmaLinux 8, glibc 2.28) with GCC 14 ([`engine-build.yml`](../.github/workflows/engine-build.yml)), so they run on nearly every distro from 2019 on.
+- **audio.cpp** (the voice engine): Tomecast's own build of audio.cpp's tagged release, fetched from this repository's releases and checked against its pinned SHA-256. CPU build **27 MB**, or Vulkan build **45 MB** for any graphics card.
+  - **Why our own build:** upstream builds its Linux binaries on the newest Ubuntu, so they need glibc 2.43 and don't start on Ubuntu 22.04/24.04, Debian 12/13 or Fedora 43 ([#18](https://github.com/Kingskid2026/tomecast/issues/18)). Ours are built in GitHub Actions on `manylinux_2_28` (AlmaLinux 8, glibc 2.28) with GCC 14 ([`engine-build.yml`](../.github/workflows/engine-build.yml)), so the engine itself starts on anything from glibc 2.28 on. What limits Tomecast as a whole is the window library (see the honest limits below).
+  - **Every computer uses it**, not only ones with an older glibc. One build means what CI checks is what everyone runs, with one set of pins and one download path. It's also the safer build on new systems: upstream's main Linux builds compile the CPU kernels for whatever CPU GitHub's build machine has (`ENGINE_ENABLE_NATIVE_CPU` is on by default), while ours target any AVX2 CPU, which is exactly what `check_system()` checks. And it's smaller, because it holds only the server.
   - **Unmodified:** the same source commit and upstream's release build options. The differences only affect where it runs: libstdc++, libgcc and libgomp are linked in statically, so the server needs nothing but glibc (plus the system's `libvulkan.so.1` for the Vulkan build), and the CPU kernels are built for any AVX2 CPU (x86-64-v3) rather than for the build machine's CPU. The server is the only program included; upstream's `audiocpp_cli` and `audiocpp_gguf` aren't needed.
   - **Pinned and traceable:** audio.cpp by commit, the build image by digest, and the Vulkan headers, loader and shader compiler by SHA-256. Each build is a release tagged `audiocpp-v<version>-tc<N>` (never "latest", and never a name release-please uses), with a signed build provenance attestation. The tarballs keep upstream's layout and add `BUILD-INFO.txt` and the third-party licenses.
 - **ffmpeg** comes inside a Python package (`imageio-ffmpeg`). **eSpeak NG** is downloaded like the models, from the `espeakng-loader` wheel, pinned by SHA-256. So **nothing comes from the distro's package manager**.
@@ -256,16 +258,16 @@ On first launch the app runs the hardware scan, lists what it needs to download 
   - Heron runs on ONNX Runtime (a small Python package),
   - the text and OCR models run on llama.cpp.
 - **Models** come only from official repos, in the sizes from section 10. Where a smaller file than the official one is needed, the app makes it locally with llama.cpp's own `llama-quantize` (seconds), instead of downloading files from unknown uploaders.
-- **Self-check:** it runs a 2-second test of each piece. If an engine won't start, it says so and falls back to its CPU build or the Python fallback.
+- **Self-check:** it runs a 2-second test of each piece. If an engine won't start, it says so and falls back to its CPU build.
 
-**Where it works: the honest limits.** These were checked on 2026-11-05. Voicing needs **glibc 2.29 or newer**: our audio.cpp build needs 2.28, and the eSpeak NG library from the `espeakng-loader` wheel needs 2.29. llama.cpp's main Linux downloads are built on Ubuntu 22.04. To check a system, run `ldd --version`.
+**Where it works: the honest limits.** These were checked on 2026-11-08. Tomecast needs **glibc 2.34 or newer**, because the Qt 6 library behind the window (PySide6 6.12 from PyPI) is only built for 2.34 and up, so uv can't install Tomecast on anything older. The voice engine needs less: our audio.cpp build starts on glibc 2.28, and the eSpeak NG library from the `espeakng-loader` wheel needs 2.29 (`check_system()` checks that, and AVX2). llama.cpp's main Linux downloads are built on Ubuntu 22.04. To check a system, run `ldd --version`.
 
 | System | Result |
 |---|---|
-| Distros from 2019 on (glibc 2.29+): Ubuntu 20.04 and newer, Debian 11 and newer, Fedora (including Bazzite), RHEL/Alma/Rocky 9, Arch-based ones, openSUSE Tumbleweed | **Everything works.** Every pull request that touches the engine converts a real book on Ubuntu 22.04/24.04, Debian 12/13, Fedora 44 and Arch ([`integration.yml`](../.github/workflows/integration.yml)) |
-| Older ones, like Ubuntu 18.04, Debian 10 or RHEL 8 | **Not supported.** Tomecast installs, then explains that the voice engine needs glibc 2.29 |
+| Distros with glibc 2.34+: Ubuntu 22.04 and newer, Debian 12 and newer, Fedora 35 and newer (including Bazzite), RHEL/Alma/Rocky 9 and newer, Arch-based ones, openSUSE Tumbleweed | **Everything works.** Pull requests that change the engine, the conversion or the packaging convert a real book on Ubuntu 22.04/24.04, Debian 12/13, Fedora 43/44 and Arch, and voice sentences with the Vulkan build on Mesa's software Vulkan driver ([`integration.yml`](../.github/workflows/integration.yml)). Each engine build is also started on AlmaLinux 8 and 9, Debian 11, Ubuntu 22.04 and Arch ([`engine-build.yml`](../.github/workflows/engine-build.yml)) |
+| Older ones, like Ubuntu 20.04, Debian 11 or RHEL 8 | **Not supported.** Tomecast doesn't install there, because its window library needs glibc 2.34 |
 | Alpine (musl) or NixOS | The engines don't run as-is. Possible with extra setup, but not a first target |
-| ARM Linux (Raspberry Pi, ARM laptops) | audio.cpp has no Linux ARM build yet, so this needs the `kokoro-onnx` fallback (section 4). llama.cpp does have ARM builds |
+| ARM Linux (Raspberry Pi, ARM laptops) | **Not supported yet.** audio.cpp has no Linux ARM build. llama.cpp does have ARM builds |
 | CPUs without AVX2 (Intel before 2013, AMD before 2015, and many Pentium and Celeron chips) | **Not supported yet.** Tomecast says so before downloading anything. A build for them is possible (ggml can pick the CPU's best instructions at run time), but it was about 15% slower on a new CPU in a quick test, so it isn't the default |
 
 **The one thing it can't install: graphics drivers.** Those need admin rights and differ per distro. The app uses whatever driver is already there. If Vulkan isn't working, it runs on the CPU and shows the single package to install for that distro (e.g. `vulkan-icd-loader` on Arch, `libvulkan1` on Ubuntu/Debian, `vulkan-loader` on Fedora).
@@ -314,10 +316,10 @@ Other ways it stays light:
 - **Threads:** the scan picks the thread count, and uses fewer on a laptop running on battery.
 
 Rough totals for a **CPU-only machine** (estimates, to be measured in build step 2):
-- Voice only, English books: **~0.25 GB** (Kokoro + audio.cpp).
+- Voice only, English books: **~0.23 GB** (Kokoro + eSpeak NG + audio.cpp).
 - Non-English books: the multilingual Kokoro file is ~0.93 GB, downloaded only when needed.
 - With every AI add-on: **~3.2 GB**.
-- The premium voice on a graphics card adds **~1.9 GB** (Ming + the Vulkan build).
+- The premium voice on a graphics card adds **~1.8 GB** (Ming + the Vulkan build).
 - Peak memory: **~1.5–2 GB**, because only one model is loaded at a time.
 
 ### 11. Open source: the repo, quality, and updates
@@ -350,7 +352,7 @@ Rough totals for a **CPU-only machine** (estimates, to be measured in build step
 | **Licenses** | `LICENSE` for our code. `THIRD_PARTY.md` lists every model and engine the app downloads, with its license (Kokoro Apache 2.0, Ming MIT, LFM3 LFM Open License, …) |
 | **Community files** | `CONTRIBUTING.md` (how to set up, test, and send a pull request), `SECURITY.md` plus GitHub's private vulnerability reporting |
 | **Issue templates** | The bug form asks for `tomecast doctor` output (distro, GPU, versions), so reports are useful from the first message |
-| **Automatic checks on every pull request** | `ruff` (style and lint), `pyright` (type checks), `pytest` (readers and cleanup rules on public-domain sample books), and **the install script run inside Ubuntu 22.04/24.04, Debian 12/13, Fedora and Arch containers**. That last one proves the "works on any distro" promise on every change. Pull requests that touch the engine also run a **real conversion** in each of those containers: install with `install.sh`, turn a short public-domain EPUB into an M4B with Kokoro on the CPU, and check its length and chapters with ffmpeg |
+| **Automatic checks on every pull request** | `ruff` (style and lint), `pyright` (type checks), `pytest` (readers and cleanup rules on public-domain sample books), and **the install script run inside Ubuntu 22.04/24.04, Debian 12/13, Fedora and Arch containers**. That last one proves the "works on any distro" promise on every change. Pull requests that touch the engine, the conversion or the packaging also run a **real conversion** in each of those containers (plus Fedora 43): install with `install.sh`, turn a short public-domain EPUB into an M4B with Kokoro on the CPU, and check its length and chapters with ffmpeg. One more job voices sentences with the Vulkan build on Mesa's software Vulkan driver and checks them against the CPU build |
 | **Protected main branch** | Changes only land through pull requests with passing checks, ours included |
 | **Dependabot** | Opens pull requests when Python packages or GitHub Actions have updates, and the checks show whether anything broke |
 | **Docs** | `CHANGELOG.md` (generated), `docs/architecture.md` (this plan, cleaned up), `docs/models.md` (why each model and quantization), and how to add a new voice engine |

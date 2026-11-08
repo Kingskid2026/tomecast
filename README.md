@@ -24,9 +24,9 @@ tomecast preview "Galadriel"                  # hear a word (or -o word.wav to s
 
 `--format mp3` writes `book/01 - Chapter title.mp3`, `02 - …` and so on, for players and car stereos that don't know `.m4b`. Each file is tagged (album, author, track n/total, chapter title) and carries the cover. MP3 is 64 kbps mono, about 29 MB per hour, the same as the M4B. Like the M4B, it never overwrites without `--force`; the window always picks a free name ("book (2)").
 
-The first conversion downloads the voice engine, eSpeak NG and the Kokoro model (about 264 MB, after asking). On an 8-core laptop CPU, a 13-minute story took about 3 minutes to make.
+The first conversion downloads the voice engine, eSpeak NG and the Kokoro model (about 228 MB, after asking). On an 8-core laptop CPU, a 13-minute story took about 3 minutes to make.
 
-If your computer has a graphics card with a working Vulkan driver (NVIDIA, AMD or Intel), Tomecast uses it automatically through the driver you already have, which was about 4 times faster on an NVIDIA laptop card (the story took 41 seconds). It downloads a different engine build for that (about 317 MB in all), never installs drivers, and falls back to the CPU if the card doesn't work. Turn it off with `--no-gpu` or the "Use graphics card" switch; `tomecast doctor` prints what Tomecast sees, for bug reports.
+If your computer has a graphics card with a working Vulkan driver (NVIDIA, AMD or Intel), Tomecast uses it automatically through the driver you already have, which was about 4 times faster on an NVIDIA laptop card (the story took 41 seconds). It downloads a different engine build for that (about 245 MB in all), never installs drivers, and falls back to the CPU if the card doesn't work. Turn it off with `--no-gpu` or the "Use graphics card" switch; `tomecast doctor` prints what Tomecast sees, for bug reports.
 
 ## What it does (and will do)
 
@@ -105,14 +105,14 @@ Then open **Tomecast** from your app launcher. Run the same line again any time 
 
 | Your system | Support |
 |---|---|
-| Distros from 2019 on (glibc 2.29 or newer, check with `ldd --version`): Ubuntu 20.04+, Debian 11+, Fedora and Bazzite, RHEL/Alma/Rocky 9+, Arch-based ones, openSUSE Tumbleweed | Everything. Tested on every engine change with real conversions on Ubuntu 22.04/24.04, Debian 12/13, Fedora 44 and Arch |
-| Older distros (Ubuntu 18.04, Debian 10, RHEL 8) | Not supported |
+| Ubuntu 22.04 and newer, Debian 12 and newer, Fedora 35 and newer (including Bazzite), RHEL/Alma/Rocky 9+, Arch-based ones, openSUSE Tumbleweed: anything with glibc 2.34 or newer (check with `ldd --version`) | Everything. Every engine change is tested with real conversions on Ubuntu 22.04/24.04, Debian 12/13, Fedora 43/44 and Arch |
+| Older distros (Ubuntu 20.04, Debian 11, RHEL 8 and earlier) | Not supported: Tomecast's window library needs glibc 2.34 |
 | Processors without AVX2 (Intel before 2013, AMD before 2015, many Pentium and Celeron chips) | Not supported yet |
 | Alpine, NixOS, ARM computers | Not supported yet |
 
 ## Privacy
 
-Everything runs locally. Tomecast uses the internet only to download engines and models (from their official sources, checked against pinned checksums) and for a once-a-day update check that you can turn off. There is no telemetry.
+Everything runs locally. Tomecast uses the internet only to download engines and models, and for a once-a-day update check that you can turn off. There is no telemetry. Every download is checked against a checksum pinned in Tomecast's code. Models and most engines come from their official sources. The audio.cpp voice engine is Tomecast's own unmodified build of audio.cpp's official source, made by GitHub Actions so it runs on more distros, and downloaded from this repository's [releases](https://github.com/Kingskid2026/tomecast/releases/tag/audiocpp-v0.9.4-tc1) ([how it's built](THIRD_PARTY.md#audiocpp-builds-distributed-by-tomecast)).
 
 ## Contributing
 
