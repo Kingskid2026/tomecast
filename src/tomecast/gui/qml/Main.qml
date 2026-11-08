@@ -53,6 +53,7 @@ ApplicationWindow {
             ScreenSlot { name: "drop"; sourceComponent: dropScreen }
             ScreenSlot { name: "chapters"; sourceComponent: chaptersScreen }
             ScreenSlot { name: "voice"; sourceComponent: voiceScreen }
+            ScreenSlot { name: "names"; sourceComponent: namesScreen }
             ScreenSlot { name: "converting"; sourceComponent: convertingScreen }
             ScreenSlot { name: "done"; sourceComponent: doneScreen }
         }
@@ -97,6 +98,7 @@ ApplicationWindow {
     Component { id: dropScreen; DropScreen { dragActive: window.bookDragActive } }
     Component { id: chaptersScreen; ChaptersScreen {} }
     Component { id: voiceScreen; VoiceScreen {} }
+    Component { id: namesScreen; NamesScreen {} }
     Component { id: convertingScreen; ConvertingScreen {} }
     Component { id: doneScreen; DoneScreen {} }
 }

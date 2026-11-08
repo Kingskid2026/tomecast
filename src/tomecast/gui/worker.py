@@ -40,9 +40,18 @@ from tomecast.convert import (
 )
 from tomecast.downloads import Asset, DownloadError, ensure, is_installed, local_path
 from tomecast.engines.audiocpp import AUDIOCPP_VULKAN, AutoKokoro, EngineError
+from tomecast.gui.fixes import FixLists, ListFile
 from tomecast.hardware import list_devices, pick_device
+from tomecast.names import Name, find_book_names
 from tomecast.packaging import PackagingError, stretch_wav
+from tomecast.pronunciations import (
+    Pronunciations,
+    book_list_path,
+    global_list_path,
+    load_for_book,
+)
 from tomecast.readers import InvalidEbookError, read_book
+from tomecast.textprep import TextPrep
 from tomecast.workdirs import WorkFolderBusy, exclusive, work_folder
 
 # Speed and time left are shown once this many chunks have been voiced in the current run.
@@ -158,12 +167,24 @@ class ConvertJob:
     control: TimedControl
     use_gpu: bool = False
     format: Literal["m4b", "mp3"] = "m4b"  # "mp3": ``output`` is a folder of MP3 files
+    # The pronunciation fixes to use. None: read the lists on the worker (load_for_book), as
+    # the command line does. The window passes its own only when a change couldn't be saved.
+    fixes: Pronunciations | None = None
 
 
 Job = ReadJob | ScanJob | PreviewJob | ConvertJob
 
 
 # --- Results (worker → window) ---------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class BookRead:
+    """A book as read, the names its Names screen lists, and its pronunciation lists."""
+
+    book: Book
+    names: tuple[Name, ...] = ()  # find_book_names(), most frequent first
+    fixes: FixLists | None = None  # handed over to the window, which owns it from then on
 
 
 @dataclass(frozen=True, slots=True)
@@ -276,7 +297,7 @@ def megabytes(size: int) -> str:
 class ConversionWorker(QObject):
     """Runs jobs one at a time on its thread and reports through signals (all queued)."""
 
-    bookRead = Signal(int, object)  # job, Book
+    bookRead = Signal(int, object)  # job, BookRead
     previewReady = Signal(int, str)  # job, path of the WAV to play
     stageChanged = Signal(int, str)  # job, "downloading" or "starting"
     downloadProgress = Signal(int, str)  # job, the label to show
@@ -346,7 +367,13 @@ class ConversionWorker(QObject):
         except OSError as error:
             self.failed.emit(job.job, f"Couldn't open {job.path.name}: {error.strerror or error}.")
             return
-        self.bookRead.emit(job.job, book)
+        # The names (as `tomecast names` lists them, without leaving out the ones that have a
+        # fix, since the Names screen shows and edits those) and the two lists, read here so
+        # the window never waits on the disk.
+        fixes = FixLists(
+            ListFile.read(book_list_path(job.path)), ListFile.read(global_list_path(self._root))
+        )
+        self.bookRead.emit(job.job, BookRead(book, tuple(find_book_names(book)), fixes))
 
     # --- Voice preview -------------------------------------------------------------------
 
@@ -428,7 +455,13 @@ class ConversionWorker(QObject):
             self._close_preview_engine()  # one model in memory at a time
             self._system_check()
             engine = self._engine_factory(self._root, job.voice, job.speed, job.use_gpu)
-            plan = plan_chunks(job.book, engine.max_chars, job.chapters)
+            fixes, notes = (
+                (job.fixes, [])
+                if job.fixes is not None
+                else load_for_book(self._root, job.book_path)
+            )
+            prep = TextPrep.for_language(job.book.language, fixes)
+            plan = plan_chunks(job.book, engine.max_chars, job.chapters, prep)
             chunks = [chunk for chapter in plan for chunk in chapter]
             first_chapter = next((position for position, c in enumerate(plan) if c), 0)
             self.progressed.emit(
@@ -442,7 +475,7 @@ class ConversionWorker(QObject):
             )
             with exclusive(workdir):
                 self.stageChanged.emit(job.job, "starting")
-                outcome = self._voice_book(job, engine, chunks, workdir)
+                outcome = self._voice_book(job, engine, chunks, workdir, prep, notes)
             shutil.rmtree(workdir, ignore_errors=True)
         except ConversionCancelled:
             self.cancelled.emit(job.job)
@@ -459,9 +492,18 @@ class ConversionWorker(QObject):
         self.converted.emit(job.job, outcome)
 
     def _voice_book(
-        self, job: ConvertJob, engine: Engine, chunks: Sequence[Chunk], workdir: Path
+        self,
+        job: ConvertJob,
+        engine: Engine,
+        chunks: Sequence[Chunk],
+        workdir: Path,
+        prep: TextPrep,
+        notes: Sequence[str] = (),
     ) -> ConvertResult:
-        """Start the engine, convert, and stop the engine again (all on this thread)."""
+        """Start the engine, convert, and stop the engine again (all on this thread).
+
+        ``notes`` are warnings about pronunciation list lines that were skipped.
+        """
         control = job.control
         try:
             engine.start()
@@ -475,7 +517,7 @@ class ConversionWorker(QObject):
 
             result = convert_book(
                 job.book, meter, job.output, workdir=workdir, progress=report, control=control,
-                chapters=job.chapters, overwrite=False, format=job.format,
+                chapters=job.chapters, overwrite=False, format=job.format, prep=prep,
             )  # fmt: skip
             taken = time.monotonic() - started - (control.paused_seconds - paused_before)
         finally:
@@ -486,7 +528,11 @@ class ConversionWorker(QObject):
             chapters=len(result.chapters),
             size_bytes=_size_of(result.output),
             seconds_taken=max(0.0, taken),
-            warnings=(*((engine.warning,) if engine.warning else ()), *result.warnings),
+            warnings=(
+                *((engine.warning,) if engine.warning else ()),
+                *result.warnings,
+                *(_as_sentence(f"Pronunciation list: {note}") for note in notes),
+            ),
             speedup=meter.speedup(),
         )
 

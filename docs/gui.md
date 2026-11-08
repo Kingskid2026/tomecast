@@ -13,6 +13,7 @@ src/tomecast/gui/
   backend.py       Backend: the one QObject QML talks to (registered as the singleton `Backend`)
   models.py        ChapterModel (QAbstractListModel) for the chapter list
   worker.py        ConversionWorker: runs downloads and convert_book() on a long-lived QThread
+  fixes.py         FixLists: the book's and the global pronunciation list, as the Names screen edits them
   dots.py          render_dots(): images to Night Studio dots (pure Qt, no Pillow)
   dotgrid.py       DotGrid: the sentence grid as one painted QML item
   images.py        DotImageProvider: serves "image://dots/<name>/<theme>" to QML
@@ -22,8 +23,9 @@ src/tomecast/gui/
   qml/
     Main.qml       ApplicationWindow; shows the screen named by Backend.screen
     Theme.qml      singleton: palettes, fonts, spacing (follows Backend.theme)
-    components/    buttons, meters, labels, the header, the error banner, the chapter row (see the folder)
-    screens/       DropScreen, ChaptersScreen, VoiceScreen, ConvertingScreen, DoneScreen
+    components/    buttons, meters, labels, the header, the error banner, the chapter row, LineField
+                   (a field that is one 1 px line) and TagButton (the 36 px Names pills) (see the folder)
+    screens/       DropScreen, ChaptersScreen, VoiceScreen, NamesScreen, ConvertingScreen, DoneScreen
 ```
 
 **Imports:**
@@ -33,7 +35,7 @@ src/tomecast/gui/
 
 ## Rules
 
-- **Threads:** `convert_book()`, downloads and book reading run on a `QThread` that lives for the whole job, never on the GUI thread. The engine's "stop when Tomecast dies" signal fires when the *thread* that started it exits, so the engine must be started from that long-lived thread. Workers talk to the GUI only through Qt signals (queued connections). QML never sees worker objects.
+- **Threads:** `convert_book()`, downloads, book reading (with the name finder and reading the two pronunciation lists) and voicing previews run on a `QThread` that lives for the whole job, never on the GUI thread. Saving a change to a pronunciation list (a few hundred bytes) happens on the GUI thread, so a problem shows in the banner at once. The engine's "stop when Tomecast dies" signal fires when the *thread* that started it exits, so the engine must be started from that long-lived thread. Workers talk to the GUI only through Qt signals (queued connections). QML never sees worker objects.
 - **Light on resources:** nothing animates continuously while converting. `DotGrid` repaints only when `done` changes; screen changes animate for 150–400 ms. A system "reduce motion" setting (or `Backend.reduceMotion`) turns animations off.
 - **No new heavy dependencies:** PySide6-Essentials only (no QtMultimedia, no Pillow). The voice preview plays through the system's player (`pw-play`, then `paplay`, then `aplay`).
 - **Accessibility:** every control has `Accessible.name`; keyboard focus is visible (2 px accent outline); text meets 4.5:1.
@@ -48,7 +50,7 @@ Every property has a `<name>Changed` notify signal. Lists are plain JS arrays of
 
 | Property | Type | Meaning |
 |---|---|---|
-| `screen` | string | `"drop"`, `"chapters"`, `"voice"`, `"converting"` or `"done"` |
+| `screen` | string | `"drop"`, `"chapters"`, `"voice"`, `"names"`, `"converting"` or `"done"` |
 | `themeSetting` | string | `"system"`, `"dark"` or `"light"` (saved between runs) |
 | `theme` | string | the effective theme: `"dark"` or `"light"` |
 | `reduceMotion` | bool | true when animations should be skipped |
@@ -62,7 +64,7 @@ Every property has a `<name>Changed` notify signal. Lists are plain JS arrays of
 |---|---|
 | `setThemeSetting(name)` | switch the theme |
 | `setUseGpu(on)` | use the graphics card (through the driver already installed) or the CPU. Saved. Refreshes `downloadNote` and `hardwareLabel` |
-| `goTo(screen)` | move between screens that are allowed from here (back buttons) |
+| `goTo(screen)` | move between screens that are allowed from here (back buttons, and Next): `"voice"` from chapters, done or names; `"names"` only from voice, and only when `names` isn't empty |
 | `chooseBookFolder()` → string | the folder the file dialog should open in (last used, else `~`) |
 | `dismissError()` | clear `errorMessage` |
 
@@ -116,8 +118,39 @@ The switches sit above the chapter list in a `Flow`, as in `Chapters.dc.html`: "
 |---|---|
 | `setVoice(id)`, `setSpeed(value)` | |
 | `setOutputFormat(name)` | `"m4b"` or `"mp3"`; anything else is ignored. Saved |
-| `togglePreview()` | voice `previewText` with the chosen voice and speed, then play it; again to stop. Above 1.5× the preview is also time-stretched, so it sounds like the book will (see the architecture notes on speed) |
+| `togglePreview()` | voice `previewText` with the chosen voice and speed, then play it; again to stop. Above 1.5× the preview is also time-stretched, so it sounds like the book will (see the architecture notes on speed). Like every player in the window it says the text as the book would: the pronunciation fixes, then the language's rules (what `tomecast preview` does), while `previewText` stays as written |
 | `startConversion()` | write `<book folder>/<book title>.m4b` (with `outputFormat == "mp3"`: the folder `<book folder>/<book title>/`) and go to `"converting"`. It does nothing while `loading` is true (Start is disabled then), because the book being read would replace this one. The job carries the **whole book** plus `chapters`, the indices of the ticked rows (see "Ticked sections and resuming" below). |
+
+`VoiceScreen.qml`'s primary button is **Next** (`voiceNextButton`, `goTo("names")`) when `names` isn't empty, and **Start converting** (`startConvertingButton`) when it is, so a book without names skips the Names step. `downloadNote` shows above whichever it is.
+
+### Names
+
+The Names step (design.md, "Screens") comes after Voice for books where the name finder found something. The worker computes the list when the book is read, with `find_book_names(book)` on the book as read (the same as `tomecast names`, but without leaving out words that already have a fix), and reads both pronunciation lists there too. Both arrive with the book in one `BookRead`.
+
+| Property | Type | Meaning |
+|---|---|---|
+| `names` | list | `[{word: "Gryphon", count: 55, countLabel: "55×", meterLit: 7}, …]`, most frequent first. `meterLit` is 1–11 dots, log-scaled to the most frequent name (`round(log(count) / log(top) × 11)`, at least 1). Empty: no Names step |
+| `nameFixes` | object | `{"Gryphon": "GRIFF-on"}`: for each listed name with a fix, the right side of the fix that applies to it (the book's list first, then the global one), as written in the list. A row's field shows it |
+| `fixes` | list | YOUR FIXES: `[{word: "Gryphon", say: "GRIFF-on", scope: "book"}, …]`, one per left side, the book's (`"book"`) first, then the global ones (`"all"`) the book doesn't override, each in its file's order |
+| `bookListName` | string | the book's list file name, `"alice.pronunciations.txt"` (for the footnote) |
+| `playingName` | string | the name whose row is playing (or being voiced), `""` otherwise |
+| `tryPlaying` | bool | the TRY ANY WORD text is playing (or being voiced) |
+
+| Slot | Does |
+|---|---|
+| `setNameFix(word, say)` | save how to say a listed name. An empty (or blank) `say` removes its fix. A fix that exists is changed in the list that has it (keeping its left side, arrow, spacing and comment); a new one goes at the end of the book's list. Nothing is written if it's the same as before. A respelling the list can't hold (a phonetic spelling in /slashes/, or a "#" that would start a comment) is refused with a sentence in the banner |
+| `removeFix(scope, word)` | remove the fix for `word` from the book's list (`"book"`) or the global one (`"all"`) |
+| `toggleFixScope(scope, word)` | move the fix to the other list (the THIS BOOK / EVERY BOOK pill): it is written to the other file first, then removed from this one |
+| `playName(word)` | voice `word` with the fixes, in the chosen voice and speed, and play it; again to stop |
+| `playText(text)` | the same for any text (TRY ANY WORD) |
+
+**Playing.** The preview, the rows' buttons and TRY ANY WORD share one path (`PreviewJob` on the worker, then the system player, as `togglePreview`): only one thing plays at a time, pressing another button switches to it, pressing the same one again stops it, and changing screen, voice or speed stops it too. Each voiced text is cached by voice, speed and the text as spoken, so a changed fix is voiced afresh.
+
+**Saving** (`gui/fixes.py`). Each list is kept as its file's text. A change re-reads the file first (so lines added in an editor meanwhile are kept), applies `pronunciations.edit` and saves it with `pronunciations.save`: a temporary file next to it, moved into place, a symbolic link followed, the file's permissions kept, and a list left empty removed rather than kept as an empty file. If the book's folder (or the data folder) can't be written, the banner says so in a sentence ("Tomecast couldn't save alice.pronunciations.txt in /books (permission denied). The change works until you close Tomecast.") and the change is kept for the session. A list that exists but can't be read is never written. A fix change that works clears a banner an earlier fix change put up.
+
+**Converting with the fixes.** `ConvertJob.fixes` is `None` normally: the worker reads the lists with `load_for_book(data folder, book)`, exactly as the command line does, and builds the `TextPrep` that `plan_chunks` and `convert_book` use. When a change couldn't be saved, the window passes its own lists instead, so the fix still reaches the book. Lines the lists can't use are added to the done screen's warnings ("Pronunciation list: alice.pronunciations.txt, line 3: …").
+
+`NamesScreen.qml`: header buttons `namesBackButton` and `namesStartButton` (and `namesDownloadNote`, as on Voice); the table `namesTable` with rows `nameRow<i>` (`nameWord<i>`, `nameCount<i>`, `nameMeter<i>`, `nameField<i>`, `namePlay<i>`) and `showAllNames`; the side panel `namesSide` with `tryField`, `tryButton`, `tryWave`, `heardAs`, `fixesCount`, rows `fixRow<i>` (`fixText<i>`, `fixScope<i>`, `fixRemove<i>`) and `fixesNote`. A row's field saves on `editingFinished` (Enter, Tab or a click elsewhere) and then shows what was saved. After the THIS BOOK / EVERY BOOK pill or Remove rebuilds the list, keyboard focus goes back to the same fix's pill (or the Remove now in that place).
 
 ### Converting
 

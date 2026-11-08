@@ -48,6 +48,8 @@ Tomecast turns numbers, dates, times, money, years, Roman numerals and abbreviat
 2. **Hear them.** `tomecast preview "Galadriel"` says a word with the voice and speed you choose (`--voice`, `--speed`; `-o word.wav` saves it instead of playing it). It uses your pronunciation lists, so you hear what the book will sound like; `--raw` skips them.
 3. **Fix them.** Add a line to a pronunciation list, then convert as usual.
 
+The window does all three in one place. When a book has names like these, a **Names** step comes after Voice: press play to hear a name in the voice and speed you chose, type how it sounds, and it's saved to the book's list when you press Enter or move on (the THIS BOOK / EVERY BOOK switch moves a fix to the list for every book). TRY ANY WORD voices anything you type, with your fixes. Start converting skips the step whenever you like.
+
 A pronunciation list is a plain text file with one fix per line, *written → say it as*:
 
 ```text

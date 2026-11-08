@@ -129,11 +129,11 @@ Text prep turns written text into speakable text, deterministically, in **one pl
 - **Nothing is ever dropped.** Rules only replace a written form with words that say the same thing. On top of that, every paragraph is checked (`words_lost`): if a rule would lose a word, that paragraph is voiced as written. Tests cover every rule with exact expected output, plus a test that every input word survives or is a known expansion.
 - **Other languages** plug in by registering an object with `heading()` and `body()` in `textprep.RULES`. Until then a book in another language is voiced as written (the pronunciation lists still apply).
 - **Pronunciation fixes** are plain text files of *written → say it as* lines (the exact format is in the README):
-  - A **global list**, `~/.local/share/tomecast/pronunciations.txt`, and a **per-book list** next to the book file (`Title.epub` → `Title.pronunciations.txt`). Next to the book was chosen over a folder keyed by the book's hash because it is easy to find and edit, and it travels with the book. The book's list wins over the global one. The same lists are used by the terminal command, and the window will use them too ([#10](https://github.com/Kingskid2026/tomecast/issues/10)).
+  - A **global list**, `~/.local/share/tomecast/pronunciations.txt`, and a **per-book list** next to the book file (`Title.epub` → `Title.pronunciations.txt`). Next to the book was chosen over a folder keyed by the book's hash because it is easy to find and edit, and it travels with the book. The book's list wins over the global one. The terminal command and the window use the same lists, and the window's Names step edits them ([#40](https://github.com/Kingskid2026/tomecast/issues/40)): it changes only the line for the word being fixed, keeping the user's other lines and comments (`pronunciations.edit`), and writes the file whole through a temporary file (`pronunciations.save`).
   - Whole-word matching. A left side in lowercase matches any case; one with a capital matches that spelling and its ALL-CAPS version. Fixes are applied *before* the rules, so a fix can cover an abbreviation (`Dr. Who → the Doctor`).
   - **Right-hand sides are respellings, not phonemes** (see "Phonetic spellings" in section 10 for why). Capitalised syllables are lowercased before voicing because eSpeak spells all-caps words letter by letter.
   - A line the program can't use (no arrow, or an IPA `/value/`) is skipped with a warning that names the line.
-- **Name finder** (`tomecast names BOOK`, and `names.find_book_names(book)` for the window): lists capitalised words that are used at least 3 times, were seen capitalised somewhere other than at the start of a sentence, are not in the common-word list and are never written in lowercase in the book (so "Table" is not a name). Counts are listed most frequent first, and words that already have a fix are left out. The common-word list (`data/common_words.txt`, about 22,000 words) is built by `scripts/make_wordlist.py` from public-domain Project Gutenberg books, so it has no license of its own.
+- **Name finder** (`tomecast names BOOK`, and `names.find_book_names(book)` for the window): lists capitalised words that are used at least 3 times, were seen capitalised somewhere other than at the start of a sentence, are not in the common-word list and are never written in lowercase in the book (so "Table" is not a name). Counts are listed most frequent first. The command line leaves out words that already have a fix; the window keeps them, since its Names step shows and edits their fixes. The common-word list (`data/common_words.txt`, about 22,000 words) is built by `scripts/make_wordlist.py` from public-domain Project Gutenberg books, so it has no license of its own.
 - **Hear a word:** `tomecast preview "text"` voices the text with the chosen voice and speed and plays it (pw-play, paplay or aplay), or saves it with `-o file.wav`. It applies the same lists and rules as a conversion, so you hear what the book will sound like; `--raw` says it exactly as typed. There is no `--phonemes` option, for the reason below.
 - **Made-up languages:** Kokoro sounds out unknown words with eSpeak NG's spelling rules (measured in section 10), so it reads *something* reasonable, and the list fixes the rest.
 
@@ -223,7 +223,7 @@ Both sit behind one small interface (`voices()`, `languages()`, `synthesize(chun
   1. Drop a book in.
   2. Chapter list with checkboxes and the skip switches.
   3. Voice, speed and Preview.
-  4. Pronunciation tab with the name finder and Try it.
+  4. Names: the name finder's list, with a fix and a play button for each name, and Try any word (only when the finder found something).
   5. Convert, with progress, time left, and Pause/Resume.
   6. "Open output folder".
 - **Terminal:** `tomecast convert book.epub --voice UK_George --format m4b`, plus `tomecast voices`, `tomecast preview "text"`, `tomecast names book.epub`, `tomecast scan`. Easy for a techy user to script over a folder of books.
@@ -367,7 +367,7 @@ Rough totals for a **CPU-only machine** (estimates, to be measured in build step
 
    *If either struggles on normal hardware, we find out here, before building around it.*
 3. Cleanup rules and the PDF reader. (The DOCX, FB2, TXT and HTML readers are done.)
-4. Text prep: numbers, abbreviations, pronunciation lists, name finder. *Done for the terminal command; the window's Pronunciation tab is still to do ([#10](https://github.com/Kingskid2026/tomecast/issues/10)).*
+4. Text prep: numbers, abbreviations, pronunciation lists, name finder. *Done, in the terminal command and the window's Names step ([#40](https://github.com/Kingskid2026/tomecast/issues/40)).*
 5. Pause & resume and preview.
 6. Hardware scan, the GPU switch, and speed estimates.
 7. The desktop window.

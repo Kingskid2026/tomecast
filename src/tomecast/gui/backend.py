@@ -41,8 +41,10 @@ from tomecast.engines.audiocpp import (
     default_threads,
     required_assets,
 )
+from tomecast.gui.fixes import BadFix, FixLists, FixNotSaved, Scope
 from tomecast.gui.models import DEFAULT_SPEEDUP, ChapterModel
 from tomecast.gui.worker import (
+    BookRead,
     ConversionWorker,
     ConvertJob,
     ConvertResult,
@@ -59,10 +61,13 @@ from tomecast.gui.worker import (
     scan_gpu,
 )
 from tomecast.hardware import short_name, vulkan_possible
+from tomecast.names import Name
 from tomecast.packaging import portable_name
+from tomecast.pronunciations import book_list_path
 from tomecast.readers import FORMATS, SUFFIXES
+from tomecast.textprep import TextPrep
 
-SCREENS = ("drop", "chapters", "voice", "converting", "done")
+SCREENS = ("drop", "chapters", "voice", "names", "converting", "done")
 THEME_SETTINGS = ("system", "dark", "light")
 OUTPUT_FORMATS = ("m4b", "mp3")
 MIN_SPEED, MAX_SPEED, SPEED_STEP = 0.5, 3.0, 0.25  # 11 meter dots; 1.00x is the third
@@ -75,6 +80,7 @@ _FORMAT_LIST = f"{', '.join(FORMATS[:-1])} and {FORMATS[-1]}"
 STOPPED_MESSAGE = "Stopped. Start again to continue where you left off."
 UNKNOWN_TIME = "--:--:--"
 DOWNLOAD_NOTE = "STARTING DOWNLOADS THE VOICE ONCE · {mb} MB"
+NAME_METER_DOTS = 11  # the Names screen's count meter
 
 # Voice menu groups, and the order of voices in each (as in the maintainer's mockup).
 VOICE_GROUPS = (
@@ -196,6 +202,22 @@ def _took(seconds: float) -> str:
     return f"{hours} H {rest:02d} MIN" if hours else f"{rest} MIN"
 
 
+def name_rows(names: Sequence[Name]) -> list[dict[str, Any]]:
+    """The Names screen's rows: ``{word, count, countLabel, meterLit}``. The label is the
+    count and a multiplication sign; the 11-dot meter is log-scaled to the most frequent
+    name, with at least one dot lit."""
+    top = math.log(names[0].count) if names and names[0].count > 1 else 0.0
+    rows = []
+    for name in names:
+        share = math.log(name.count) / top if top > 0 else 1.0
+        lit = max(1, min(NAME_METER_DOTS, math.floor(share * NAME_METER_DOTS + 0.5)))
+        rows.append(
+            {"word": name.word, "count": name.count, "countLabel": f"{name.count}\u00d7",
+             "meterLit": lit}
+        )  # fmt: skip
+    return rows
+
+
 def _local_path(url: QUrl | str) -> Path | None:
     if isinstance(url, QUrl):
         return Path(url.toLocalFile()) if url.isLocalFile() else None
@@ -240,6 +262,13 @@ class Backend(QObject):
     previewTextChanged = Signal()
     previewPlayingChanged = Signal()
     previewAvailableChanged = Signal()
+
+    namesChanged = Signal()
+    nameFixesChanged = Signal()
+    fixesChanged = Signal()
+    bookListNameChanged = Signal()
+    playingNameChanged = Signal()
+    tryPlayingChanged = Signal()
 
     downloadNoteChanged = Signal()
     stageChanged = Signal()
@@ -296,6 +325,9 @@ class Backend(QObject):
         self._cover_count = 0
         self._has_cover = False
         self._playback: QProcess | None = None
+        self._playing = ""  # what plays: "preview", "try", "name:<word>" or "" for nothing
+        self._fix_lists: FixLists | None = None
+        self._fix_error = ""  # the last banner message a fix caused
         self._preview_cache: Path | None = None
         self._shut_down = False
         fixed_assets = None if assets is None else tuple(assets)
@@ -341,6 +373,13 @@ class Backend(QObject):
         self._previewText = ""
         self._previewPlaying = False
         self._downloadNote = ""
+        # Names
+        self._names: list[dict[str, Any]] = []
+        self._nameFixes: dict[str, str] = {}
+        self._fixes: list[dict[str, str]] = []
+        self._bookListName = ""
+        self._playingName = ""
+        self._tryPlaying = False
         # Converting
         self._stage = "starting"
         self._downloadLabel = ""
@@ -460,6 +499,15 @@ class Backend(QObject):
 
     previewAvailable = _property(bool, _get_preview_available, previewAvailableChanged)
 
+    # --- Properties: names -----------------------------------------------------------------
+
+    names: list[dict[str, Any]] = _field(list, "names", namesChanged)
+    nameFixes: dict[str, str] = _field(dict, "nameFixes", nameFixesChanged)
+    fixes: list[dict[str, str]] = _field(list, "fixes", fixesChanged)
+    bookListName: str = _field(str, "bookListName", bookListNameChanged)
+    playingName: str = _field(str, "playingName", playingNameChanged)
+    tryPlaying: bool = _field(bool, "tryPlaying", tryPlayingChanged)
+
     # --- Properties: converting ------------------------------------------------------------
 
     stage: str = _field(str, "stage", stageChanged)
@@ -515,11 +563,13 @@ class Backend(QObject):
             self._show("drop")
         elif screen == "chapters" and self._bookLoaded:
             self._show("chapters")
-        elif screen == "voice" and self._bookLoaded and current in ("chapters", "done"):
+        elif screen == "voice" and self._bookLoaded and current in ("chapters", "done", "names"):
             if not self._chapters.selected_rows():
                 self._update("errorMessage", "Choose at least one section to convert.")
                 return
             self._show("voice")
+        elif screen == "names" and self._bookLoaded and current == "voice" and self._names:
+            self._show("names")
 
     @Slot(result=str)
     def chooseBookFolder(self) -> str:
@@ -627,23 +677,47 @@ class Backend(QObject):
     @Slot()
     def togglePreview(self) -> None:
         """Voice ``previewText`` with the chosen voice and speed and play it; again to stop."""
-        if self._previewPlaying:
-            self._stop_preview()
+        self._toggle_play("preview", self._previewText)
+
+    # --- Slots: names ----------------------------------------------------------------------
+
+    @Slot(str, str)
+    def setNameFix(self, word: str, say: str) -> None:
+        """Save how to say ``word`` (a listed name); an empty ``say`` removes its fix. A new
+        fix goes in the book's list; one that exists is changed in the list that has it."""
+        if self._fix_lists is None or not any(row["word"] == word for row in self._names):
             return
-        if self._player is None or not self._previewText or self._shut_down:
+        try:
+            self._fix_lists.set_for_name(word, say)
+        except BadFix as problem:
+            self._fix_problem(str(problem))  # nothing changed
             return
-        self._update("previewPlaying", True)
-        if self._preview_cache is None:
-            self._preview_cache = Path(tempfile.mkdtemp(prefix="tomecast-preview-"))
-        wav = preview_file(self._preview_cache, self._voice, self._speed, self._previewText)
-        if wav.is_file():
-            self._play(wav)
-            return
-        self._preview_job = next(self._jobs)
-        job = PreviewJob(
-            self._preview_job, self._previewText, self._voice, self._speed, wav, self._using_gpu
-        )
-        self._jobRequested.emit(job)
+        except FixNotSaved as problem:
+            self._fix_problem(str(problem))
+        else:
+            self._fix_problem("")
+        self._refresh_fixes()
+
+    @Slot(str, str)
+    def removeFix(self, scope: str, word: str) -> None:
+        """Remove the fix for ``word`` from the book's list (``"book"``) or the global one
+        (``"all"``)."""
+        self._edit_fixes(lambda lists, where: lists.remove(where, word), scope)
+
+    @Slot(str, str)
+    def toggleFixScope(self, scope: str, word: str) -> None:
+        """Move the fix for ``word`` from the list ``scope`` to the other one."""
+        self._edit_fixes(lambda lists, where: lists.move(where, word), scope)
+
+    @Slot(str)
+    def playName(self, word: str) -> None:
+        """Voice ``word`` with the fixes, in the chosen voice and speed; again to stop."""
+        self._toggle_play(f"name:{word}", word)
+
+    @Slot(str)
+    def playText(self, text: str) -> None:
+        """Voice any text with the fixes (TRY ANY WORD); again to stop."""
+        self._toggle_play("try", text)
 
     @Slot()
     def startConversion(self) -> None:
@@ -670,6 +744,10 @@ class Backend(QObject):
             return
         self._stop_preview()
         sections = self._chapters.sections
+        # The lists are read again on the worker, unless a change couldn't be saved: then the
+        # window's own copy is the only one with every fix.
+        lists = self._fix_lists
+        fixes = lists.combined() if lists is not None and lists.unsaved else None
         # The whole book plus the ticked indices, so chunk IDs (and the resume folder) are the
         # same whichever sections are ticked, and match a run from the command line.
         book = self._book
@@ -686,7 +764,7 @@ class Backend(QObject):
         self._jobRequested.emit(
             ConvertJob(
                 self._convert_job, book, tuple(rows), self._book_path, output, self._voice,
-                self._speed, self._control, self._using_gpu, output_format,
+                self._speed, self._control, self._using_gpu, output_format, fixes,
             )
         )  # fmt: skip
 
@@ -741,9 +819,11 @@ class Backend(QObject):
         self._read_job = None
         self._chapters.clear()
         self._set_cover(None)
+        self._fix_lists = None
         for name, value in (
             ("bookLoaded", False), ("loading", False), ("bookTitle", ""), ("bookAuthors", ""),
-            ("bookHasPages", False),
+            ("bookHasPages", False), ("names", []), ("nameFixes", {}), ("fixes", []),
+            ("bookListName", ""),
             ("outputPath", ""), ("audioLength", ""), ("doneSummary", ""), ("warnings", []),
             ("errorMessage", ""),
         ):  # fmt: skip
@@ -775,7 +855,7 @@ class Backend(QObject):
     # --- Worker results --------------------------------------------------------------------
 
     @Slot(int, object)
-    def _on_book_read(self, job: int, book: Book) -> None:
+    def _on_book_read(self, job: int, read: BookRead) -> None:
         if job != self._read_job:
             return
         self._read_job = None
@@ -784,8 +864,14 @@ class Backend(QObject):
             # it would strand the conversion that is running.
             self._update("loading", False)
             return
+        book = read.book
         self._raw_book = book
         self._book_path = self._read_path
+        self._fix_lists = read.fixes
+        self._update("names", name_rows(read.names))
+        self._refresh_fixes()
+        list_name = book_list_path(self._book_path).name if self._book_path else ""
+        self._update("bookListName", list_name)
         self._update("bookHasPages", book.has_pages)
         self._apply_cleanup(keep_selection=False)
         self._update("bookTitle", book.title)
@@ -806,7 +892,7 @@ class Backend(QObject):
         if job != self._preview_job:
             return
         self._preview_job = None
-        if self._previewPlaying:
+        if self._playing:
             self._play(Path(path))
 
     @Slot(int, str)
@@ -865,7 +951,7 @@ class Backend(QObject):
             self._update("loading", False)
         elif job == self._preview_job:
             self._preview_job = None
-            self._update("previewPlaying", False)
+            self._set_playing("")
         elif job == self._convert_job:
             self._end_conversion()
             self._show("voice")
@@ -905,9 +991,9 @@ class Backend(QObject):
             getattr(self, f"{name}Changed").emit()
 
     def _show(self, screen: str) -> None:
-        if screen != "voice":
-            self._stop_preview()
-        else:
+        if screen != self._screen:
+            self._stop_preview()  # whatever played belonged to the screen being left
+        if screen in ("voice", "names"):
             self._refresh_download_note()
         self._update("screen", screen)
 
@@ -1037,7 +1123,74 @@ class Backend(QObject):
         self._refresh_hardware_label()
         self.selectionSummaryChanged.emit()
 
+    # --- Names and fixes -------------------------------------------------------------------
+
+    def _edit_fixes(self, change: Callable[[FixLists, Scope], None], scope: str) -> None:
+        if self._fix_lists is None or scope not in ("book", "all"):
+            return
+        try:
+            change(self._fix_lists, cast(Scope, scope))
+        except FixNotSaved as problem:
+            self._fix_problem(str(problem))
+        else:
+            self._fix_problem("")
+        self._refresh_fixes()
+
+    def _fix_problem(self, message: str) -> None:
+        """Show what went wrong with a fix, or clear the banner a fix put up earlier."""
+        if message:
+            self._fix_error = message
+            self._update("errorMessage", message)
+        elif self._fix_error and self._errorMessage == self._fix_error:
+            self._update("errorMessage", "")
+
+    def _refresh_fixes(self) -> None:
+        lists = self._fix_lists
+        if lists is None:
+            self._update("nameFixes", {})
+            self._update("fixes", [])
+            return
+        found = {row["word"]: lists.fix_for(row["word"]) for row in self._names}
+        self._update("nameFixes", {word: fix.say for word, fix in found.items() if fix})
+        self._update(
+            "fixes", [{"word": f.word, "say": f.say, "scope": f.scope} for f in lists.fixes()]
+        )
+
+    def _spoken(self, text: str) -> str:
+        """``text`` as the book would say it: the fixes, then the language's rules (what
+        `tomecast preview` does)."""
+        fixes = self._fix_lists.combined() if self._fix_lists is not None else None
+        language = self._book.language if self._book is not None else None
+        return TextPrep.for_language(language, fixes).body(text)
+
     # --- Preview playback ------------------------------------------------------------------
+
+    def _toggle_play(self, key: str, text: str) -> None:
+        """Voice ``text`` (as the book would say it) and play it. Only one thing plays at a
+        time: a second press of the same button stops it, another button switches."""
+        if self._playing == key:
+            self._stop_preview()
+            return
+        self._stop_preview()
+        spoken = self._spoken(text.strip())
+        if self._player is None or self._shut_down or not any(c.isalnum() for c in spoken):
+            return
+        self._set_playing(key)
+        if self._preview_cache is None:
+            self._preview_cache = Path(tempfile.mkdtemp(prefix="tomecast-preview-"))
+        wav = preview_file(self._preview_cache, self._voice, self._speed, spoken)
+        if wav.is_file():
+            self._play(wav)
+            return
+        self._preview_job = next(self._jobs)
+        job = PreviewJob(self._preview_job, spoken, self._voice, self._speed, wav, self._using_gpu)
+        self._jobRequested.emit(job)
+
+    def _set_playing(self, key: str) -> None:
+        self._playing = key
+        self._update("previewPlaying", key == "preview")
+        self._update("tryPlaying", key == "try")
+        self._update("playingName", key.removeprefix("name:") if key.startswith("name:") else "")
 
     def _play(self, wav: Path) -> None:
         assert self._player is not None
@@ -1051,13 +1204,13 @@ class Backend(QObject):
     def _on_playback_finished(self) -> None:
         if self.sender() is self._playback:
             self._playback = None
-            self._update("previewPlaying", False)
+            self._set_playing("")
 
     @Slot(QProcess.ProcessError)
     def _on_playback_error(self, error: QProcess.ProcessError) -> None:
         if self.sender() is self._playback and error == QProcess.ProcessError.FailedToStart:
             self._playback = None
-            self._update("previewPlaying", False)
+            self._set_playing("")
             self._update("errorMessage", f"Couldn't play the preview with {self._player}.")
 
     def _stop_preview(self) -> None:
@@ -1066,4 +1219,4 @@ class Backend(QObject):
         if playback is not None and playback.state() != QProcess.ProcessState.NotRunning:
             playback.kill()
             playback.waitForFinished(1000)
-        self._update("previewPlaying", False)
+        self._set_playing("")
