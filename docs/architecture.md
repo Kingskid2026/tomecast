@@ -348,7 +348,7 @@ Rough totals for a **CPU-only machine** (estimates, to be measured in build step
 |---|---|
 | **README** | What it does, a short demo GIF and an audio sample, the one-line install, the supported-distros table, quick start, FAQ, credits |
 | **Licenses** | `LICENSE` for our code. `THIRD_PARTY.md` lists every model and engine the app downloads, with its license (Kokoro Apache 2.0, Ming MIT, LFM3 LFM Open License, …) |
-| **Community files** | `CONTRIBUTING.md` (how to set up, test, and send a pull request), `CODE_OF_CONDUCT.md` (Contributor Covenant), `SECURITY.md` plus GitHub's private vulnerability reporting |
+| **Community files** | `CONTRIBUTING.md` (how to set up, test, and send a pull request), `SECURITY.md` plus GitHub's private vulnerability reporting |
 | **Issue templates** | The bug form asks for `tomecast doctor` output (distro, GPU, versions), so reports are useful from the first message |
 | **Automatic checks on every pull request** | `ruff` (style and lint), `pyright` (type checks), `pytest` (readers and cleanup rules on public-domain sample books), and **the install script run inside Ubuntu 22.04/24.04, Debian 12/13, Fedora and Arch containers**. That last one proves the "works on any distro" promise on every change. Pull requests that touch the engine also run a **real conversion** in each of those containers: install with `install.sh`, turn a short public-domain EPUB into an M4B with Kokoro on the CPU, and check its length and chapters with ffmpeg |
 | **Protected main branch** | Changes only land through pull requests with passing checks, ours included |

@@ -6,7 +6,7 @@
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
 > [!NOTE]
-> **Preview.** Tomecast 0.1 is a working preview, usable today. It has a desktop window and a terminal command, and turns **EPUB, PDF, DOCX, FB2, HTML and TXT** books into **M4B** audiobooks with chapters (or one MP3 per chapter), using the Kokoro voice, on your CPU or the graphics card you already have. It reads the book, not the page: page numbers, running headers, footnotes, captions, links and front matter are left out. Expect rough edges. **Active development is paused for now.** The [roadmap](#roadmap) lays out what's left before the full 1.0 release.
+> **Preview.** Tomecast 0.1 is a working preview, usable today. It has a desktop window and a terminal command, and turns **EPUB, PDF, DOCX, FB2, HTML and TXT** books into **M4B** audiobooks with chapters (or one MP3 per chapter), using the Kokoro voice, on your CPU or the graphics card you already have. It reads the book, not the page: page numbers, running headers, footnotes, captions, links and front matter are left out. Expect some rough edges while the rest is built. The [roadmap](#roadmap) shows what's coming next.
 
 ## Try it
 
@@ -73,7 +73,7 @@ New Zealand → noo zee-lund  # several words are fine
 | **0.3.0** | Optional AI add-ons for messy books: PDF page layout, scanned PDFs (OCR), tricky cleanup calls | Planned |
 | **1.0.0** | Public launch (demo, docs, install page) and a Windows version | Planned |
 
-**Where things stand:** Tomecast is a preview, and active development is paused after 0.1.2. The plan to get it fully shipped, in order:
+**What's coming, in order:**
 
 1. **0.2.0, the polish release.** The premium Ming voice for computers with a graphics card, a pronunciation editor in the window, the voice engine on older distros such as Ubuntu and Debian (built in [#27](https://github.com/Kingskid2026/tomecast/pull/27)), the final app icon, and safer engine updates that check a new engine before switching to it.
 2. **0.3.0, the AI add-ons.** Optional downloads for messy books: understanding complex PDF page layouts, reading scanned PDFs, and a small local model for tricky cleanup decisions. This is the largest piece of work, since each add-on brings its own model.
@@ -116,7 +116,7 @@ Everything runs locally. Tomecast uses the internet only to download engines and
 
 ## Contributing
 
-Contributions are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md), and please follow the [Code of Conduct](CODE_OF_CONDUCT.md). To report a security problem, see [SECURITY.md](SECURITY.md).
+Contributions are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md). To report a security problem, see [SECURITY.md](SECURITY.md).
 
 ## Credits and license
 
