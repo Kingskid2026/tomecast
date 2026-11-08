@@ -66,8 +66,8 @@ def engine_build(variant: str, label: str, *, sha256: str, size: int) -> Asset:
 AUDIOCPP_CPU = engine_build(
     "cpu",
     "CPU",
-    sha256="TBD",
-    size=0,
+    sha256="fb4465a856fbae3843ef506706b5dc145300b95f55dc2b2ae068196f570200db",
+    size=27_434_594,
 )
 
 # The same audio.cpp, built with Vulkan. It also contains the CPU backend, so a machine that
@@ -77,8 +77,8 @@ AUDIOCPP_CPU = engine_build(
 AUDIOCPP_VULKAN = engine_build(
     "vulkan",
     "graphics card",
-    sha256="TBD",
-    size=0,
+    sha256="8466f9c628d1635e52ccf30e9a8f98dfc1cb7b76093252d762c22f87a0664742",
+    size=44_609_493,
 )
 
 ESPEAK_NG = Asset(
