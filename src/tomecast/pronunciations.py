@@ -79,47 +79,58 @@ class Pronunciations:
 
     entries: tuple[Pronunciation, ...] = ()
     _pattern: re.Pattern[str] | None = field(default=None, init=False, repr=False, compare=False)
-    _lookup: dict[str, str] = field(default_factory=dict, init=False, repr=False, compare=False)
+    # Every entry, grouped by its lowercase left side, in list order: (any case?, key, spoken).
+    _rules: dict[str, list[tuple[bool, str, str]]] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
-        folded: dict[str, str] = {}  # lowercase keys: match in any case
-        exact: dict[str, str] = {}  # keys with a capital: match that spelling (and ALL CAPS)
+        rules: dict[str, list[tuple[bool, str, str]]] = {}
+        # One regex alternative per spelling an entry matches, each carrying its own case
+        # rule, so the longest matching entry wins whichever kind it is.
+        alternatives: dict[str, int] = {}
         for entry in self.entries:
-            spoken = respelling(entry.spoken)
             key = _normalise_key(entry.written)
-            if key == key.lower():
-                folded[key] = spoken
+            any_case = key == key.lower()
+            rules.setdefault(key.lower(), []).append((any_case, key, respelling(entry.spoken)))
+            if any_case:
+                alternatives["(?i:" + _literal(key) + ")"] = len(key)
             else:
-                exact[key] = spoken
+                alternatives[_literal(key)] = len(key)
                 if len(key) > 1 and key.upper() != key:
-                    exact.setdefault(key.upper(), spoken)
-        lookup = {
-            **{"f:" + k: v for k, v in folded.items()},
-            **{"e:" + k: v for k, v in exact.items()},
-        }
+                    alternatives[_literal(key.upper())] = len(key)
         pattern = None
-        if folded or exact:
-            # Both groups always exist; an empty one is "(?!)", which never matches.
-            any_case = "(?i:" + _alternation(folded) + ")" if folded else "(?!)"
-            as_written = _alternation(exact) if exact else "(?!)"
-            pattern = re.compile(
-                rf"(?<!\w)(?:(?P<folded>{any_case})|(?P<exact>{as_written}))(?!\w)"
-            )
+        if alternatives:
+            ordered = sorted(alternatives, key=alternatives.__getitem__, reverse=True)
+            pattern = re.compile(r"(?<!\w)(?:" + "|".join(ordered) + r")(?!\w)")
         object.__setattr__(self, "_pattern", pattern)
-        object.__setattr__(self, "_lookup", lookup)
+        object.__setattr__(self, "_rules", rules)
 
     def __len__(self) -> int:
         return len(self.entries)
 
     def apply(self, text: str) -> str:
-        """Replace every whole-word match in ``text`` with its respelling."""
+        """Replace every whole-word match in ``text`` with its respelling.
+
+        Where several entries match the same words (say a global ``alice`` and a book's
+        ``Alice``), the last one in the list wins, so the book's own list beats the global
+        one. A capitalised entry's ALL-CAPS form gives way to an entry written in capitals.
+        """
         if self._pattern is None:
             return text
 
         def replace(match: re.Match[str]) -> str:
-            if match["folded"] is not None:
-                return self._lookup["f:" + _normalise_key(match["folded"]).lower()]
-            return self._lookup["e:" + _normalise_key(match["exact"])]
+            found = _normalise_key(match.group())
+            candidates = self._rules.get(found.lower(), [])
+            written_in_capitals = any(
+                not any_case and key == found for any_case, key, _ in candidates
+            )
+            for any_case, key, spoken in reversed(candidates):
+                if any_case or key == found:
+                    return spoken
+                if found == key.upper() and len(key) > 1 and not written_in_capitals:
+                    return spoken
+            return match.group()
 
         return self._pattern.sub(replace, text)
 
@@ -136,10 +147,9 @@ def _normalise_key(text: str) -> str:
     return " ".join(text.split())
 
 
-def _alternation(keys: dict[str, str]) -> str:
-    # Longest first, so "New Zealand" wins over "New".
-    ordered = sorted(keys, key=len, reverse=True)
-    return "|".join(re.escape(key).replace(r"\ ", r"\s+") for key in ordered)
+def _literal(key: str) -> str:
+    """``key`` as a regex that matches it literally, with any run of whitespace between words."""
+    return re.escape(key).replace(r"\ ", r"\s+")
 
 
 def parse(text: str, source: str = "pronunciations") -> tuple[Pronunciations, list[str]]:
