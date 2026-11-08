@@ -18,7 +18,7 @@ src/tomecast/gui/
   images.py        DotImageProvider: serves "image://dots/<name>/<theme>" to QML
   assets/          cantoria.jpg (source photo, public domain) and its credit
   fonts/           Doto, IBM Plex Sans, IBM Plex Mono static .ttf files plus OFL.txt
-  icons/           tomecast.svg (app icon, placeholder until the maintainer approves one)
+  icons/           tomecast.svg (the app icon, the sentence grid; see docs/design.md) and png/ (its PNG sizes, made by scripts/render_icons.py)
   qml/
     Main.qml       ApplicationWindow; shows the screen named by Backend.screen
     Theme.qml      singleton: palettes, fonts, spacing (follows Backend.theme)

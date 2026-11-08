@@ -1,16 +1,34 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- PLACEHOLDER icon: a dot-grid "T" in the Night Studio style (docs/design.md).
-     Pending the maintainer's approval; replace freely. -->
+<!-- Tomecast's app icon: "A · Sentence grid" from the maintainer's icon options (see
+     docs/design.md, "App icon"). A 5 × 5 grid of dots in reading order: the voiced
+     sentences are light, the one being spoken is the accent, the rest are still waiting.
+     The <title> is how desktop.py recognises the installed copy as Tomecast's. -->
 <svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
   <title>Tomecast</title>
   <rect width="256" height="256" rx="56" fill="#0B0B0C"/>
-  <circle cx="48" cy="48" r="16" fill="#F2F2F2"/>
-  <circle cx="88" cy="48" r="16" fill="#F2F2F2"/>
-  <circle cx="128" cy="48" r="16" fill="#F2F2F2"/>
-  <circle cx="168" cy="48" r="16" fill="#F2F2F2"/>
-  <circle cx="208" cy="48" r="16" fill="#F2F2F2"/>
-  <circle cx="128" cy="88" r="16" fill="#F2F2F2"/>
-  <circle cx="128" cy="128" r="16" fill="#F2F2F2"/>
-  <circle cx="128" cy="168" r="16" fill="#F2F2F2"/>
-  <circle cx="128" cy="208" r="16" fill="#7C8CFF"/>
+  <circle cx="48" cy="48" r="14" fill="#F2F2F2"/>
+  <circle cx="88" cy="48" r="14" fill="#F2F2F2"/>
+  <circle cx="128" cy="48" r="14" fill="#F2F2F2"/>
+  <circle cx="168" cy="48" r="14" fill="#F2F2F2"/>
+  <circle cx="208" cy="48" r="14" fill="#F2F2F2"/>
+  <circle cx="48" cy="88" r="14" fill="#F2F2F2"/>
+  <circle cx="88" cy="88" r="14" fill="#F2F2F2"/>
+  <circle cx="128" cy="88" r="14" fill="#F2F2F2"/>
+  <circle cx="168" cy="88" r="14" fill="#F2F2F2"/>
+  <circle cx="208" cy="88" r="14" fill="#F2F2F2"/>
+  <circle cx="48" cy="128" r="14" fill="#F2F2F2"/>
+  <circle cx="88" cy="128" r="14" fill="#F2F2F2"/>
+  <circle cx="128" cy="128" r="14" fill="#7C8CFF"/>
+  <circle cx="168" cy="128" r="14" fill="#2A2A2E"/>
+  <circle cx="208" cy="128" r="14" fill="#2A2A2E"/>
+  <circle cx="48" cy="168" r="14" fill="#2A2A2E"/>
+  <circle cx="88" cy="168" r="14" fill="#2A2A2E"/>
+  <circle cx="128" cy="168" r="14" fill="#2A2A2E"/>
+  <circle cx="168" cy="168" r="14" fill="#2A2A2E"/>
+  <circle cx="208" cy="168" r="14" fill="#2A2A2E"/>
+  <circle cx="48" cy="208" r="14" fill="#2A2A2E"/>
+  <circle cx="88" cy="208" r="14" fill="#2A2A2E"/>
+  <circle cx="128" cy="208" r="14" fill="#2A2A2E"/>
+  <circle cx="168" cy="208" r="14" fill="#2A2A2E"/>
+  <circle cx="208" cy="208" r="14" fill="#2A2A2E"/>
 </svg>
