@@ -27,9 +27,13 @@ def main() -> int:
     OUT.mkdir(parents=True, exist_ok=True)
     for size in SIZES:
         target = OUT / f"tomecast-{size}.png"
+        # The smallest sizes have their own pixel-snapped drawing (tomecast-16.svg, …), because
+        # scaling the 256 px grid down puts its dots between pixels and they blur together.
+        snapped = SVG.with_name(f"tomecast-{size}.svg")
+        source = snapped if snapped.is_file() else SVG
         command = [renderer, "--width", str(size), "--height", str(size)]
-        subprocess.run([*command, "--output", str(target), str(SVG)], check=True)
-        print(f"wrote {target.relative_to(ROOT)}")
+        subprocess.run([*command, "--output", str(target), str(source)], check=True)
+        print(f"wrote {target.relative_to(ROOT)} from {source.name}")
     return 0
 
 
