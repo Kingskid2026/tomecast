@@ -12,6 +12,7 @@ import math
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -33,13 +34,14 @@ from PySide6.QtGui import QDesktopServices, QGuiApplication
 from tomecast.book import Book
 from tomecast.chunking import split_sentences
 from tomecast.cleanup import CleanupOptions, clean
-from tomecast.downloads import Asset, build_in_use, data_dir, is_installed, needs_download
+from tomecast.downloads import Asset, build_in_use, data_dir, needs_download
 from tomecast.engines.audiocpp import (
     DEFAULT_VOICE,
     VOICES,
     check_system,
     default_threads,
     required_assets,
+    stop_all_engines,
 )
 from tomecast.gui.fixes import BadFix, FixLists, FixNotSaved, Scope
 from tomecast.gui.models import DEFAULT_SPEEDUP, ChapterModel
@@ -83,6 +85,8 @@ COMING_SOON: dict[str, str] = {}
 _FORMAT_LIST = f"{', '.join(FORMATS[:-1])} and {FORMATS[-1]}"
 STOPPED_MESSAGE = "Stopped. Start again to continue where you left off."
 UNKNOWN_TIME = "--:--:--"
+# How long closing the window waits for the worker, twice over (packaging aside).
+SHUTDOWN_WAIT_MS = 7_500
 DOWNLOAD_NOTE = "STARTING DOWNLOADS THE VOICE ONCE · {mb} MB"
 # When everything missing is a newer build of an engine that's installed (Start checks it
 # before using it, and keeps the old one if it doesn't work here).
@@ -355,7 +359,6 @@ class Backend(QObject):
         self._assets_for: Callable[[bool], Sequence[Asset]] = (
             required_assets if fixed_assets is None else (lambda use_gpu: fixed_assets)
         )
-        self._verified: dict[Path, tuple[int, int]] = {}  # file -> (size, mtime_ns) once hashed
 
         # App
         self._screen = "drop"
@@ -447,7 +450,8 @@ class Backend(QObject):
         self._thread.start()
         # The card's name, and how fast it and the CPU voice (measured once per engine build
         # and device, then remembered).
-        self._jobRequested.emit(ScanJob(next(self._jobs), gpu=self._gpuAvailable))
+        # With "Use graphics card" off, it doesn't touch the card at all.
+        self._jobRequested.emit(ScanJob(next(self._jobs), gpu=self._using_gpu))
 
     # --- Properties: app -------------------------------------------------------------------
 
@@ -577,6 +581,9 @@ class Backend(QObject):
         self.selectionSummaryChanged.emit()  # each device has its own speed
         self._refresh_hardware_label()
         self._refresh_download_note()
+        if self._using_gpu and not self._card_known():
+            # Switched on for the first time this session: learn the card's name and speed.
+            self._jobRequested.emit(ScanJob(next(self._jobs), gpu=True))
 
     @Slot(str)
     def goTo(self, screen: str) -> None:
@@ -858,16 +865,31 @@ class Backend(QObject):
     # --- Shutting down ---------------------------------------------------------------------
 
     def shutdown(self) -> None:
-        """Cancel any running job, stop the engine and join the worker thread."""
+        """Cancel any running job, stop the engines and join the worker thread.
+
+        While a book is being packaged it waits for that to finish (the audiobook is written
+        regardless). Otherwise it doesn't wait long: every engine is stopped at once, and the
+        worker's waits (another Tomecast's install, a self-check, the speed test, a download)
+        all stop when asked, so the thread ends within :data:`SHUTDOWN_WAIT_MS`."""
         if self._shut_down:
             return
         self._shut_down = True
         self._worker.stop()
+        packaging = self._control is not None and self._control.committed
         if self._control is not None:
             self._control.cancel()
         self._stop_preview()
         self._shutdownRequested.emit()
-        self._thread.wait()
+        if packaging:
+            self._thread.wait()
+        else:
+            stop_all_engines()  # a start-up or request in progress ends now
+            if not self._thread.wait(SHUTDOWN_WAIT_MS):
+                stop_all_engines()  # one that started meanwhile
+                if not self._thread.wait(SHUTDOWN_WAIT_MS):
+                    print(
+                        "tomecast: the worker didn't stop in time; closing anyway.", file=sys.stderr
+                    )
         if self._preview_cache is not None:
             shutil.rmtree(self._preview_cache, ignore_errors=True)
             self._preview_cache = None
@@ -1049,27 +1071,14 @@ class Backend(QObject):
         )
 
     def _needs_download(self, asset: Asset) -> bool:
-        """``needs_download``, but a plain file that was already hashed isn't hashed again
-        until its size or modification time changes (the voice model is large)."""
-        if asset.archive:
-            return needs_download(asset, self._data_root)  # reads small marker files
-        return not self._file_installed(asset)
+        """``needs_download`` without hashing anything: this runs on the GUI thread, and a
+        model can be 1.7 GB. A file already verified has a marker; one that hasn't been yet
+        counts if it has the pinned size, and the worker verifies it before converting."""
+        return needs_download(asset, self._data_root, verify=False)
 
-    def _file_installed(self, asset: Asset) -> bool:
-        path = self._data_root / asset.path
-        try:
-            stat = path.stat()
-        except OSError:
-            self._verified.pop(path, None)
-            return is_installed(asset, self._data_root)
-        stamp = (stat.st_size, stat.st_mtime_ns)
-        if self._verified.get(path) == stamp:
-            return True
-        if is_installed(asset, self._data_root):
-            self._verified[path] = stamp
-            return True
-        self._verified.pop(path, None)
-        return False
+    def _card_known(self) -> bool:
+        """The card's name and its speed are both known."""
+        return bool(self._gpuName) and short_name(self._gpuName) in self._speeds
 
     @Slot()
     def _update_theme(self) -> None:

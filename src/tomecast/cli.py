@@ -32,8 +32,10 @@ from tomecast.convert import (
     plan_chunks,
 )
 from tomecast.downloads import (
+    UPDATE_FAILED_NOTE,
     Asset,
     DownloadError,
+    Prepared,
     ProgressCallback,
     build_in_use,
     data_dir,
@@ -41,6 +43,8 @@ from tomecast.downloads import (
     forget_failures,
     installed_sha256,
     is_installed,
+    mark_proven,
+    roll_back,
     waiting_check,
 )
 from tomecast.engines.audiocpp import (
@@ -361,8 +365,10 @@ def _convert(args: argparse.Namespace) -> int:
     for warning in warnings:
         print(f"Note: {warning}", file=sys.stderr)
     try:
-        _prepare(use_gpu, root, assume_yes=args.yes)
-        workdir = work_folder(root, book_path, args.voice, args.speed, use_gpu=use_gpu)
+        builds = _prepare(use_gpu, root, assume_yes=args.yes).builds
+        workdir = work_folder(
+            root, book_path, args.voice, args.speed, use_gpu=use_gpu, builds=builds
+        )
     except OSError as error:
         raise CliError(str(error)) from error
 
@@ -382,7 +388,9 @@ def _convert(args: argparse.Namespace) -> int:
         except WorkFolderBusy as error:
             raise CliError(str(error)) from None
         try:
-            with AutoKokoro(root, voice=args.voice, speed=args.speed, use_gpu=use_gpu) as engine:
+            with AutoKokoro(
+                root, voice=args.voice, speed=args.speed, use_gpu=use_gpu, builds=builds
+            ) as engine:
                 print(_hardware_line(engine, args.gpu))
                 if engine.warning:
                     print(f"Note: {engine.warning}")
@@ -404,12 +412,19 @@ def _convert(args: argparse.Namespace) -> int:
             if note := _saved_note(workdir):
                 print(note)
             raise
-        except (
-            EngineError, MissingAudioError, PackagingError, CoverageError, OSError, wave.Error
-        ) as error:  # fmt: skip
+        except (EngineError, MissingAudioError) as error:
+            progress.finish()
+            # A switched-to update that crashes (or makes no usable audio) on the book, before
+            # it has finished one: the next run uses the build that worked, in a new work
+            # folder, so nothing is mixed.
+            if roll_back(root, builds, str(error)):
+                raise CliError(f"{error}\nNote: {UPDATE_FAILED_NOTE} {AGAIN_NOTE}") from error
+            raise CliError(f"{error}\n{_saved_note(workdir)}".rstrip()) from error
+        except (PackagingError, CoverageError, OSError, wave.Error) as error:
             progress.finish()
             raise CliError(f"{error}\n{_saved_note(workdir)}".rstrip()) from error
         progress.finish()
+    mark_proven(root, builds)
     shutil.rmtree(workdir, ignore_errors=True)
 
     for warning in result.warnings:
@@ -424,6 +439,8 @@ def _convert(args: argparse.Namespace) -> int:
     )
     return 0
 
+
+AGAIN_NOTE = "Run the same command again to make the book with it."
 
 NO_VULKAN_NOTE = (
     "No usable Vulkan graphics driver was found, so Tomecast will use the CPU. To use the "
@@ -628,11 +645,13 @@ def _preview(args: argparse.Namespace) -> int:
         print(f"Saying: {spoken}")
 
     use_gpu = _wants_gpu(args.gpu)
-    _prepare(use_gpu, root, assume_yes=args.yes)
+    builds = _prepare(use_gpu, root, assume_yes=args.yes).builds
     with tempfile.TemporaryDirectory(prefix="tomecast-preview-") as folder:
         wav = Path(folder) / "preview.wav"
         try:
-            with AutoKokoro(root, voice=args.voice, speed=args.speed, use_gpu=use_gpu) as engine:
+            with AutoKokoro(
+                root, voice=args.voice, speed=args.speed, use_gpu=use_gpu, builds=builds
+            ) as engine:
                 if engine.warning:
                     print(f"Note: {engine.warning}", file=sys.stderr)
                 _voice_text(engine, spoken, wav)
@@ -704,7 +723,7 @@ def _saved_note(workdir: Path) -> str:
     return ""
 
 
-def _prepare(use_gpu: bool, root: Path, *, assume_yes: bool) -> None:
+def _prepare(use_gpu: bool, root: Path, *, assume_yes: bool) -> Prepared:
     """Download what a run needs (after asking), and switch to new engine builds only once
     they pass their self-check. Prints a note when an update was kept back."""
 
@@ -746,6 +765,7 @@ def _prepare(use_gpu: bool, root: Path, *, assume_yes: bool) -> None:
         raise CliError(str(error)) from error
     for note in prepared.notes:
         print(f"Note: {note}")
+    return prepared
 
 
 def _download_printer(asset: Asset, number: int, count: int) -> ProgressCallback:

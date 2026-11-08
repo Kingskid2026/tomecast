@@ -15,10 +15,10 @@ import fcntl
 import hashlib
 import shutil
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 
-from tomecast.downloads import installed_sha256
+from tomecast.downloads import Asset, build_sha256, installed_sha256
 from tomecast.engines.audiocpp import AUDIOCPP_VERSION, DEFAULT_SEED, required_assets
 
 # Unfinished conversions are kept so they can be resumed; after this long they're removed.
@@ -30,11 +30,19 @@ class WorkFolderBusy(RuntimeError):
 
 
 def work_folder(
-    root: Path, book_path: Path, voice: str, speed: float, *, use_gpu: bool = False
+    root: Path,
+    book_path: Path,
+    voice: str,
+    speed: float,
+    *,
+    use_gpu: bool = False,
+    builds: Mapping[str, Path] | None = None,
 ) -> Path:
     """The folder for this book's chunk audio: the same book and settings resume in it.
 
-    Also removes work folders that haven't been used for :data:`STALE_WORK_DAYS`.
+    ``builds`` are the engine builds the run uses (``Prepared.builds``, which the engine is
+    also given), so the key names exactly what voices the book. Without them, the builds in
+    use now. Also removes work folders that haven't been used for :data:`STALE_WORK_DAYS`.
     """
     cache = root / "cache"
     cache.mkdir(parents=True, exist_ok=True)
@@ -50,12 +58,18 @@ def work_folder(
     # mixes two voices, speeds or model versions. The builds are the ones in use, which are
     # the pinned ones unless an update didn't work on this computer (or isn't installed yet).
     settings = [voice, str(speed), f"seed={DEFAULT_SEED}", f"audiocpp-{AUDIOCPP_VERSION}"]
-    settings += [installed_sha256(a, root) or a.sha256 for a in required_assets(use_gpu)]
+    settings += [_sha256_in_use(a, root, builds or {}) for a in required_assets(use_gpu)]
     digest.update("|".join(settings).encode())
     folder = cache / f"convert-{digest.hexdigest()[:16]}"
     folder.mkdir(exist_ok=True)
     folder.touch()  # counts as recently used
     return folder
+
+
+def _sha256_in_use(asset: Asset, root: Path, builds: Mapping[str, Path]) -> str:
+    if asset.slot in builds:
+        return build_sha256(builds[asset.slot]) or asset.sha256
+    return installed_sha256(asset, root) or asset.sha256
 
 
 @contextlib.contextmanager

@@ -16,6 +16,7 @@ small chunk of text per request. Facts this module relies on were checked agains
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import http.client
 import json
@@ -26,9 +27,11 @@ import signal
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
+import weakref
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from types import TracebackType
@@ -39,10 +42,15 @@ from tomecast.chunking import split_long
 from tomecast.convert import audio_problem
 from tomecast.downloads import (
     Asset,
+    Cancelled,
+    CheckResult,
     Consent,
     DownloadReporter,
+    Inconclusive,
+    IsCancelled,
     Prepared,
     SelfCheck,
+    VoiceCheck,
     local_path,
     prepare,
 )
@@ -268,6 +276,8 @@ class KokoroServer:
         backend: Literal["cpu", "vulkan"] = "cpu",
         device: int | None = None,
         espeak: Path | None = None,
+        builds: Mapping[str, Path] | None = None,
+        cancelled: IsCancelled | None = None,
     ) -> None:
         if voice not in VOICES:
             raise EngineError(f"unknown voice {voice!r}; choose one of: {', '.join(VOICES)}")
@@ -280,11 +290,17 @@ class KokoroServer:
         self._request_timeout = request_timeout
         self.backend = backend
         self.device = device
-        # The build to run (by default the one in use when it starts; a self-check runs a new
-        # one), and the eSpeak NG build to give it.
+        # Which builds to run: given here (a self-check runs a new one), or pinned by
+        # prepare() for this run, or else the ones in use when it first starts. Either way
+        # they're decided once (see _resolve) and kept, so crash restarts and the CPU fallback
+        # never start a different build in the middle of a book.
         self._chosen_executable = executable
         self._build = engine_asset(backend == "vulkan")  # kept when falling back to the CPU
         self._espeak = espeak
+        self._pinned: dict[str, Path] = dict(builds or {})
+        self._run: tuple[Path, Path] | None = None  # (program, eSpeak folder), once decided
+        self._cancelled = cancelled
+        self._aborted = threading.Event()
         self._reported_backend = ""
         self._process: subprocess.Popen[bytes] | None = None
         self._tempdir: tempfile.TemporaryDirectory[str] | None = None
@@ -323,12 +339,44 @@ class KokoroServer:
     @property
     def executable(self) -> Path:
         """The engine program this runs (its folder is the engine build): the one given, else
-        the build in use of the engine it was made for (the Vulkan build even after falling
-        back to its CPU backend). It's looked up each time, so an engine made before an update
-        was switched to starts the new build."""
-        if self._chosen_executable is not None:
-            return self._chosen_executable
-        return local_path(self._build, self._root) / EXECUTABLE
+        the one pinned for this run, else the build in use of the engine it was made for (the
+        Vulkan build even after falling back to its CPU backend). Decided at the first start
+        and kept; before that it's what a start would use now, so an engine made before an
+        update was switched to starts the new build."""
+        return (self._run or self._resolve())[0]
+
+    @property
+    def builds(self) -> dict[str, Path]:
+        """The engine and eSpeak NG builds this runs, by slot (decided at the first start)."""
+        program, espeak = self._run or self._resolve()
+        return {self._build.slot: program.parent, ESPEAK_NG.slot: espeak}
+
+    def pin_builds(self, builds: Mapping[str, Path]) -> None:
+        """Run exactly these builds (slot -> folder), as :func:`prepare_voice` chose them for
+        this run and keyed its work folder by. Takes effect at the next start."""
+        self._pinned = dict(builds)
+        if self._process is None:
+            self._run = None
+
+    def abort(self) -> None:
+        """Stop the engine now, from any thread: a start-up or request in progress fails at
+        once, and it isn't restarted (closing the window does this)."""
+        self._aborted.set()
+        process = self._process
+        if process is not None:
+            with contextlib.suppress(OSError):
+                process.terminate()
+
+    def _resolve(self) -> tuple[Path, Path]:
+        program = self._chosen_executable or (
+            self._pinned[self._build.slot] / EXECUTABLE
+            if self._build.slot in self._pinned
+            else local_path(self._build, self._root) / EXECUTABLE
+        )
+        espeak = (
+            self._espeak or self._pinned.get(ESPEAK_NG.slot) or local_path(ESPEAK_NG, self._root)
+        )
+        return program, espeak
 
     @property
     def max_chars(self) -> int:
@@ -354,6 +402,8 @@ class KokoroServer:
         """Start the server and wait until the model is loaded."""
         if self._process is not None:
             return
+        if self._run is None:
+            self._run = self._resolve()
         # A private (0700) folder for the config, the log and the short eSpeak link.
         self._tempdir = tempfile.TemporaryDirectory(prefix="tomecast-audiocpp-")
         try:
@@ -415,6 +465,7 @@ class KokoroServer:
             log = _tail(self._log_path)
             if self._consecutive_restarts >= _MAX_RESTARTS:
                 raise EngineError(f"the voice engine keeps crashing. Its log:\n{log}") from error
+            self._stop_if_asked()  # it was stopped on purpose: don't start it again
             self._consecutive_restarts += 1
             self._stop_process()
             self._launch()
@@ -457,6 +508,7 @@ class KokoroServer:
         self._base_url = f"http://127.0.0.1:{port}"
         config = workdir / "server.json"
         config.write_text(json.dumps(self._server_config(port)))
+        self._stop_if_asked()
         with self._log_path.open("ab") as log:
             self._process = subprocess.Popen(
                 [str(self.executable), "--config", str(config), "--no-ui"],
@@ -466,8 +518,11 @@ class KokoroServer:
                 env=self._environment(workdir),
                 preexec_fn=_stop_with_parent,  # only calls prctl, safe after fork
             )
+        with _RUNNING_LOCK:
+            _RUNNING.add(self)
         deadline = time.monotonic() + self._startup_timeout
         while time.monotonic() < deadline:
+            self._stop_if_asked()
             if self._process.poll() is not None:
                 with self._log_path.open("rb") as log_file:
                     log_file.seek(log_start)
@@ -491,7 +546,13 @@ class KokoroServer:
             f"{_tail(self._log_path)}"
         )
 
+    def _stop_if_asked(self) -> None:
+        if self._aborted.is_set() or (self._cancelled is not None and self._cancelled()):
+            raise Cancelled
+
     def _stop_process(self) -> None:
+        with _RUNNING_LOCK:
+            _RUNNING.discard(self)
         if self._process is None:
             return
         self._process.terminate()
@@ -529,8 +590,14 @@ class KokoroServer:
             raise _ConnectionLost(f"couldn't reach the voice engine: {error}") from error
 
     def loaded_device(self) -> int | None:
-        """The device the server says the voice model is loaded on (``/v1/models``), or
-        ``None`` if it doesn't say. ``/health`` only names the backend."""
+        """The device the server says the voice model is loaded on, or ``None`` if it doesn't
+        say. ``/health`` only names the backend. Checked against audio.cpp 0.9.4 on this
+        project's machines: ``GET /v1/models`` returns ``{"object": "list", "data": [{"id":
+        "kokoro", "object": "model", "owned_by": "engine", "family": "kokoro_tts", "task":
+        "tts", "mode": "offline", "device": 1, "loaded": true, "configured": true, "path":
+        "..."}]}``, where ``device`` is the ``device`` index from the config (1 for the AMD
+        860M after the NVIDIA card). On the CPU backend it says 0, which means nothing, so
+        it's only read on Vulkan."""
         try:
             with _LOCAL.open(f"{self._base_url}/v1/models", timeout=5) as response:
                 payload = json.loads(response.read())
@@ -581,7 +648,7 @@ class KokoroServer:
         }
 
     def _environment(self, private_dir: Path) -> dict[str, str]:
-        espeak = (self._espeak or local_path(ESPEAK_NG, self._root)) / "espeakng_loader"
+        espeak = (self._run or self._resolve())[1] / "espeakng_loader"
         data = espeak / "espeak-ng-data"
         if len(os.fsencode(data)) > _ESPEAK_PATH_LIMIT:
             # eSpeak can't take a long path; link to it from our private temp folder instead.
@@ -599,6 +666,20 @@ class KokoroServer:
             # them; a fixed folder means they're reused instead of piling up in /tmp.
             "TMPDIR": str(cache),
         }
+
+
+# Every engine with a running process, so closing the window can stop them all at once.
+_RUNNING: weakref.WeakSet[KokoroServer] = weakref.WeakSet()
+_RUNNING_LOCK = threading.Lock()
+
+
+def stop_all_engines() -> None:
+    """Stop every engine this process is running, now (see :meth:`KokoroServer.abort`). The
+    window calls this when it closes, so a long start-up or request can't hold it open."""
+    with _RUNNING_LOCK:
+        engines = list(_RUNNING)
+    for engine in engines:
+        engine.abort()
 
 
 # Looked up once, here in the parent: loading a library in the forked child (before the
@@ -720,9 +801,6 @@ class AutoKokoro(KokoroServer):
 # --- Installing, and checking a new build before switching to it ------------------------------
 
 SELF_CHECK_TEXT = "Tomecast is checking that its voice works on this computer."
-# A new build's first start, and a graphics driver's first use of it, can be slow; a driver
-# that hangs mustn't hold the run for long, though.
-_CHECK_TIMEOUT = 90.0
 
 
 def check_build(
@@ -732,13 +810,17 @@ def check_build(
     *,
     backend: Literal["cpu", "vulkan"],
     device: int | None = None,
+    cancelled: IsCancelled | None = None,
 ) -> str | None:
     """Try the engine build in the folder ``engine``: ``None`` if it works, else why not.
 
     It must start with ``backend`` (and ``device``), ``/health`` must report that backend,
     the voice model must be loaded on ``device`` when the server says where it is, and
     :data:`SELF_CHECK_TEXT` must come out as audio that passes the same checks as a book's.
-    ``espeak`` is the eSpeak NG build to use (``None``: the one in use).
+    ``espeak`` is the eSpeak NG build to use (``None``: the one in use). It gets the same
+    time as a real run (a new build's first start on a graphics card compiles its shaders).
+    If ``cancelled`` says the user stopped, this raises :class:`~tomecast.downloads.Cancelled`
+    rather than report a failure.
     """
     with tempfile.TemporaryDirectory(prefix="tomecast-check-") as folder:
         wav = Path(folder) / "check.wav"
@@ -749,8 +831,7 @@ def check_build(
                 espeak=espeak,
                 backend=backend,
                 device=device,
-                startup_timeout=_CHECK_TIMEOUT,
-                request_timeout=_CHECK_TIMEOUT,
+                cancelled=cancelled,
             ) as server:
                 if backend == "vulkan":
                     loaded = server.loaded_device()
@@ -761,21 +842,27 @@ def check_build(
                         )
                 server.synthesize(SELF_CHECK_TEXT, wav)
         except (EngineError, OSError) as error:
+            if cancelled is not None and cancelled():
+                raise Cancelled from error
             return str(error) or type(error).__name__
         return audio_problem(wav, SELF_CHECK_TEXT) or None
 
 
-def self_check(root: Path, use_gpu: bool) -> SelfCheck:
-    """The check :func:`~tomecast.downloads.prepare` runs before switching to new builds.
+def self_check(root: Path, use_gpu: bool, cancelled: IsCancelled | None = None) -> SelfCheck:
+    """Kokoro's check of new engine and eSpeak builds, for a run with or without the card.
 
     Without the graphics card, the new builds must voice on the CPU. With it, they must voice
-    on the card a run would use, unless the builds in use can't use that card either: then the
-    card (or its driver) is the problem, not the update, and the new builds are checked on the
-    CPU, which is what such a run falls back to.
+    on the card a run would use. If they fail there, the builds in use are tried on the card
+    too: if those work, the new builds have failed; if those fail as well, the card (or its
+    driver, or another program using it) is the problem, not the update, so the result is
+    :class:`~tomecast.downloads.Inconclusive`: nothing is switched or recorded, and the next
+    run checks again. A graphics-card build is never switched to on the strength of a CPU
+    check while there's a card to use; only when no build can see a card at all (so a run
+    voices on that build's CPU side anyway) is it checked on the CPU.
     """
     engine_slot = engine_asset(use_gpu).slot
 
-    def check(new: Mapping[str, Path], old: Mapping[str, Path]) -> str | None:
+    def check(new: Mapping[str, Path], old: Mapping[str, Path]) -> CheckResult:
         new_engine, new_espeak = new[engine_slot], new.get(ESPEAK_NG.slot)
         old_engine, old_espeak = old.get(engine_slot), old.get(ESPEAK_NG.slot)
         if use_gpu:
@@ -785,19 +872,37 @@ def self_check(root: Path, use_gpu: bool) -> SelfCheck:
             device = pick_device(devices)
             if device is not None:
                 problem = check_build(
-                    root, new_engine, new_espeak, backend="vulkan", device=device.index
+                    root,
+                    new_engine,
+                    new_espeak,
+                    backend="vulkan",
+                    device=device.index,
+                    cancelled=cancelled,
                 )
-                if problem is None:
-                    return None
-                old_works = old_engine is not None and (
-                    check_build(root, old_engine, old_espeak, backend="vulkan", device=device.index)
-                    is None
+                if problem is None or old_engine is None:
+                    return problem
+                old_problem = check_build(
+                    root,
+                    old_engine,
+                    old_espeak,
+                    backend="vulkan",
+                    device=device.index,
+                    cancelled=cancelled,
                 )
-                if old_works:
-                    return problem  # the card worked with the old builds, not with these
-        return check_build(root, new_engine, new_espeak, backend="cpu")
+                if old_problem is None:
+                    return problem  # the card worked with the builds in use, not these
+                return Inconclusive(f"the graphics card didn't work with any build: {problem}")
+        return check_build(root, new_engine, new_espeak, backend="cpu", cancelled=cancelled)
 
     return check
+
+
+def kokoro_check(root: Path, use_gpu: bool, cancelled: IsCancelled | None = None) -> VoiceCheck:
+    """Kokoro's :class:`~tomecast.downloads.VoiceCheck`: it runs on the engine build for the
+    choice and on eSpeak NG. A voice added later (Ming, #11) adds its own, so a new engine
+    build is switched to only once every installed voice that uses it has passed."""
+    uses = frozenset({engine_asset(use_gpu).slot, ESPEAK_NG.slot})
+    return VoiceCheck("Kokoro", uses, self_check(root, use_gpu, cancelled))
 
 
 def prepare_voice(
@@ -807,14 +912,17 @@ def prepare_voice(
     consent: Consent = lambda missing, updates: True,
     on_download: DownloadReporter | None = None,
     on_check: Callable[[], None] | None = None,
+    cancelled: IsCancelled | None = None,
 ) -> Prepared:
     """Install what a run needs (:func:`required_assets`), switching to new engine builds
-    only once they pass :func:`self_check`. See :func:`tomecast.downloads.prepare`."""
+    only once they pass :func:`kokoro_check`. See :func:`tomecast.downloads.prepare`; give
+    its ``builds`` to the engine and the work folder."""
     return prepare(
         required_assets(use_gpu),
         root,
-        check=self_check(root, use_gpu),
+        check=[kokoro_check(root, use_gpu, cancelled)],
         consent=consent,
         on_download=on_download,
         on_check=on_check,
+        cancelled=cancelled,
     )

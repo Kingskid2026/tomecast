@@ -13,8 +13,9 @@ import shutil
 import sys
 import tarfile
 import threading
+import time
 import wave
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 
 import pytest
@@ -26,7 +27,15 @@ from tomecast.audio import wav_info
 from tomecast.book import Book, Chapter
 from tomecast.cleanup import is_numbered_chapter
 from tomecast.convert import plan_chunks
-from tomecast.downloads import UPDATE_FAILED_NOTE, Asset, build_in_use, is_installed
+from tomecast.downloads import (
+    UPDATE_FAILED_NOTE,
+    Asset,
+    build_in_use,
+    failure,
+    is_installed,
+    mark_verified,
+    waiting_check,
+)
 from tomecast.engines.audiocpp import (
     AUDIOCPP_CPU,
     AUDIOCPP_VULKAN,
@@ -107,6 +116,10 @@ class FakeEngine:
         self.started = False
         self.closed = False
         self.thread_id: int | None = None  # the OS thread that started it
+        self.pinned: dict[str, Path] | None = None  # the builds the run was told to use
+
+    def pin_builds(self, builds: Mapping[str, Path]) -> None:
+        self.pinned = dict(builds)
 
     @property
     def voice_speed(self) -> float:
@@ -220,12 +233,18 @@ def make_backend(
         scan: str = "",  # the card the start-up scan finds
         speeds: Speeds = NO_SPEEDS,  # what the start-up speed test finds
         engine_check: SelfCheckFor | None = None,
+        probed: list[bool] | None = None,  # records each speed probe's "look at the card"
     ) -> Backend:
+        def probe(root: Path, card: bool, cancelled: object) -> Speeds:
+            if probed is not None:
+                probed.append(card)
+            return speeds
+
         backend = Backend(
             engine_factory=engines if engines is not None else Engines(),
             gpu_check=lambda: gpu,
             device_scanner=lambda root: scan,
-            speed_probe=lambda root, card: speeds,
+            speed_probe=probe,
             engine_check=engine_check,
             assets=assets,
             data_root=tmp_path / "data",
@@ -1406,10 +1425,14 @@ def _test_asset(folder: Path, name: str, content: bytes, size: int | None = None
     )
 
 
-def _install(asset: Asset, root: Path, content: bytes) -> None:
+def _install(asset: Asset, root: Path, content: bytes, *, verified: bool = True) -> None:
+    """Put ``asset`` in place as a download does: the file, plus its verified marker (which a
+    damaged file, ``verified=False``, never gets)."""
     target = root / asset.path
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(content)
+    if verified:
+        mark_verified(asset, root)
 
 
 def test_download_note_says_what_start_will_download(
@@ -1431,7 +1454,7 @@ def test_download_note_says_what_start_will_download(
     assert backend.downloadNote == "STARTING DOWNLOADS THE VOICE ONCE · 271 MB"
 
     backend.goTo("chapters")
-    _install(voice_asset, tmp_path / "data", b"a damaged file")  # wrong checksum: still missing
+    _install(voice_asset, tmp_path / "data", b"a damaged file", verified=False)  # still missing
     backend.goTo("voice")
     assert backend.downloadNote == "STARTING DOWNLOADS THE VOICE ONCE · 271 MB"
 
@@ -1623,8 +1646,8 @@ def test_an_engine_update_says_so_in_the_download_note(
     model = root / KOKORO_Q8.path
     model.parent.mkdir(parents=True)
     model.write_bytes(b"")
+    mark_verified(KOKORO_Q8, root)  # as if downloaded (or hashed) already
     backend = make_backend(gpu=True, assets=None)
-    backend._verified[model] = (0, model.stat().st_mtime_ns)  # as if hashed already
     _open(qtbot, backend, _short_book(tmp_path))
 
     backend.goTo("voice")
@@ -2163,7 +2186,7 @@ def test_an_update_that_fails_its_check_is_a_note_and_the_old_build_stays(
     asset, legacy = _engine_update(tmp_path)
     checked: list[bool] = []
 
-    def failing(root: Path, gpu: bool) -> Callable[..., str]:
+    def failing(root: Path, gpu: bool, cancelled: object) -> Callable[..., str]:
         checked.append(gpu)
         return lambda new, old: "illegal instruction"
 
@@ -2185,7 +2208,7 @@ def test_an_update_that_passes_is_used_without_a_note(
     qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
 ) -> None:
     asset, legacy = _engine_update(tmp_path)
-    backend = make_backend(assets=(asset,), engine_check=lambda root, gpu: lambda n, o: None)
+    backend = make_backend(assets=(asset,), engine_check=lambda root, gpu, c: lambda n, o: None)
     _open(qtbot, backend, _short_book(tmp_path))
 
     _convert(qtbot, backend)
@@ -2258,28 +2281,209 @@ def test_without_measurements_the_graphics_card_note_is_the_general_one(
     assert backend.gpuNote == "USING THE CPU · THE GRAPHICS CARD IS USUALLY SEVERAL TIMES FASTER"
 
 
-def test_the_start_up_scan_looks_at_the_card_only_when_a_driver_is_there(
+def test_the_start_up_scan_looks_at_the_card_only_when_it_is_switched_on(
     qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
 ) -> None:
     asked: list[bool] = []
 
-    def probe(root: Path, gpu: bool) -> Speeds:
+    def probe(root: Path, gpu: bool, cancelled: object) -> Speeds:
         asked.append(gpu)
         return Speeds()
 
-    for gpu in (False, True):
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    # No driver; a driver and the switch on; a driver and the switch off.
+    for driver, switched_on in ((False, True), (True, True), (True, False)):
+        settings.setValue("useGpu", switched_on)
+        before = len(asked)
         backend = Backend(
             engine_factory=Engines(),
-            gpu_check=lambda gpu=gpu: gpu,  # type: ignore[misc]
+            gpu_check=lambda driver=driver: driver,  # type: ignore[misc]
             device_scanner=lambda root: "",
             speed_probe=probe,
             assets=(),
             data_root=tmp_path / "data",
             player=None,
-            settings=QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat),
+            settings=settings,
             system_check=lambda: None,
         )
-        qtbot.waitUntil(lambda gpu=gpu: len(asked) == (2 if gpu else 1))  # type: ignore[misc]
+        qtbot.waitUntil(lambda before=before: len(asked) > before)  # type: ignore[misc]
         backend.shutdown()
 
-    assert asked == [False, True]
+    assert asked == [False, True, False]  # off means the card isn't touched at all
+
+
+# --- After the review: rollback, Cancel and closing never wait on installs --------------------
+
+
+def test_an_update_that_fails_on_the_book_is_rolled_back(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    asset, legacy = _engine_update(tmp_path)
+    engines = Engines()
+    engines.start_error = "the voice engine keeps crashing. Its log:\nSegmentation fault"
+    backend = make_backend(engines, assets=(asset,), engine_check=lambda r, g, c: lambda n, o: None)
+    _open(qtbot, backend, _short_book(tmp_path))
+
+    _convert(qtbot, backend)  # the update passed its check, then crashed on the book
+
+    assert backend.screen == "voice"
+    assert backend.errorMessage.endswith(
+        "The voice engine update didn't work on this computer, so Tomecast kept using the "
+        "previous version. Start again to make the book with it."
+    )
+    new_build = tmp_path / "data" / asset.path / asset.sha256[:12]
+    assert engines.made[0].pinned == {"engine": new_build}
+    assert build_in_use(asset, tmp_path / "data") == legacy
+
+    engines.start_error = None
+    _convert(qtbot, backend)  # Start again
+
+    assert backend.screen == "done"
+    assert engines.made[-1].pinned == {"engine": legacy}  # the build that worked
+
+
+def test_a_failed_update_download_is_tried_again_in_the_same_session(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    asset, legacy = _engine_update(tmp_path)
+    source = Path(asset.url.removeprefix("file://"))
+    away = source.with_suffix(".away")
+    source.rename(away)  # no network
+    backend = make_backend(assets=(asset,), engine_check=lambda r, g, c: lambda n, o: None)
+    labels: list[str] = []
+    backend.downloadLabelChanged.connect(lambda: labels.append(backend.downloadLabel))
+    _open(qtbot, backend, _short_book(tmp_path))
+
+    _convert(qtbot, backend)
+
+    assert backend.screen == "done"
+    assert backend.warnings[0] == (
+        "The voice engine update couldn't be downloaded, so Tomecast kept using the previous "
+        "version."
+    )
+    backend.goTo("voice")
+    assert backend.downloadNote.startswith("STARTING DOWNLOADS A VOICE ENGINE UPDATE")  # it will
+
+    away.rename(source)  # the network is back
+    labels.clear()
+    _convert(qtbot, backend)
+
+    assert any(label.startswith("DOWNLOADING AN UPDATE") for label in labels)
+    assert build_in_use(asset, tmp_path / "data") != legacy
+    backend.goTo("voice")
+    assert backend.downloadNote == ""
+
+
+def _book_is_read(qtbot: QtBot, backend: Backend, tmp_path: Path) -> None:
+    """The worker isn't stuck: it reads another book."""
+    other = build_epub(
+        tmp_path / "other.epub",
+        [Page("o.xhtml", "<p>Another book entirely.</p>")],
+        toc=[NavPoint("Only", "o.xhtml")],
+        title="Other Book",
+    )
+    backend.goTo("drop")
+    backend.openBook(_url(other))
+    qtbot.waitUntil(lambda: backend.bookTitle == "Other Book", timeout=5000)
+
+
+def test_cancel_works_while_another_tomecast_is_installing(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    import fcntl
+
+    asset = _test_asset(tmp_path, "model.bin", b"model weights")
+    root = tmp_path / "data"
+    root.mkdir()
+    with (root / ".install.lock").open("w") as other:
+        fcntl.flock(other, fcntl.LOCK_EX)  # the command line is installing
+        backend = make_backend(assets=(asset,))
+        _open(qtbot, backend, _short_book(tmp_path))
+        backend.goTo("voice")
+        backend.startConversion()
+        qtbot.wait(300)  # the worker is waiting for the lock
+
+        backend.cancelConversion()
+
+        assert backend.errorMessage == STOPPED_MESSAGE
+        _book_is_read(qtbot, backend, tmp_path)
+    assert not (root / asset.path).exists()
+
+
+def test_cancel_works_during_the_self_check_and_blames_nothing(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    asset, legacy = _engine_update(tmp_path)
+    checking = threading.Event()
+
+    def slow_check(root: Path, gpu: bool, cancelled: Callable[[], bool]) -> Callable[..., str]:
+        def check(new: object, old: object) -> str:
+            checking.set()
+            while not cancelled():  # a first start on a slow card
+                time.sleep(0.02)
+            return "the voice engine stopped while starting"
+
+        return check
+
+    backend = make_backend(assets=(asset,), engine_check=slow_check)
+    _open(qtbot, backend, _short_book(tmp_path))
+    backend.goTo("voice")
+    backend.startConversion()
+    qtbot.waitUntil(checking.is_set)
+
+    backend.cancelConversion()
+
+    _book_is_read(qtbot, backend, tmp_path)
+    assert failure(asset, tmp_path / "data") is None  # stopped, not failed
+    assert waiting_check(asset, tmp_path / "data")
+    assert build_in_use(asset, tmp_path / "data") == legacy
+
+
+def test_closing_the_window_doesnt_wait_for_a_stuck_engine(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(backend_module, "SHUTDOWN_WAIT_MS", 200)
+    stopped: list[bool] = []
+    monkeypatch.setattr(backend_module, "stop_all_engines", lambda: stopped.append(True))
+    engines = Engines()
+    engines.block_at = 1  # the first piece hangs (a request to a stuck card)
+    backend = make_backend(engines)
+    _open(qtbot, backend, _short_book(tmp_path))
+    backend.goTo("voice")
+    backend.startConversion()
+    assert engines.blocked.wait(timeout=10)
+    started = time.monotonic()
+
+    backend.shutdown()
+
+    assert time.monotonic() - started < 2
+    assert stopped  # every engine was told to stop
+    engines.release.set()
+    assert backend.worker_thread.wait(10_000)
+
+
+def test_closing_the_window_while_packaging_waits_for_the_book(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(backend_module, "SHUTDOWN_WAIT_MS", 1)
+    backend = make_backend()
+    _open(qtbot, backend, _short_book(tmp_path))
+    backend.goTo("voice")
+    backend.startConversion()
+    qtbot.waitUntil(lambda: _control(backend).committed, timeout=CONVERSION_TIMEOUT)
+
+    backend.shutdown()
+
+    assert not backend.worker_thread.isRunning()  # it waited for packaging to finish
+    assert list(tmp_path.glob("Short Book*.m4b"))
+
+
+def test_turning_the_card_on_looks_at_it_once(qtbot: QtBot, make_backend: MakeBackend) -> None:
+    probed: list[bool] = []
+    backend = make_backend(gpu=True, probed=probed)
+    qtbot.waitUntil(lambda: probed == [True])  # on at start-up: the card is looked at
+
+    backend.setUseGpu(False)
+    backend.setUseGpu(True)  # its name and speed are still unknown: look again
+
+    qtbot.waitUntil(lambda: probed == [True, True])

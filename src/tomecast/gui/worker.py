@@ -18,7 +18,7 @@ import tempfile
 import threading
 import time
 import wave
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Protocol
@@ -39,20 +39,29 @@ from tomecast.convert import (
     plan_chunks,
 )
 from tomecast.downloads import (
+    UPDATE_FAILED_NOTE,
     Asset,
+    Cancelled,
     DownloadError,
+    IsCancelled,
     ProgressCallback,
     SelfCheck,
+    VoiceCheck,
     build_in_use,
     is_usable,
+    mark_proven,
+    needs_download,
     prepare,
+    roll_back,
+    run_builds,
+    waiting_check,
 )
 from tomecast.engines.audiocpp import (
     AUDIOCPP_VULKAN,
     EXECUTABLE,
     AutoKokoro,
     EngineError,
-    self_check,
+    kokoro_check,
 )
 from tomecast.gui.fixes import FixLists, ListFile
 from tomecast.hardware import list_devices, pick_device
@@ -86,6 +95,11 @@ class Engine(VoiceEngine, Protocol):
     gpu_description: str  # after start(): the card's full description, or "" on the CPU
     warning: str | None  # after start(): why the CPU is used when the card was wanted
 
+    def pin_builds(self, builds: Mapping[str, Path]) -> None:
+        """Run exactly these engine builds (``Prepared.builds``): the work folder is keyed by
+        them, so crash restarts must not pick up another."""
+        ...
+
     def start(self) -> None: ...
 
     def close(self) -> None: ...
@@ -97,10 +111,12 @@ EngineFactory = Callable[[Path, str, float, bool], Engine]
 AssetsFor = Callable[[bool], Sequence[Asset]]
 # (data folder) -> the graphics card's description if one would be used, else ""
 DeviceScanner = Callable[[Path], str]
-# (data folder, look at the graphics card too) -> the speeds measured (or remembered) there
-SpeedProbe = Callable[[Path, bool], Speeds]
-# (data folder, use the graphics card) -> the check a new engine build must pass
-SelfCheckFor = Callable[[Path, bool], SelfCheck]
+# (data folder, look at the graphics card too, has the user stopped?) -> the speeds measured
+# (or remembered) there
+SpeedProbe = Callable[[Path, bool, IsCancelled], Speeds]
+# (data folder, use the graphics card, has the user stopped?) -> the checks a new engine build
+# must pass (one per voice that uses it)
+SelfCheckFor = Callable[[Path, bool, IsCancelled], SelfCheck | Sequence[VoiceCheck]]
 
 
 def kokoro_engine(root: Path, voice: str, speed: float, use_gpu: bool) -> Engine:
@@ -119,10 +135,15 @@ def scan_gpu(root: Path) -> str:
     return device.description if device else ""
 
 
-def probe_speeds(root: Path, gpu: bool) -> Speeds:
+def probe_speeds(root: Path, gpu: bool, cancelled: IsCancelled) -> Speeds:
     """The real speed probe: the CPU's speed, and the card's with ``gpu``, measured once per
     engine build and device (a few seconds each) and remembered after that."""
-    return probe(root, gpu=gpu)
+    return probe(root, gpu=gpu, cancelled=cancelled)
+
+
+def voice_checks(root: Path, use_gpu: bool, cancelled: IsCancelled) -> list[VoiceCheck]:
+    """The real self-checks: one per voice that runs on the engine builds (Kokoro today)."""
+    return [kokoro_check(root, use_gpu, cancelled)]
 
 
 class TimedControl(ConversionControl):
@@ -344,7 +365,7 @@ class ConversionWorker(QObject):
         system_check: Callable[[], None],
         device_scanner: DeviceScanner = scan_gpu,
         speed_probe: SpeedProbe = probe_speeds,
-        engine_check: SelfCheckFor = self_check,
+        engine_check: SelfCheckFor = voice_checks,
     ) -> None:
         super().__init__()
         self._engine_factory = engine_factory
@@ -395,7 +416,11 @@ class ConversionWorker(QObject):
         if job.gpu:
             self.deviceChosen.emit(self._device_scanner(self._root))
         self._close_preview_engine()  # one model in memory at a time
-        self.speedsKnown.emit(self._speed_probe(self._root, job.gpu))
+        try:
+            speeds = self._speed_probe(self._root, job.gpu, self._stopping.is_set)
+        except Cancelled:
+            return  # the window is closing
+        self.speedsKnown.emit(speeds)
 
     # --- Reading a book ------------------------------------------------------------------
 
@@ -492,6 +517,7 @@ class ConversionWorker(QObject):
 
     def _convert(self, job: ConvertJob) -> None:
         workdir: Path | None = None
+        builds: dict[str, Path] = {}
         try:
             self._close_preview_engine()  # one model in memory at a time
             self._system_check()
@@ -508,17 +534,23 @@ class ConversionWorker(QObject):
             self.progressed.emit(
                 job.job, ConvertUpdate(0, len(chunks), first_chapter, "", "starting", None, None)
             )
-            install_notes = self._prepare(job)
+            install_notes, builds = self._prepare(job)
             if job.control.cancelled:
                 raise ConversionCancelled
+            # The work folder and the engine use exactly the builds prepare() chose, so a
+            # book is never voiced with two builds under one key.
+            engine.pin_builds(builds)
             workdir = work_folder(
-                self._root, job.book_path, job.voice, job.speed, use_gpu=job.use_gpu
-            )
+                self._root, job.book_path, job.voice, job.speed, use_gpu=job.use_gpu,
+                builds=builds,
+            )  # fmt: skip
             with exclusive(workdir):
                 self.stageChanged.emit(job.job, "starting")
                 outcome = self._voice_book(job, engine, chunks, workdir, prep, notes, install_notes)
             shutil.rmtree(workdir, ignore_errors=True)
-        except ConversionCancelled:
+            with contextlib.suppress(Cancelled, OSError):
+                mark_proven(self._root, builds, self._stopping.is_set)
+        except (ConversionCancelled, Cancelled):
             self.cancelled.emit(job.job)
             return
         except (
@@ -526,11 +558,27 @@ class ConversionWorker(QObject):
             WorkFolderBusy, OSError, wave.Error,
         ) as error:  # fmt: skip
             message = _as_sentence(str(error))
-            if workdir is not None and any((workdir / "chunks").glob("*.wav")):
+            # A switched-to update that crashes (or makes no usable audio) on its first book.
+            failed_voicing = isinstance(error, EngineError | MissingAudioError)
+            if failed_voicing and builds and self._roll_back(job, builds, error):
+                message += f" {UPDATE_FAILED_NOTE} Start again to make the book with it."
+            elif workdir is not None and any((workdir / "chunks").glob("*.wav")):
                 message += " The audio made so far is kept, so starting again continues from there."
             self.failed.emit(job.job, message)
             return
         self.converted.emit(job.job, outcome)
+
+    def _roll_back(self, job: ConvertJob, builds: Mapping[str, Path], error: Exception) -> bool:
+        """An update that passed its check failed on the book: go back to the build before
+        it (:func:`tomecast.downloads.roll_back`), and prepare again next time."""
+        try:
+            rolled = roll_back(self._root, builds, str(error), self._stopping.is_set)
+        except (Cancelled, OSError):
+            return False
+        if rolled:
+            self._assets_ready.pop(job.use_gpu, None)
+            self._close_preview_engine()  # it may be running the build that failed
+        return rolled
 
     def _voice_book(
         self,
@@ -604,13 +652,16 @@ class ConversionWorker(QObject):
             )
         return self._assets_usable[use_gpu]
 
-    def _prepare(self, job: ConvertJob) -> tuple[str, ...]:
+    def _prepare(self, job: ConvertJob) -> tuple[tuple[str, ...], dict[str, Path]]:
         """Download what's missing and switch to new engine builds once they pass their
         self-check (:func:`tomecast.downloads.prepare`). Pressing Start counts as agreeing to
         the downloads, so the label says whether it's a one-time download or an update.
-        Returns the notes to show on the done screen (an update kept back)."""
+        Returns the notes to show on the done screen (an update kept back), and the builds
+        this run uses. Waiting for another Tomecast, downloading and checking all stop when
+        the conversion is cancelled or the window closes."""
+        assets = self._assets_for(job.use_gpu)
         if self._assets_ready.get(job.use_gpu):
-            return ()
+            return (), run_builds(assets, self._root)
         kind = "DOWNLOADING ONCE"
 
         def consent(missing: Sequence[Asset], updates: bool) -> bool:
@@ -628,24 +679,33 @@ class ConversionWorker(QObject):
         def on_check() -> None:
             self.stageChanged.emit(job.job, "starting")
 
+        def cancelled() -> bool:
+            return job.control.cancelled or self._stopping.is_set()
+
         prepared = prepare(
-            self._assets_for(job.use_gpu),
+            assets,
             self._root,
-            check=self._self_check(self._root, job.use_gpu),
+            check=self._self_check(self._root, job.use_gpu, cancelled),
             consent=consent,
             on_download=on_download,
             on_check=on_check,
+            cancelled=cancelled,
         )
-        self._assets_ready[job.use_gpu] = True
+        # Done for this session only if nothing is left to try: a download that failed, or a
+        # check with no verdict, is tried again by the next conversion.
+        self._assets_ready[job.use_gpu] = not any(
+            needs_download(asset, self._root) or waiting_check(asset, self._root)
+            for asset in assets
+        )
         self._assets_usable[job.use_gpu] = True
-        return prepared.notes
+        return prepared.notes, dict(prepared.builds)
 
     def _download_reporter(self, job: ConvertJob, label: str) -> Callable[[int, int], None]:
         shown = -1
 
         def show(done: int, total: int) -> None:
             nonlocal shown
-            if job.control.cancelled:
+            if job.control.cancelled or self._stopping.is_set():
                 raise ConversionCancelled  # stops the download; nothing half-done is kept
             percent = min(100, 100 * done // total) if total else 100
             if percent != shown:
