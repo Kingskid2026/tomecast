@@ -1,8 +1,8 @@
 """Launcher integration: the freedesktop ``.desktop`` entry and icon for ``tomecast gui``.
 
-Installing writes two files under ``$XDG_DATA_HOME`` (default ``~/.local/share``) so
-Tomecast shows up in app launchers (Walker, GNOME Activities, KRunner) and in the "Open with"
-menu for EPUB files. Nothing here needs root.
+Installing writes a ``.desktop`` entry and the icon (SVG, plus PNG sizes) under
+``$XDG_DATA_HOME`` (default ``~/.local/share``) so Tomecast shows up in app launchers (Walker,
+GNOME Activities, KRunner) and in the "Open with" menu for EPUB files. Nothing here needs root.
 """
 
 from __future__ import annotations
@@ -17,10 +17,14 @@ from pathlib import Path
 
 ENTRY_NAME = "tomecast.desktop"
 ICON_NAME = "tomecast.svg"
+# PNG copies for docks and older themes that don't read SVG. Keep in step with
+# scripts/render_icons.py, which makes them from the SVG.
+ICON_SIZES = (16, 24, 32, 48, 64, 128, 256)
 # Only files containing this line are treated as ours, so uninstall never deletes
 # someone else's tomecast.desktop.
 MARKER = "Name=Tomecast"
 _ICON_SOURCE = Path(__file__).parent / "gui" / "icons" / ICON_NAME
+_PNG_SOURCES = {size: _ICON_SOURCE.parent / "png" / f"tomecast-{size}.png" for size in ICON_SIZES}
 
 
 class ForeignEntryError(RuntimeError):
@@ -41,6 +45,9 @@ class Locations:
     @property
     def hicolor(self) -> Path:
         return self.icon.parents[2]
+
+    def png(self, size: int) -> Path:
+        return self.hicolor / f"{size}x{size}" / "apps" / "tomecast.png"
 
 
 def locations() -> Locations:
@@ -108,10 +115,14 @@ def install() -> list[str]:
     where.icon.parent.mkdir(parents=True, exist_ok=True)
     where.entry.write_text(desktop_entry_text(executable), encoding="utf-8")
     shutil.copyfile(_ICON_SOURCE, where.icon)
+    for size, source in _PNG_SOURCES.items():
+        target = where.png(size)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
     refresh_caches(where)
     return [
         f"Added Tomecast to your app launcher: {where.entry}",
-        f"Installed its icon: {where.icon}",
+        f"Installed its icon: {where.icon}, and PNG sizes {', '.join(map(str, ICON_SIZES))}",
         f"It opens {executable} gui, and EPUB files now offer Open with Tomecast.",
     ]
 
@@ -140,6 +151,20 @@ def uninstall() -> list[str]:
             messages.append(f"Removed {where.icon}")
         else:
             messages.append(f"Left {where.icon} alone, because Tomecast didn't create it.")
+    # A PNG has no title to check, so a file counts as ours only if it is byte-for-byte the
+    # copy we install.
+    removed_pngs = 0
+    for size, source in _PNG_SOURCES.items():
+        target = where.png(size)
+        if not target.exists():
+            continue
+        if _same_bytes(target, source):
+            target.unlink()
+            removed_pngs += 1
+        else:
+            messages.append(f"Left {target} alone, because Tomecast didn't create it.")
+    if removed_pngs:
+        messages.append(f"Removed Tomecast's {removed_pngs} PNG icons from {where.hicolor}")
     if not messages:
         return ["Tomecast wasn't in your app launcher, so there is nothing to remove."]
     refresh_caches(where)
@@ -150,6 +175,13 @@ def _icon_is_ours(icon: Path) -> bool:
     try:
         return "<title>Tomecast</title>" in icon.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
+        return False
+
+
+def _same_bytes(path: Path, source: Path) -> bool:
+    try:
+        return path.read_bytes() == source.read_bytes()
+    except OSError:
         return False
 
 
