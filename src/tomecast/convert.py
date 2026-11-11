@@ -159,6 +159,9 @@ class ConversionProgress:
     now_speaking: str = ""  # the text being voiced next ("" once all of it is voiced)
     audio_seconds: float = 0.0  # length of the audio made so far
     stage: Literal["voicing", "packaging"] = "voicing"
+    # Of ``chunks_done``, how many an earlier run had already made (reused, so not voiced
+    # now): a speed or time left measured on this run leaves them out.
+    chunks_reused: int = 0
 
 
 ProgressCallback = Callable[[ConversionProgress], None]
@@ -267,7 +270,7 @@ def convert_book(
             progress(
                 ConversionProgress(
                     done, total, chapter_index, chapter_count, upcoming, seconds,
-                    "packaging" if stage == "packaging" else "voicing",
+                    "packaging" if stage == "packaging" else "voicing", reused,
                 )
             )  # fmt: skip
 

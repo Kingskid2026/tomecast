@@ -2386,6 +2386,31 @@ def test_a_conversion_measures_better_than_the_speed_test(
     assert "4.6×" not in backend.hardwareLabel
 
 
+def test_packaging_time_doesnt_count_towards_the_measured_speed(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    packaging = SlowPackaging(monkeypatch)
+    backend = make_backend(speeds=Speeds(cpu=4.6))
+    qtbot.waitUntil(lambda: "REAL TIME" in backend.hardwareLabel)
+    _open(qtbot, backend, _short_book(tmp_path))
+    backend.goTo("voice")
+    backend.startConversion()
+    qtbot.waitUntil(lambda: backend.stage == "packaging", timeout=CONVERSION_TIMEOUT)
+    key = backend._speed_key("CPU")
+    voicing = backend._speeds[key]  # measured on the voicing alone
+    assert voicing != 4.6
+
+    time.sleep(1.0)  # a long book takes minutes to encode, after the last piece is voiced
+    packaging.release.set()
+    qtbot.waitUntil(lambda: backend.screen == "done", timeout=CONVERSION_TIMEOUT)
+
+    # The speed kept for the next book's estimates and the card-or-CPU note is how fast it
+    # voices, as the speed test measures it: packaging (or a resumed book's few new pieces
+    # against a whole book's encode) doesn't drag it down.
+    assert backend._speeds[key] == pytest.approx(voicing)
+    assert backend.hardwareLabel.endswith(f"ABOUT {voicing:.1f}× REAL TIME")
+
+
 def test_the_graphics_card_note_shows_the_measured_speed_up(
     qtbot: QtBot, make_backend: MakeBackend
 ) -> None:
@@ -2412,6 +2437,38 @@ def test_the_graphics_card_note_is_honest_about_a_slow_card(
     assert backend.gpuNote == "NO FASTER THAN THE CPU HERE · USES THE DRIVER ALREADY INSTALLED"
     backend.setUseGpu(False)
     assert backend.gpuNote == "USING THE CPU · THE GRAPHICS CARD WAS NO FASTER HERE"
+
+
+def test_voicing_on_the_cpu_with_the_card_off_keeps_what_is_known_about_the_card(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    player = shutil.which("true")
+    if player is None:
+        pytest.skip("needs the `true` command as a stand-in audio player")
+    engines = Engines()
+    backend = make_backend(
+        engines, gpu=True, scan=NVIDIA, player=player,
+        speeds=Speeds(cpu=5.0, gpu=4.0, gpu_description=NVIDIA),
+    )  # fmt: skip
+    qtbot.waitUntil(lambda: "REAL TIME" in backend.hardwareLabel)
+    backend.setUseGpu(False)
+    measured = "USING THE CPU · THE GRAPHICS CARD WAS NO FASTER HERE"
+    assert backend.gpuNote == measured
+    _open(qtbot, backend, _short_book(tmp_path))
+    backend.goTo("voice")
+
+    backend.togglePreview()  # a preview on the CPU...
+    qtbot.waitUntil(lambda: not backend.previewPlaying)
+    assert backend.errorMessage == ""
+    _convert(qtbot, backend)  # ...and a book
+
+    assert backend.screen == "done"
+    assert [engine.use_gpu for engine in engines.made] == [False, False]
+    # An engine started on the CPU because the card is switched off says nothing about the card.
+    assert backend.gpuName == NVIDIA
+    assert backend.gpuNote == measured
+    backend.setUseGpu(True)
+    assert backend.hardwareLabel == "NVIDIA RTX PRO 1000 · ABOUT 4.0× REAL TIME"
 
 
 def test_without_measurements_the_graphics_card_note_is_the_general_one(
