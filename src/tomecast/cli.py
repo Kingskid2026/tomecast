@@ -72,7 +72,7 @@ from tomecast.machine import (
 )
 from tomecast.manifest import ASSETS
 from tomecast.names import DEFAULT_MIN_COUNT, find_book_names
-from tomecast.packaging import PackagingError
+from tomecast.packaging import OutputExistsError, PackagingError
 from tomecast.playback import PLAYERS, find_player, play
 from tomecast.readers import FORMATS, InvalidEbookError, read_book
 from tomecast.speed import (
@@ -349,10 +349,7 @@ def _convert(args: argparse.Namespace) -> int:
     output: Path = args.output or (
         book_path.with_suffix("") if output_format == "mp3" else book_path.with_suffix(".m4b")
     )
-    if (output.exists() or output.is_symlink()) and not args.force:
-        raise CliError(f"{output} already exists (use --force to overwrite it)")
-    if not output.parent.is_dir():
-        raise CliError(f"the folder {output.parent} doesn't exist")
+    _check_output(output, output_format, book_path, force=args.force)
 
     try:
         book = read_book(book_path)
@@ -451,6 +448,10 @@ def _convert(args: argparse.Namespace) -> int:
                     format=output_format,
                     prep=prep,
                     chapters=chapters,
+                    # Without --force, a file that appears at the output while the book is
+                    # made (another run's, say) is never replaced: the run stops instead.
+                    overwrite=args.force,
+                    rename=False,
                 )
         except KeyboardInterrupt:
             progress.finish()
@@ -469,6 +470,13 @@ def _convert(args: argparse.Namespace) -> int:
             if not out_of_memory and roll_back(root, builds, str(error)):
                 raise CliError(f"{error}\nNote: {UPDATE_FAILED_NOTE} {AGAIN_NOTE}") from error
             raise CliError(f"{error}\n{_saved_note(workdir)}".rstrip()) from error
+        except OutputExistsError as error:
+            progress.finish()
+            raise CliError(
+                f"{error}: it appeared while this book was being made, so it wasn't replaced. "
+                "The audio made so far is saved: run the command again with -o to save the "
+                "audiobook under another name, or with --force to replace it."
+            ) from error
         except (PackagingError, CoverageError, OSError, wave.Error) as error:
             progress.finish()
             raise CliError(f"{error}\n{_saved_note(workdir)}".rstrip()) from error
@@ -857,6 +865,34 @@ def _display_name(removal: Removal, chapters: Sequence[Chapter]) -> str:
 
 def _interrupt(signum: int, frame: object) -> None:
     raise KeyboardInterrupt
+
+
+def _check_output(
+    output: Path, output_format: Literal["m4b", "mp3"], book: Path, *, force: bool
+) -> None:
+    """Refuse an output path that can't work, before anything is voiced: one that exists
+    (without ``force``), is the wrong kind for the format (``force`` doesn't change that),
+    or is in a folder that doesn't exist."""
+    taken = output.exists() or output.is_symlink()
+    if output_format == "m4b" and output.is_dir():
+        raise CliError(
+            f"{output} is a folder. Give the audiobook a file name, like "
+            f"-o {output / book.with_suffix('.m4b').name}"
+        )
+    if output_format == "m4b" and output.suffix.lower() == ".mp3":
+        raise CliError(
+            f"{output} ends in .mp3, but the audiobook is an M4B file. Use --format mp3 for "
+            "MP3s (one per chapter, in a folder), or a name ending in .m4b"
+        )
+    if output_format == "mp3" and taken and not output.is_dir():
+        raise CliError(
+            f"{output} is a file, but --format mp3 makes a folder of MP3s. "
+            "Choose a folder name with -o"
+        )
+    if taken and not force:
+        raise CliError(f"{output} already exists (use --force to overwrite it)")
+    if not output.parent.is_dir():
+        raise CliError(f"the folder {output.parent} doesn't exist")
 
 
 def _saved_note(workdir: Path) -> str:

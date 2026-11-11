@@ -63,6 +63,11 @@ class PackagingError(RuntimeError):
     """Raised when the audiobook can't be built: bad input audio, a bad cover, or ffmpeg failed."""
 
 
+class OutputExistsError(PackagingError):
+    """Raised with ``overwrite=False, rename=False`` when the output's name is taken (by
+    something that appeared while the audiobook was made, say). Nothing was written."""
+
+
 @dataclass(frozen=True, slots=True)
 class ChapterAudio:
     """One chapter's audio: WAV segments in reading order, each followed by some silence.
@@ -131,6 +136,7 @@ def write_m4b(
     bitrate: str = "64k",
     ffmpeg: str | None = None,
     overwrite: bool = True,
+    rename: bool = True,
     tempo: float = 1.0,
 ) -> PackagedBook:
     """Encode ``chapters`` into an M4B audiobook at ``output`` and return where it ended up
@@ -150,7 +156,8 @@ def write_m4b(
     With ``overwrite=False`` an existing file is never replaced, even if it appears while
     the audiobook is being encoded: the finished file is published with a hard link, which
     fails if the name is taken, and the next free name ("Title (2).m4b", "Title (3).m4b"...)
-    is used instead. The returned ``output`` is the name actually used.
+    is used instead. The returned ``output`` is the name actually used. With ``rename=False``
+    as well, a taken name raises :class:`OutputExistsError` instead, and nothing is written.
 
     ``tempo`` speeds the finished audio up (or slows it down) without changing its pitch,
     using ffmpeg's ``atempo`` filter in the same single encode. It must be from 0.5 to 2.0.
@@ -200,7 +207,7 @@ def write_m4b(
         if overwrite:
             partial.replace(output)
         else:
-            output = _publish_without_overwriting(partial, output)
+            output = _publish_without_overwriting(partial, output, rename=rename)
     finally:
         partial.unlink(missing_ok=True)  # only still there if something failed
 
@@ -223,6 +230,7 @@ def write_mp3s(
     workdir: Path,
     tempo: float = 1.0,
     overwrite: bool = True,
+    rename: bool = True,
     ffmpeg: str | None = None,
 ) -> PackagedBook:
     """Encode ``chapters`` as one MP3 file each, in a folder at ``folder``.
@@ -242,8 +250,9 @@ def write_mp3s(
     failed run leaves nothing behind. With ``overwrite=False`` an existing ``folder`` is
     never touched: the finished folder is moved into place under the first free name
     ("Title (2)", "Title (3)"...), claimed atomically, and the returned ``output`` is the
-    name used. With ``overwrite=True`` an existing folder keeps any files that aren't
-    numbered MP3s, and its old numbered MP3s are replaced.
+    name used; with ``rename=False`` as well, a taken name raises :class:`OutputExistsError`
+    instead, and nothing is written. With ``overwrite=True`` an existing folder keeps any
+    files that aren't numbered MP3s, and its old numbered MP3s are replaced.
 
     Raises:
         PackagingError: for the same reasons as :func:`write_m4b`, or if ``folder`` exists
@@ -283,7 +292,7 @@ def write_mp3s(
         if overwrite:
             _replace_folder(partial, folder)
         else:
-            folder = _publish_folder_without_overwriting(partial, folder)
+            folder = _publish_folder_without_overwriting(partial, folder, rename=rename)
     finally:
         shutil.rmtree(partial, ignore_errors=True)  # only still there if something failed
 
@@ -398,17 +407,20 @@ def _replace_folder(partial: Path, target: Path) -> None:
     shutil.rmtree(partial, ignore_errors=True)
 
 
-def _publish_folder_without_overwriting(partial: Path, target: Path) -> Path:
+def _publish_folder_without_overwriting(partial: Path, target: Path, *, rename: bool) -> Path:
     """Give the folder ``partial`` its final name: ``target``, or the first free
     "<name> (N)". The name is claimed with ``mkdir``, which fails if it exists (a symlink
     too), and the folder is then renamed over that empty claim; if somebody put something
-    in the claimed folder meanwhile, the rename fails and the next name is tried."""
+    in the claimed folder meanwhile, the rename fails and the next name is tried. With
+    ``rename=False``, raise :class:`OutputExistsError` instead of trying another name."""
     number = 1
     candidate = target
     while True:
         try:
             candidate.mkdir()
         except FileExistsError:
+            if not rename:
+                raise OutputExistsError(f"{target} already exists") from None
             number += 1
             candidate = target.with_name(f"{target.name} ({number})")
             continue
@@ -419,14 +431,17 @@ def _publish_folder_without_overwriting(partial: Path, target: Path) -> Path:
                 with contextlib.suppress(OSError):
                     candidate.rmdir()
                 raise
+            if not rename:  # somebody filled the claimed folder: it's theirs now
+                raise OutputExistsError(f"{target} already exists") from None
             number += 1
             candidate = target.with_name(f"{target.name} ({number})")
             continue
         return candidate
 
 
-def _publish_without_overwriting(partial: Path, target: Path) -> Path:
-    """Give ``partial`` its final name: ``target``, or the first free "<stem> (N)<suffix>".
+def _publish_without_overwriting(partial: Path, target: Path, *, rename: bool) -> Path:
+    """Give ``partial`` its final name: ``target``, or the first free "<stem> (N)<suffix>"
+    (with ``rename=False``, raise :class:`OutputExistsError` instead of trying another name).
 
     ``os.link`` fails if the name exists (it does not follow symlinks either), so claiming a
     name is atomic and a file that appears at any moment is never replaced. On a file system
@@ -439,6 +454,8 @@ def _publish_without_overwriting(partial: Path, target: Path) -> Path:
         try:
             os.link(partial, candidate)
         except FileExistsError:
+            if not rename:
+                raise OutputExistsError(f"{target} already exists") from None
             number += 1
             candidate = target.with_name(f"{target.stem} ({number}){target.suffix}")
             continue
@@ -446,6 +463,8 @@ def _publish_without_overwriting(partial: Path, target: Path) -> Path:
             try:
                 os.close(os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666))
             except FileExistsError:
+                if not rename:
+                    raise OutputExistsError(f"{target} already exists") from None
                 number += 1
                 candidate = target.with_name(f"{target.stem} ({number}){target.suffix}")
                 continue
