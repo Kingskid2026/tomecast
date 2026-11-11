@@ -381,6 +381,7 @@ SENTENCE_STARTS = [
     ("It ended. 5-7 men came.", "It ended. Five to seven men came."),
     ("Done. 3:45 p.m. came.", "Done. Three forty-five pee em came."),
     ("He left. -5 degrees.", "He left. Minus five degrees."),
+    ("He left. ~5 men came.", "He left. ~Five men came."),
     ("He left. \u22125 degrees.", "He left. Minus five degrees."),
     ("He left. No. 5 was next.", "He left. Number five was next."),
     # After a spelled-out a.m., p.m., B.C. or A.D., whichever rule says the number.
