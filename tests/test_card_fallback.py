@@ -44,6 +44,12 @@ _DEVICES = json.dumps(
 )  # fmt: skip
 
 
+@pytest.fixture(autouse=True)
+def _premium_preview(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests use the premium voice, a preview for now: opted into."""
+    monkeypatch.setenv("TOMECAST_PREMIUM_PREVIEW", "1")
+
+
 @pytest.fixture
 def fake_server(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("FAKE_LOG", str(tmp_path / "fake.log"))

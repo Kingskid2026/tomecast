@@ -86,7 +86,12 @@ def _hours_minutes(minutes: int) -> str:
 
 
 def summarize(
-    words: int, sections: int, total_sections: int, speedup: float, speed: float = 1.0
+    words: int,
+    sections: int,
+    total_sections: int,
+    speedup: float,
+    speed: float = 1.0,
+    voice_speed: float | None = None,
 ) -> dict[str, str]:
     """The four summary lines under the chapter list, as ready-to-show uppercase strings.
 
@@ -95,7 +100,7 @@ def summarize(
     the voice's speed counts), and the time-stretch on top is quick.
     """
     listening = audio_minutes(words, speed)
-    making = make_minutes(words, speed, speedup)
+    making = make_minutes(words, speed, speedup, voice_speed=voice_speed)
     if words == 0:
         audio, make = "NO AUDIO", "NOTHING TO MAKE"
     else:
@@ -235,8 +240,11 @@ class ChapterModel(QAbstractListModel):
     def selected_rows(self) -> list[int]:
         return [row for row, section in enumerate(self._sections) if section.selected]
 
-    def summary(self, speedup: float, speed: float = 1.0) -> dict[str, str]:
-        """``{sections, words, audio, make}`` for the rows that are ticked."""
+    def summary(
+        self, speedup: float, speed: float = 1.0, *, voice_speed: float | None = None
+    ) -> dict[str, str]:
+        """``{sections, words, audio, make}`` for the rows that are ticked. ``voice_speed`` is
+        the voice's own speed (the premium voice's is always 1.0; None: Kokoro's split)."""
         chosen = [section for section in self._sections if section.selected]
         return summarize(
             sum(section.words for section in chosen),
@@ -244,6 +252,7 @@ class ChapterModel(QAbstractListModel):
             len(self._sections),
             speedup,
             speed,
+            voice_speed,
         )
 
     def meter_lit(self, row: int) -> int:

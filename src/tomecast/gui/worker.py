@@ -62,7 +62,6 @@ from tomecast.engines.audiocpp import (
     AUDIOCPP_VULKAN,
     DEFAULT_VOICE,
     EXECUTABLE,
-    AutoKokoro,
     EngineError,
 )
 from tomecast.gui.fixes import FixLists, ListFile
@@ -143,11 +142,9 @@ SelfCheckFor = Callable[[Path, bool, IsCancelled], SelfCheck | Sequence[VoiceChe
 
 def kokoro_engine(root: Path, voice: str, speed: float, use_gpu: bool) -> Engine:
     """The real engine: Kokoro through audio.cpp, with its files under ``root`` (or Ming, for
-    a premium voice). It uses the graphics card when asked to and able, and falls back to the
-    CPU."""
-    if ming.is_ming_voice(voice):
-        return ming.AutoMing(root, voice=voice, speed=speed, use_gpu=use_gpu)
-    return AutoKokoro(root, voice=voice, speed=speed, use_gpu=use_gpu)
+    a premium voice, made where every engine is: :func:`tomecast.voices.make_engine`). It uses
+    the graphics card when asked to and able, and falls back to the CPU."""
+    return voices.make_engine(root, voice, speed=speed, use_gpu=use_gpu)
 
 
 def scan_devices(root: Path, cancelled: IsCancelled) -> list[GpuDevice] | None:
@@ -166,10 +163,11 @@ def probe_speeds(
     return probe(root, gpu=gpu, cancelled=cancelled, devices=devices, listed=gpu)
 
 
-def voice_checks(root: Path, use_gpu: bool, cancelled: IsCancelled) -> list[VoiceCheck]:
-    """The real self-checks: one per installed voice that runs on the engine builds (Kokoro,
-    and Ming on the graphics-card build once it's installed)."""
-    return voices.voice_checks(root, DEFAULT_VOICE, use_gpu, cancelled)
+def voice_checks(root: Path, voice: str, use_gpu: bool, cancelled: IsCancelled) -> list[VoiceCheck]:
+    """The real self-checks for a run with ``voice``: its own voice's, plus every other
+    installed voice that runs on the same engine builds (:func:`tomecast.voices.voice_checks`).
+    So a premium-only install never runs Kokoro's check without Kokoro's model."""
+    return voices.voice_checks(root, voice, use_gpu, cancelled)
 
 
 class TimedControl(ConversionControl):
@@ -462,7 +460,7 @@ class ConversionWorker(QObject):
         system_check: Callable[[], None],
         device_scanner: DeviceScanner = scan_devices,
         speed_probe: SpeedProbe = probe_speeds,
-        engine_check: SelfCheckFor = voice_checks,
+        engine_check: SelfCheckFor | None = None,
     ) -> None:
         super().__init__()
         self._engine_factory = engine_factory
@@ -471,7 +469,7 @@ class ConversionWorker(QObject):
         self._system_check = system_check
         self._device_scanner = device_scanner
         self._speed_probe = speed_probe
-        self._self_check = engine_check
+        self._self_check = engine_check  # None: the real checks, for the job's own voice
         self._stopping = threading.Event()
         # Per (voice engine, "use the graphics card"): prepared, and some build of each file
         # is there (previews). Kokoro and Ming need different files.
@@ -644,12 +642,22 @@ class ConversionWorker(QObject):
         try:
             self._close_preview_engine()  # one model in memory at a time
             self._system_check()
-            # A book in a language the chosen voice doesn't speak goes to the other engine.
-            route = voices.route(job.voice, job.book.language, premium_possible=job.use_gpu)
+            # A book in a language the chosen voice doesn't speak (or the premium voice isn't
+            # checked for) may go to the other engine; it goes to the premium voice only if
+            # that's opted into, installed and fits the card: routing never downloads it.
+            route = voices.route(
+                job.voice,
+                job.book.language,
+                premium_ok=lambda: voices.premium_can_take(self._root, job.use_gpu),
+            )
             if route.voice != job.voice:
                 job = replace(job, voice=route.voice)
-            if ming.is_ming_voice(job.voice):  # the window knows only Kokoro's CPU speed
-                job = replace(job, cpu_speedup=None)
+            capped = None
+            if ming.is_ming_voice(job.voice):
+                if job.speed > ming.MAX_SPEED:  # a routed book, or a speed saved before
+                    capped = ming.CAPPED_NOTE
+                # The window knows only Kokoro's CPU speed, and the premium voice stops at 2x.
+                job = replace(job, cpu_speedup=None, speed=ming.capped_speed(job.speed))
             engine = self._engine_factory(self._root, job.voice, job.speed, job.use_gpu)
             if isinstance(engine, ming.MingServer):
                 engine.language = route.language
@@ -657,7 +665,8 @@ class ConversionWorker(QObject):
                 note
                 for note in (
                     route.note,
-                    ming.UNCHECKED_NOTE if ming.is_ming_voice(job.voice) else None,
+                    capped,
+                    ming.preview_note() if ming.is_ming_voice(job.voice) else None,
                 )
                 if note
             )
@@ -703,7 +712,12 @@ class ConversionWorker(QObject):
             # graphics chip built into the processor, the card's memory is the computer's).
             failed_voicing = isinstance(error, EngineError | MissingAudioError)
             stopped = job.control.cancelled or self._stopping.is_set()
-            blameless = stopped or (engine is not None and engine.out_of_memory)
+            # Nor after a premium-voice run: what fails under the premium voice (words left
+            # out, an error its model answers with) is that voice's, not the shared build's,
+            # which Kokoro's own check judges; and when the card failed it fell back anyway.
+            blameless = stopped or (
+                engine is not None and (engine.out_of_memory or isinstance(engine, ming.MingServer))
+            )
             if failed_voicing and builds and not blameless and self._roll_back(job, builds, error):
                 message += f" {UPDATE_FAILED_NOTE} Start again to make the book with it."
             elif workdir is not None and any((workdir / "chunks").glob("*.wav")):
@@ -858,7 +872,11 @@ class ConversionWorker(QObject):
         prepared = prepare(
             assets,
             self._root,
-            check=self._self_check(self._root, job.use_gpu, cancelled),
+            check=(
+                voice_checks(self._root, job.voice, job.use_gpu, cancelled)
+                if self._self_check is None
+                else self._self_check(self._root, job.use_gpu, cancelled)
+            ),
             consent=consent,
             on_download=on_download,
             on_check=on_check,

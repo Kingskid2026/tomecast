@@ -24,7 +24,7 @@ from tomecast.downloads import (
     Prepared,
     VoiceCheck,
     build_in_use,
-    is_installed,
+    needs_download,
     prepare,
 )
 from tomecast.engines import audiocpp, ming
@@ -43,8 +43,11 @@ LANGUAGE_NAMES = {
     "en": "English", "es": "Spanish", "fr": "French", "it": "Italian", "pt": "Portuguese",
     "hi": "Hindi", "ja": "Japanese", "zh": "Chinese", "de": "German", "ko": "Korean",
 }  # fmt: skip
-# The Kokoro voice a book in this language gets when it's routed away from Ming.
-KOKORO_VOICE_FOR = {"it": "if_sara", "pt": "pf_dora", "hi": "hf_alpha"}
+# ISO 639-2 and 639-3 codes (some EPUBs use them) for the languages above.
+_THREE_LETTER = {
+    "eng": "en", "spa": "es", "fra": "fr", "fre": "fr", "ita": "it", "por": "pt", "hin": "hi",
+    "jpn": "ja", "zho": "zh", "chi": "zh", "cmn": "zh", "deu": "de", "ger": "de", "kor": "ko",
+}  # fmt: skip
 
 PREMIUM_NOTE = "The premium voice is about {size} to download and needs a graphics card."
 NEEDS_GPU = (
@@ -59,10 +62,12 @@ def engine_of(voice: str) -> Engine:
 
 
 def language_code(language: str | None) -> str:
-    """A book's language as a primary subtag: ``"en-GB"`` becomes ``"en"``. Unknown: ``en``."""
+    """A book's language as a two-letter primary subtag: ``"en-GB"`` and ``"eng"`` become
+    ``"en"``, ``"deu"`` and ``"ger"`` become ``"de"``. Unknown: ``en``."""
     if not language:
         return "en"
-    return language.replace("_", "-").split("-")[0].strip().lower() or "en"
+    code = language.replace("_", "-").split("-")[0].strip().lower() or "en"
+    return _THREE_LETTER.get(code, code)
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,45 +80,69 @@ class Route:
     note: str | None = None
 
 
-def route(voice: str, language: str | None, *, premium_possible: bool) -> Route:
+def route(
+    voice: str, language: str | None, *, premium_ok: Callable[[], bool] = lambda: False
+) -> Route:
     """The voice for a book in ``language`` when ``voice`` was chosen.
 
-    If the chosen voice's engine doesn't speak the language and the other one does, the book
-    goes to the other one, and the note says so: Italian, Portuguese and Hindi go to Kokoro;
-    German and Korean go to Ming, but only when ``premium_possible`` (a graphics card is in
-    use), since Ming isn't offered without one. If neither speaks it, the chosen voice reads
-    it with English rules, as before, and the note says that too.
+    * A premium voice reads only the languages it has been checked for
+      (:data:`tomecast.engines.ming.CHECKED_LANGUAGES`: English so far). A book in another
+      language goes to the Kokoro voice closest to it (:data:`~tomecast.engines.ming.KOKORO_MATCH`),
+      read with English rules, and the note says so.
+    * A Kokoro book goes to the premium voice only in a language Kokoro doesn't speak and the
+      premium voice is checked for, and only if ``premium_ok()`` says so (asked only then):
+      the preview is opted into, the premium voice is already installed (routing never
+      downloads it), and the card in use has room for it (:func:`premium_can_take`).
+    * Kokoro's other languages (Spanish, French, Italian, Portuguese, Hindi, Japanese,
+      Chinese) need its larger multilingual voice file, which isn't pinned yet, so the book
+      stays with the chosen voice and the note says it's read by an English voice. (Routing
+      Italian, Portuguese and Hindi to if_sara, pf_dora and hf_alpha waits for that file.)
+    * Anything else stays with the chosen voice, read with English rules, and says so.
     """
     code = language_code(language)
     name = LANGUAGE_NAMES.get(code, code)
     if engine_of(voice) == "ming":
-        if code in ming.LANGUAGES:
+        if code in ming.CHECKED_LANGUAGES:
             return Route(voice, code)
-        if code in KOKORO_LANGUAGES:
-            kokoro = KOKORO_VOICE_FOR.get(code, audiocpp.DEFAULT_VOICE)
-            return Route(
-                kokoro,
-                code,
-                f"The premium voice doesn't speak {name}, so Tomecast used Kokoro ({kokoro}).",
-            )
-        return Route(voice, "en", f"No voice speaks {name} yet, so it's read with English rules.")
-    if code in KOKORO_LANGUAGES:
+        kokoro, kokoro_name, accent = ming.KOKORO_MATCH[voice]
+        return Route(
+            kokoro,
+            "en",
+            f"The premium voice hasn't been checked for {name} books yet, so this one uses "
+            f"Kokoro's {kokoro_name} (similar {accent} voice), read with English rules.",
+        )
+    if code == "en":
         return Route(voice, code)
-    if code in ming.LANGUAGES:
-        if premium_possible:
-            return Route(
-                ming.DEFAULT_VOICE,
-                code,
-                f"Kokoro doesn't speak {name}, so Tomecast used the premium voice "
-                f"({ming.DEFAULT_VOICE}).",
-            )
+    if code in ming.CHECKED_LANGUAGES and code not in KOKORO_LANGUAGES and premium_ok():
+        return Route(
+            ming.DEFAULT_VOICE,
+            code,
+            f"Kokoro doesn't speak {name}, so Tomecast used the premium voice "
+            f"({ming.DEFAULT_VOICE}).",
+        )
+    if code in KOKORO_LANGUAGES:
         return Route(
             voice,
             "en",
-            f"Kokoro doesn't speak {name}. The premium voice does, but it needs a graphics "
-            "card, so it's read with English rules.",
+            f"Kokoro's {name} voices need a larger voice file that Tomecast doesn't download "
+            "yet, so this book is read by an English voice.",
         )
+    if code in ming.LANGUAGES:
+        return Route(voice, "en", f"Kokoro doesn't speak {name}, so it's read with English rules.")
     return Route(voice, "en", f"No voice speaks {name} yet, so it's read with English rules.")
+
+
+def premium_can_take(root: Path, use_gpu: bool) -> bool:
+    """Whether a book may go to the premium voice without the user choosing it (language
+    routing): the preview is opted into, the card is in use, the premium voice is already
+    installed (so routing never downloads 1.74 GB on its own), and the card has room for it,
+    by the hardware scan's own rule (:func:`scan_recommendation`). It lists the cards, so
+    it's only asked when a book needs it."""
+    if not (use_gpu and ming.preview_enabled()):
+        return False
+    if any(needs_download(asset, root, verify=False) for asset in ming.required_assets(True)):
+        return False
+    return scan_recommendation(root).voice == "ming"
 
 
 def required_assets(voice: str, use_gpu: bool, *, with_kokoro: bool = True) -> tuple[Asset, ...]:
@@ -154,10 +183,13 @@ def voice_checks(
     other."""
     engine = engine_of(voice)
     checks = []
-    kokoro_installed = is_installed(KOKORO_Q8, root) and is_installed(ESPEAK_NG, root)
-    if engine == "kokoro" or kokoro_installed:
+
+    def installed(*assets: Asset) -> bool:  # without hashing a 1.7 GB model here
+        return not any(needs_download(asset, root, verify=False) for asset in assets)
+
+    if engine == "kokoro" or installed(KOKORO_Q8, ESPEAK_NG):
         checks.append(audiocpp.kokoro_check(root, use_gpu, cancelled))
-    if use_gpu and (engine == "ming" or is_installed(MING_Q8, root)):
+    if use_gpu and (engine == "ming" or installed(MING_Q8)):
         checks.append(ming.ming_check(root, use_gpu, cancelled))
     return checks
 
@@ -198,43 +230,41 @@ def make_engine(
     speed: float = 1.0,
     use_gpu: bool = True,
     language: str = "en",
-    verify: ming.SpokenCheck | None = None,
     builds: Mapping[str, Path] | None = None,
     threads: int | None = None,
-    cancelled: IsCancelled | None = None,
+    if_card_fails: ming.CardPolicy = ming.DEFAULT_CARD_POLICY,
+    kokoro: Callable[..., AutoKokoro] = AutoKokoro,
+    premium: Callable[..., AutoKokoro] = ming.AutoMing,
 ) -> AutoKokoro:
-    """The engine for ``voice``: :class:`~tomecast.engines.ming.AutoMing` for a Ming voice
-    (told to speak ``language`` and checked by ``verify``), else
-    :class:`~tomecast.engines.audiocpp.AutoKokoro`. Not started."""
+    """The engine for ``voice``, not started: the one place an engine is made, so a premium
+    voice always gets the spoken-text check (:data:`~tomecast.engines.ming.SPOKEN_CHECK`),
+    the speed cap and the language it may read. :class:`~tomecast.engines.ming.AutoMing`
+    for a premium voice (told to speak ``language``, doing ``if_card_fails`` if the card
+    fails), else :class:`~tomecast.engines.audiocpp.AutoKokoro`. ``kokoro`` and ``premium``
+    are the classes to make (the command line passes its own names, which its tests replace).
+    """
     if engine_of(voice) == "ming":
-        return ming.AutoMing(
+        return premium(
             root,
             voice=voice,
-            speed=speed,
+            speed=ming.capped_speed(speed),
             use_gpu=use_gpu,
-            language=language if language in ming.LANGUAGES else "en",
-            verify=verify,
+            language=language if language in ming.CHECKED_LANGUAGES else "en",
+            verify=ming.SPOKEN_CHECK,
             builds=builds,
             threads=threads,
-            cancelled=cancelled,
+            if_card_fails=if_card_fails,
         )
-    return AutoKokoro(
-        root,
-        voice=voice,
-        speed=speed,
-        use_gpu=use_gpu,
-        builds=builds,
-        threads=threads,
-        cancelled=cancelled,
-    )
+    return kokoro(root, voice=voice, speed=speed, use_gpu=use_gpu, builds=builds, threads=threads)
 
 
 def scan_recommendation(root: Path) -> Recommendation:
     """The hardware scan's recommendation, with the graphics card the engine would use: the
-    premium voice only if the installed graphics-card build sees a card with room for it
+    premium voice only while it's offered (:func:`~tomecast.engines.ming.preview_enabled`)
+    and the installed graphics-card build sees a card with room for it
     (:func:`tomecast.machine.recommend`). Never downloads; without that build it's Kokoro."""
     vulkan = build_in_use(AUDIOCPP_VULKAN, root)
     devices = None
-    if vulkan is not None and vulkan_possible():
+    if ming.preview_enabled() and vulkan is not None and vulkan_possible():
         devices = list_devices(vulkan / EXECUTABLE)
     return recommend(scan_machine(), pick_device(devices or []))

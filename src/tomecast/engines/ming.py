@@ -41,10 +41,19 @@ default):
 None of these counts against the engine build: no rollback, no "keeps crashing". An error
 the engine *answers* with (an HTTP error about the text), and the spoken-text check failing,
 aren't the card failing: they fail the piece as before.
+
+**A preview, for now.** Until a spoken-text check is plugged in (:data:`SPOKEN_CHECK`), the
+premium voices are offered only to someone who opts into the preview by setting
+``TOMECAST_PREMIUM_PREVIEW=1`` (:func:`preview_enabled`): the window, ``tomecast voices``, the
+scan's recommendation and language routing leave them out otherwise, and ``--voice
+UK_George`` says how to opt in. And it reads only the languages its piece size has been
+measured for (:data:`CHECKED_LANGUAGES`: English so far), because a piece cut short there
+would go unnoticed.
 """
 
 from __future__ import annotations
 
+import os
 import tempfile
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -87,6 +96,12 @@ CARD_POLICIES: tuple[CardPolicy, ...] = ("kokoro", "cpu", "stop")
 DEFAULT_CARD_POLICY: CardPolicy = "kokoro"
 # Primary language subtags Ming speaks. The request names one of them.
 LANGUAGES = frozenset({"en", "zh", "de", "es", "fr", "ko", "ja"})
+# The ones Tomecast lets it read: those whose piece size has been measured. MAX_CHARS (200)
+# was measured on English, where Ming is complete up to about 350 characters; nothing checks
+# that a piece in another language (Chinese, Japanese or Korean especially, with far more
+# sound per character) isn't cut short, and audio_problem wouldn't notice. German is the next
+# to measure: one 133-character sentence came out whole for UK_George and US_Emma (8 Nov).
+CHECKED_LANGUAGES = frozenset({"en"})
 
 MODEL_ID = "ming"
 FAMILY = "ming3_tts"
@@ -104,15 +119,42 @@ MIN_SPLIT_CHARS = 24
 
 # The hook for the spoken-text check: (a chunk's WAV, the text it should say) -> "" if every
 # word was heard, else a short description of what's missing ("skipped 'and the Queen'").
-# A speech-recognition check (being built separately) is plugged in here; until then there is
-# none, and Ming's skips go through unnoticed, which is why Ming isn't offered yet.
 SpokenCheck = Callable[[Path, str], str]
-# Said before a book is voiced with Ming while no spoken-text check is plugged in. Empty once
-# one is: the command line and the window only show it when it's set.
+# The speech-recognition check every premium-voice engine gets (being built separately, as
+# spoken_check). Setting it is the one switch: the engines use it (tomecast.voices.make_engine),
+# the preview opt-in and the notes below are no longer needed, and the work folder's key
+# changes, so pieces voiced without the check are never reused as if they had been checked.
+SPOKEN_CHECK: SpokenCheck | None = None
+
+# Until then, the premium voices are a preview that has to be asked for.
+PREVIEW_ENV = "TOMECAST_PREMIUM_PREVIEW"
 UNCHECKED_NOTE = (
     "The premium voice is a preview: it sometimes leaves out a few words, and Tomecast doesn't "
     "check it for that yet."
 )
+PREVIEW_OFF_NOTE = (
+    "The premium voices (Ming) are a preview: they sometimes leave out a few words, and "
+    f"Tomecast can't check for that yet. To try them anyway, set {PREVIEW_ENV}=1, for "
+    f"example: {PREVIEW_ENV}=1 tomecast convert BOOK --voice {{voice}}"
+)
+CAPPED_NOTE = "The premium voice goes up to 2\u00d7, so this book is made at 2\u00d7."
+
+
+def preview_enabled() -> bool:
+    """Whether the premium voices are offered: always once a spoken-text check is plugged in
+    (:data:`SPOKEN_CHECK`), and until then only to someone who opted into the preview by
+    setting ``TOMECAST_PREMIUM_PREVIEW=1``."""
+    return SPOKEN_CHECK is not None or os.environ.get(PREVIEW_ENV) == "1"
+
+
+def preview_note() -> str | None:
+    """The sentence said before a premium-voice book while it has no spoken-text check."""
+    return UNCHECKED_NOTE if SPOKEN_CHECK is None else None
+
+
+def capped_speed(speed: float) -> float:
+    """``speed`` as the premium voice can make it: at most :data:`MAX_SPEED`."""
+    return min(speed, MAX_SPEED)
 
 
 CPU_NOTE = (
@@ -203,15 +245,19 @@ def flow_settings() -> dict[str, str]:
 
 
 def work_key(voice: str) -> str:
-    """What the work folder is keyed by in place of a Kokoro voice name: the voice, and the
-    flow steps, which change the audio (so a book is never half one setting, half the other)."""
+    """What the work folder is keyed by in place of a Kokoro voice name: the voice, the flow
+    steps, which change the audio (so a book is never half one setting, half the other), and
+    whether its pieces were checked for left-out words, so pieces made without the check are
+    never reused once there is one. (The speed isn't in it: the premium voice always speaks
+    at 1.0 and the whole book is stretched afterwards, so a book resumes at any speed.)"""
     steps = flow_settings()
     flow = (
         f"{steps['AUDIOCPP_MING_FLOW_STEPS']}-{steps['AUDIOCPP_MING_FLOW_SCHEDULE']}"
         if steps
         else "default"
     )
-    return f"{MODEL_ID}/{voice}/flow={flow}"
+    checked = "on" if SPOKEN_CHECK is not None else "off"
+    return f"{MODEL_ID}/{voice}/flow={flow}/spoken-check={checked}"
 
 
 def _checked_speed(speed: float) -> float:
@@ -243,8 +289,8 @@ class MingServer(KokoroServer):
             raise EngineError(
                 f"unknown premium voice {voice!r}; choose one of: {', '.join(VOICES)}"
             )
-        if language not in LANGUAGES:
-            raise EngineError(f"the premium voice doesn't speak {language!r}")
+        if language not in CHECKED_LANGUAGES:
+            raise EngineError(f"the premium voice hasn't been checked for {language!r} yet")
         super().__init__(root, speed=_checked_speed(speed), **kwargs)  # type: ignore[arg-type]
         self.voice = voice  # after Kokoro's set-up, which only knows Kokoro's voices
         self.premium_voice = voice  # kept when Kokoro takes over (AutoMing)
