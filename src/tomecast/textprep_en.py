@@ -479,8 +479,13 @@ _LABEL_KEYWORDS = (
 _CARDINAL_KEYWORDS = f"{_STRUCTURE_KEYWORDS}|{_LABEL_KEYWORDS}"
 _KEYWORD_EXPANSIONS = {"chap": "chapter", "chap.": "chapter", "vol": "volume", "vol.": "volume",
                        "fig": "figure", "fig.": "figure"}  # fmt: skip
+# A numeral is a whole word: "L'vov" and "I'm" start with a numeral's letter but are not one,
+# while "Henry V's" (a possessive) is. The lookbehind stops the numeral from shrinking to
+# nothing instead.
+_NOT_A_CONTRACTION = r"(?<=[IVXLCDM])(?!['\u2019](?!s\b)[^\W\d_])"
 _AFTER_KEYWORD = re.compile(
     rf"\b(?P<kw>(?:{_CARDINAL_KEYWORDS})|(?i:{_CARDINAL_KEYWORDS}))\s+(?P<num>{ROMAN_PATTERN})\b"
+    + _NOT_A_CONTRACTION
 )
 _ROYALS = frozenset(
     (
@@ -489,7 +494,9 @@ _ROYALS = frozenset(
         "Innocent Clement Urban Nicholas Alfonso Carlos Juan Ivan Mary Anne Edwin"
     ).split()
 )
-_AFTER_NAME = re.compile(rf"\b(?P<name>[A-Z][a-z]+)\s+(?P<num>{ROMAN_PATTERN})\b(?!\.\d)")
+_AFTER_NAME = re.compile(
+    rf"\b(?P<name>[A-Z][a-z]+)\s+(?P<num>{ROMAN_PATTERN})\b(?!\.\d)" + _NOT_A_CONTRACTION
+)
 _HEADING_ROMAN = re.compile(
     rf"^(?P<lead>\s*)(?P<num>{ROMAN_PATTERN})(?P<rest>(?:[.:)\u2014\u2013-].*)?)$"
 )

@@ -396,6 +396,15 @@ def test_latin_and_references(written: str, spoken: str) -> None:
         ("as I act I can", "as I act I can"),
         ("the MIX CD", "the MIX CD"),
         ("Super Mario MD", "Super Mario MD"),
+        # A numeral's letter starting a contraction or a name is not a numeral...
+        ("Chapter L'vov", "Chapter L'vov"),
+        ("Prince L\u2019vov came", "Prince L\u2019vov came"),
+        ("Book I'm here", "Book I'm here"),
+        ("Act I'll go", "Act I'll go"),
+        ("Louis XIV'd", "Louis XIV'd"),
+        # ...but a possessive is still one, with a straight or a curly apostrophe.
+        ("Henry VIII\u2019s wives", "Henry the eighth\u2019s wives"),
+        ("Chapter XII's end", "Chapter twelve's end"),
     ],
 )
 def test_roman_numerals(written: str, spoken: str) -> None:
