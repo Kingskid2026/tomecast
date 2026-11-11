@@ -64,6 +64,7 @@ jobs:
     name: Windows (port in progress)
     runs-on: windows-latest
     continue-on-error: true
+    timeout-minutes: 30  # a test that hangs on Windows mustn't hold a runner for 6 hours
     steps:
       # Keep LF line endings, as on Linux: some tests compare files byte for byte.
       - run: git config --global core.autocrlf false
