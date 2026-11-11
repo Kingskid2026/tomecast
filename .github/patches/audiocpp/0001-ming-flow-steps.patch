@@ -21,8 +21,9 @@ Defaults
   Unset or empty, both give upstream's sampler unchanged: the same 10 steps on the same time
   table, with the same arithmetic, so the audio is byte-identical to an unpatched build. The
   loop body is upstream's, untouched; the local experiment this patch was cut from was checked
-  byte for byte on 20 of 20 chunks. An invalid value prints one warning and is ignored. Only
-  Ming-3.0-tts uses this code.
+  byte for byte on 20 of 20 chunks. An invalid value prints one warning and is ignored. Ming
+  models use this code: Ming-3.0-tts, and also upstream's Ming3 Audio talker
+  (src/models/ming3_audio/talker.cpp), which Tomecast doesn't load. Kokoro doesn't.
 
 Measured (2026-11-10)
   RTX PRO 1000 Blackwell Laptop (8 GB), a CUDA build for sm_120, one server, guidance 2.0,

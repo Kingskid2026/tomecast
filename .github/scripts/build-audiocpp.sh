@@ -67,10 +67,16 @@ if [ ! -d "$patch_dir" ]; then
     echo "no patch folder at $patch_dir; run this script from a Tomecast checkout" >&2
     exit 1
 fi
-mapfile -t patches < <(find "$patch_dir" -maxdepth 1 -type f -name '*.patch' | sort)
+mapfile -t patches < <(find "$patch_dir" -maxdepth 1 -type f -name '*.patch' | LC_ALL=C sort)
+if [ "${#patches[@]}" -eq 0 ]; then
+    # The release notes and BUILD-INFO.txt say the build carries patches: an empty folder is a
+    # mistake, not "no patches". Delete the folder to build upstream unchanged.
+    echo "no .patch files in $patch_dir; delete the folder to build without patches" >&2
+    exit 1
+fi
 log "Applying ${#patches[@]} Tomecast patch(es) from $patch_dir"
 for p in "${patches[@]}"; do
-    if ! grep -q '^Binary-contains: ' "$p"; then
+    if ! grep -qE '^Binary-contains: +[^ ]' "$p"; then
         echo "$(basename "$p") has no Binary-contains: line, so the build can't check it" >&2
         exit 1
     fi
@@ -228,6 +234,10 @@ fi
 # Each patch's code is really in the server, not just applied to a file the build skipped.
 for p in "${patches[@]}"; do
     read -ra expected <<<"$(sed -n 's/^Binary-contains: //p' "$p" | tr '\n' ' ')"
+    if [ "${#expected[@]}" -eq 0 ]; then
+        echo "$(basename "$p") lists nothing to check under Binary-contains:" >&2
+        exit 1
+    fi
     for s in "${expected[@]}"; do
         if ! grep -qaF "$s" "$bin"; then
             echo "audiocpp_server doesn't contain \"$s\", so $(basename "$p") isn't compiled in" >&2
