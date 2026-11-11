@@ -137,8 +137,33 @@ def test_header_and_page_number_become_bands_and_paragraphs_stay_whole() -> None
     assert {block.page for block in blocks} == {14}
 
 
+# What PaddleOCR-VL-1.6 really returned for page 17 of a 1906 printing (shortened): one
+# paragraph per line, hyphenated words rejoined, and the page number run onto the last line.
+MODEL_TEXT = """THE GIFT OF THE MAGI
+no mortal finger could coax a ring. Also appertaining thereunto was a card.
+Which is all very good.
+Della finished her cry. Something fine and rare and [17]"""
+
+
+def test_the_models_one_paragraph_per_line_and_a_run_on_page_number() -> None:
+    blocks = page_blocks(ScannedPage(16, MODEL_TEXT, 1.0, reread=False, problem=None))
+    assert [(block.lines, block.band) for block in blocks] == [
+        (("THE GIFT OF THE MAGI",), Band.TOP),
+        (("no mortal finger could coax a ring. Also appertaining thereunto was a card.",), None),
+        (("Which is all very good.",), None),
+        (("Della finished her cry. Something fine and rare and",), None),
+        (("[17]",), Band.BOTTOM),
+    ]
+
+
+def test_a_number_that_ends_a_sentence_is_not_taken_for_the_page_number() -> None:
+    blocks = page_blocks(ScannedPage(0, "He paid $20\nThey were 17", 1.0, False, None))
+    assert [block.band for block in blocks] == [None, None]
+
+
 def test_no_word_the_model_read_is_lost() -> None:
-    for text in (PAGE_TEXT, "Just one line", "12\n\nA page with its number on top.", "\n\n"):
+    texts = (PAGE_TEXT, MODEL_TEXT, "Just one line", "12\n\nA page with its number on top.", "\n\n")
+    for text in texts:
         blocks = page_blocks(ScannedPage(0, text, 1.0, reread=False, problem=None))
         kept = "\n".join("\n".join(block.lines) for block in blocks)
         assert _words(kept) == _words(text)

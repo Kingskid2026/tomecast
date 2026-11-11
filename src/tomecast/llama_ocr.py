@@ -12,8 +12,10 @@ pinning them (by version and SHA-256) belongs to :mod:`tomecast.downloads` when 
 from __future__ import annotations
 
 import base64
+import ctypes
 import json
 import os
+import signal
 import socket
 import subprocess
 import time
@@ -116,6 +118,7 @@ class LlamaServerRunner:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             env=env,
+            preexec_fn=_stop_with_parent,  # only calls prctl, safe after fork
         )
         try:
             self._wait_until_ready()
@@ -172,6 +175,21 @@ class LlamaServerRunner:
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait()
+
+
+# Looked up once, here in the parent: loading a library in the forked child could deadlock
+# if Tomecast has threads (the same approach as the audio.cpp engine).
+_PRCTL = ctypes.CDLL(None, use_errno=True).prctl
+_PR_SET_PDEATHSIG = 1
+
+
+def _stop_with_parent() -> None:
+    """Runs in the server's process before it starts: kill it if Tomecast itself dies.
+
+    SIGKILL, not SIGTERM: llama-server finishes the page it's reading before it obeys
+    SIGTERM, which on a slow CPU can be minutes. It keeps no state worth saving.
+    """
+    _PRCTL(_PR_SET_PDEATHSIG, signal.SIGKILL)
 
 
 def _free_port() -> int:

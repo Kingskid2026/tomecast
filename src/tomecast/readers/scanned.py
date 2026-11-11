@@ -24,7 +24,7 @@ from __future__ import annotations
 import itertools
 import math
 import re
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,6 +46,12 @@ UNKNOWN_SHARE = 0.15  # re-read a page if more of its words than this aren't kno
 REPEATED_LINES = 4  # ...or if one line comes back this many times in a row
 HEADER_WORDS = 8  # a running header is a short line
 
+# "[17]", "(xii)" or "- 17 -" at the very end of a line, after a space.
+_TRAILING_PAGE_NUMBER = re.compile(
+    r"\s+(\[\s*(?:\d{1,4}|[ivxlc]{1,7})\s*\]|\(\s*(?:\d{1,4}|[ivxlc]{1,7})\s*\)"
+    r"|[-\u2013\u2014]\s*\d{1,4}\s*[-\u2013\u2014])$",
+    re.IGNORECASE,
+)
 _WORD = re.compile(r"[^\W\d_]+(?:['\u2019][^\W\d_]+)*")
 
 
@@ -236,9 +242,12 @@ def read_scanned(
 def page_blocks(page: ScannedPage) -> list[Block]:
     """The page's text as blocks: a running header and a page number as bands, then paragraphs.
 
-    The model separates paragraphs with a blank line; lines inside a paragraph are kept as
-    printed, so :func:`~tomecast.cleanup.join_lines` can rejoin words hyphenated at line ends.
-    The first block may carry on the paragraph from the page before.
+    PaddleOCR-VL writes each paragraph on one line, with words split at line ends already
+    rejoined, so each line is a paragraph. If the text has blank lines, they separate the
+    paragraphs instead, and lines inside one are kept as printed, so
+    :func:`~tomecast.cleanup.join_lines` can rejoin hyphenated words. A page number in
+    brackets that the model ran onto the last line ("rare and [17]") is split off as the
+    footer. The first block may carry on the paragraph from the page before.
     """
     lines = [line.strip() for line in page.text.splitlines()]
     while lines and not lines[0]:
@@ -252,6 +261,9 @@ def page_blocks(page: ScannedPage) -> list[Block]:
         footer = lines.pop()
     elif len(lines) > 1 and is_page_number(lines[0]) and header is None:
         header = lines.pop(0)
+    elif lines and (glued := _TRAILING_PAGE_NUMBER.search(lines[-1])) and glued.start() > 0:
+        footer = glued.group(1)
+        lines[-1] = lines[-1][: glued.start()]
 
     blocks = []
     if header is not None:
@@ -275,7 +287,9 @@ def _is_running_header(line: str) -> bool:
     )
 
 
-def _paragraphs(lines: Iterable[str]) -> list[list[str]]:
+def _paragraphs(lines: Sequence[str]) -> list[list[str]]:
+    if all(lines):  # no blank lines: one paragraph per line
+        return [[line] for line in lines]
     paragraphs: list[list[str]] = [[]]
     for line in lines:
         if line:
