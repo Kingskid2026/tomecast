@@ -96,6 +96,10 @@ _ROLES = {
 }
 SNAP_EMS = 0.5  # a word just outside a box (boxes are often drawn tight) joins the nearest one
 ORPHAN_GAP_EMS = 1.5  # left-over words this close together make one orphan box
+# A header or footer box at least this sure is page furniture outright. A less sure one (a
+# formula line at the foot of a page was called a footer at 0.80) is only a header or footer
+# line, which cleanup removes if it's a page number or repeats, like the rules reader's bands.
+FURNITURE_SCORE = 0.9
 NARROW_SHARE = 0.6  # boxes narrower than this share of the text width can be in a column
 
 
@@ -394,9 +398,12 @@ def layout_page(
     result = PageLayoutResult(
         blocks=blocks,
         regions=[region for region, _ in used],
-        furniture_words=[word.text for _, group in furniture for word in group],
+        furniture_words=[word.text for r, group in furniture if _outright(r) for word in group],
         body_words=[
-            word.text for region, group in used if region.label not in _FURNITURE for word in group
+            word.text
+            for region, group in used
+            if not (region.label in _FURNITURE and _outright(region))
+            for word in group
         ],
     )
     check_words(words, result)
@@ -428,9 +435,15 @@ def _band_block(words: list[_Word], band: Band, page: int, unit: int) -> _PageBl
     return _PageBlock(_group_lines(_segments(_chars(words))), page, unit, band=band)
 
 
+def _outright(region: Region) -> bool:
+    """Whether a header or footer box is sure enough to be furniture whatever it says."""
+    return region.score >= FURNITURE_SCORE
+
+
 def _furniture_block(region: Region, words: list[_Word], page: int, unit: int) -> _PageBlock:
     lines = _group_lines(_segments(_chars(words)))
-    return _PageBlock(lines, page, unit, band=_FURNITURE[region.label], furniture=True)
+    band = _FURNITURE[region.label]
+    return _PageBlock(lines, page, unit, band=band, furniture=_outright(region))
 
 
 def _chars(words: Sequence[_Word]) -> list[_Char]:

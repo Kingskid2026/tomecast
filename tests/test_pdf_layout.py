@@ -203,6 +203,23 @@ def test_a_header_on_one_page_only_is_left_out_only_with_the_model(tmp_path: Pat
     assert with_rules[1:] == with_boxes
 
 
+def test_an_unsure_footer_box_is_read_unless_cleanup_calls_it_furniture(tmp_path: Path) -> None:
+    """A footer box under 0.9 only marks a footer line: one that isn't a page number and
+    doesn't repeat is still read (Heron called a formula line a footer at 0.80)."""
+    page = PageBuilder()
+    page.paragraph(SECOND)
+    page.footer("a > b.")
+    path = build_pdf(tmp_path / "formula.pdf", [page.page])
+    boxes = [
+        box(Label.TEXT, TEXT_LEFT, 540, TEXT_RIGHT, PAGE_HEIGHT - MARGIN + 4),
+        box(Label.PAGE_FOOTER, 0, 20, PAGE_WIDTH, 45, score=0.8),
+    ]
+
+    result = clean(read_pdf(path, layout=HeronLayout(FakeDetector([boxes]))))
+
+    assert result.book.chapters[0].paragraphs[-1] == "a > b."
+
+
 def test_a_running_header_called_a_section_header_still_goes(tmp_path: Path) -> None:
     """Heron sometimes labels a small running header as a section header. One line in the
     top fifth, no bigger than the text, is a header line instead: it goes once it repeats,
@@ -239,7 +256,9 @@ def test_a_lone_page_number_no_box_holds_is_furniture(tmp_path: Path) -> None:
 
     result = lay_out(path, boxes)
 
-    assert texts(result)[-1] == (Role.BODY, Band.BOTTOM, True, "3")
+    # A footer line, not furniture outright: cleanup removes it because it's a page number.
+    assert texts(result)[-1] == (Role.BODY, Band.BOTTOM, False, "3")
+    assert result.furniture_words == ["THE", "GIFT", "OF", "THE", "MAGI"]
 
 
 def test_a_word_in_two_boxes_is_read_once(tmp_path: Path) -> None:
