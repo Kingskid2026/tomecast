@@ -26,6 +26,8 @@ v0.9.4; see docs/architecture.md, section 10), and eSpeak reads IPA symbols out 
 ``/slashes/`` or ``[brackets]``, eSpeak's ``[[phoneme]]`` markup, or any IPA symbol at all).
 Such a line is skipped with a warning, and the window refuses to save one.
 
+A list may start with a UTF-8 byte-order mark (some editors write one): it is ignored.
+
 The window edits these files with :func:`edit` and :func:`save`, which change only the line
 for the word being fixed and keep every other line and comment as the user wrote it.
 """
@@ -219,10 +221,19 @@ def parse(text: str, source: str = "pronunciations") -> tuple[Pronunciations, li
     return Pronunciations(tuple(entries)), warnings
 
 
+def read_list(path: Path) -> str:
+    """A list file's text, without the byte-order mark some editors put at the start.
+
+    Raises:
+        OSError, UnicodeDecodeError: if it can't be read.
+    """
+    return path.read_text(encoding="utf-8-sig")
+
+
 def load(path: Path) -> tuple[Pronunciations, list[str]]:
     """Read a list file. A missing file is an empty list; an unreadable one is a warning."""
     try:
-        text = path.read_text(encoding="utf-8")
+        text = read_list(path)
     except FileNotFoundError:
         return Pronunciations(), []
     except (OSError, UnicodeDecodeError) as error:

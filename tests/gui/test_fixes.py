@@ -155,6 +155,18 @@ def test_an_ipa_line_already_in_a_list_is_skipped_and_a_new_fix_replaces_it(
     assert lists.fix_for("Dinah") == Fix("Dinah", "DIE-nuh", "book")
 
 
+def test_a_list_with_a_byte_order_mark_shows_and_keeps_its_first_fix(tmp_path: Path) -> None:
+    path = tmp_path / "book.pronunciations.txt"
+    path.write_bytes(b"\xef\xbb\xbf" + "Zorp → zawrp\nAda -> ay-da\n".encode())
+    file = ListFile.read(path)
+    assert file.latest() == {"Zorp": "zawrp", "Ada": "ay-da"}
+    lists = FixLists(file, ListFile(tmp_path / "pronunciations.txt"))
+    assert lists.fix_for("Zorp") == Fix("Zorp", "zawrp", "book")
+    lists.set_for_name("Zorp", "ZAWRP")
+    assert path.read_bytes() == "Zorp → ZAWRP\nAda -> ay-da\n".encode()  # written without one
+    assert [f.word for f in lists.fixes()] == ["Zorp", "Ada"]
+
+
 def test_a_respelling_with_a_hash_inside_a_word_is_fine(folders: tuple[Path, Path]) -> None:
     book, data = folders
     lists = _lists(book, data)

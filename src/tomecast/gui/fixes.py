@@ -23,6 +23,7 @@ from tomecast.pronunciations import (
     is_phonetic,
     matches,
     parse,
+    read_list,
     same_written,
     save,
 )
@@ -61,7 +62,7 @@ def _read(path: Path) -> str:
         OSError, UnicodeDecodeError: if it exists but can't be read.
     """
     try:
-        return path.read_text(encoding="utf-8")
+        return read_list(path)
     except FileNotFoundError:
         return ""
 

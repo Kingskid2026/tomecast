@@ -274,6 +274,17 @@ def test_load_reads_a_file_and_a_missing_file_is_empty(tmp_path: Path) -> None:
     assert pronunciations.load(tmp_path / "nope.txt") == (Pronunciations(), [])
 
 
+def test_a_byte_order_mark_doesnt_cost_the_first_fix(tmp_path: Path) -> None:
+    """Some editors save "UTF-8 with BOM": the mark is not part of the first left side."""
+    path = tmp_path / "list.txt"
+    path.write_bytes(b"\xef\xbb\xbf" + "Zorp → zawrp\nAda -> ay-da\n".encode())
+    found, warnings = pronunciations.load(path)
+    assert warnings == []
+    assert found.entries == (Pronunciation("Zorp", "zawrp"), Pronunciation("Ada", "ay-da"))
+    assert found.apply("Zorp ran. Ada ran.") == "zawrp ran. ay-da ran."
+    assert pronunciations.read_list(path) == "Zorp → zawrp\nAda -> ay-da\n"
+
+
 def test_load_reports_an_unreadable_file(tmp_path: Path) -> None:
     path = tmp_path / "list.txt"
     path.write_bytes(b"\xff\xfe not utf-8 \x80")
