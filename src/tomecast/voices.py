@@ -173,6 +173,7 @@ def prepare_voice(
     cancelled: IsCancelled | None = None,
     take_over: bool = False,
     with_kokoro: bool = True,
+    on_wait: Callable[[], None] | None = None,
 ) -> Prepared:
     """Install what a run with ``voice`` needs (:func:`required_assets`), switching to new
     engine builds only once they pass :func:`voice_checks` (see
@@ -186,6 +187,7 @@ def prepare_voice(
         on_check=on_check,
         cancelled=cancelled,
         take_over=take_over,
+        on_wait=on_wait,
     )
 
 

@@ -56,7 +56,6 @@ from tomecast.downloads import Asset, IsCancelled, VoiceCheck, local_path
 from tomecast.engines import audiocpp
 from tomecast.engines.audiocpp import (
     MIN_SPEED,
-    RAN_OUT_OF_MEMORY_NOTE,
     AutoKokoro,
     EngineCrashed,
     EngineError,
@@ -415,7 +414,7 @@ class AutoMing(MingServer, AutoKokoro):
         try:
             super().synthesize(text, output)
             return
-        except _CardFailed as failure:  # out of memory (see _carry_on_on_cpu)
+        except _CardFailed as failure:  # out of memory, or back off the card (_carry_on_on_cpu)
             reason = str(failure)
         except (GpuUnavailable, EngineCrashed) as error:  # the engine died or hung on the card
             reason = str(error)
@@ -429,12 +428,13 @@ class AutoMing(MingServer, AutoKokoro):
             return
         self._card_failed(note, at_start=True)
 
-    def _carry_on_on_cpu(self) -> None:
-        """Partway, the card ran out of memory (AutoKokoro would carry on on the CPU)."""
+    def _carry_on_on_cpu(self, note: str) -> None:
+        """Partway, the card ran out of memory or a crash restart came back off the card
+        (AutoKokoro would carry on on the CPU)."""
         if self.switched_to is not None or self.if_card_fails == "cpu":
-            super()._carry_on_on_cpu()
+            super()._carry_on_on_cpu(note)
             return
-        raise _CardFailed(RAN_OUT_OF_MEMORY_NOTE)
+        raise _CardFailed(note)
 
     def _card_failed(self, reason: str, *, at_start: bool) -> None:
         if self.if_card_fails == "stop":
@@ -475,13 +475,10 @@ class AutoMing(MingServer, AutoKokoro):
         self.fell_back = self.out_of_memory = True
 
     def _ming_on_cpu(self) -> None:
-        """Carry on with Ming on the CPU backend of the same build ("cpu")."""
-        self._stop_process()
-        self.backend, self.device = "cpu", None
-        self.device_label, self.gpu_description = "CPU", ""
-        self._consecutive_restarts = 0
-        self._launch()
-        self.warning, self.fell_back, self.out_of_memory = CPU_NOTE, True, True
+        """Carry on with Ming on the CPU backend of the same build ("cpu"), as AutoKokoro
+        does after running out of memory, and never blame the build for what follows."""
+        AutoKokoro._carry_on_on_cpu(self, CPU_NOTE)
+        self.out_of_memory = True
 
 
 class _CardFailed(GpuUnavailable):
