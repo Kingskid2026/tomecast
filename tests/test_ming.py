@@ -236,12 +236,14 @@ def test_auto_ming_uses_the_card_like_kokoro(
     assert config["models"][0]["id"] == "ming"
 
 
-def test_auto_ming_falls_back_to_the_cpu_like_kokoro(
+def test_with_if_card_fails_cpu_auto_ming_falls_back_to_the_cpu_like_kokoro(
     tmp_path: Path, fake_server: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("FAKE_DEVICES", _DEVICES)
     monkeypatch.setenv("FAKE_CRASH_VULKAN", "1")
-    with AutoMing(tmp_path / "data", executable=fake_server, startup_timeout=20) as engine:
+    with AutoMing(
+        tmp_path / "data", executable=fake_server, startup_timeout=20, if_card_fails="cpu"
+    ) as engine:
         assert engine.backend == "cpu"
         assert engine.fell_back
         assert engine.warning

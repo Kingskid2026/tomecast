@@ -255,6 +255,7 @@ class DemoBackend(QObject):
     playingNameChanged = Signal()
     tryPlayingChanged = Signal()
     downloadNoteChanged = Signal()
+    premiumNoteChanged = Signal()
     stageChanged = Signal()
     downloadLabelChanged = Signal()
     chunksDoneChanged = Signal()
@@ -349,6 +350,7 @@ class DemoBackend(QObject):
             "previewPlaying": False,
             "previewAvailable": True,
             "downloadNote": "",
+            "premiumNote": "",
             "names": name_rows(data["names"]),
             "nameFixes": {},
             "fixes": [dict(fix) for fix in DEMO_FIXES],
@@ -480,6 +482,10 @@ class DemoBackend(QObject):
 
     def set_download_note(self, text: str) -> None:
         self._set("downloadNote", text)
+
+    def set_premium_note(self, text: str) -> None:
+        """The muted line under the premium voices (the real backend's wording)."""
+        self._set("premiumNote", text)
 
     def set_gpu(self, available: bool, name: str = "") -> None:
         """Pretend a graphics driver is (not) installed, and which card it would use."""
@@ -800,6 +806,7 @@ class DemoBackend(QObject):
     playingName = Property(str, lambda self: self._get("playingName"), notify=playingNameChanged)
     tryPlaying = Property(bool, lambda self: self._get("tryPlaying"), notify=tryPlayingChanged)
     downloadNote = Property(str, lambda self: self._get("downloadNote"), notify=downloadNoteChanged)
+    premiumNote = Property(str, lambda self: self._get("premiumNote"), notify=premiumNoteChanged)
     stage = Property(str, lambda self: self._get("stage"), notify=stageChanged)
     downloadLabel = Property(
         str, lambda self: self._get("downloadLabel"), notify=downloadLabelChanged

@@ -57,6 +57,17 @@ ScreenPage {
             }
         }
 
+        // Under the premium groups, in the gpuNote style: what choosing one downloads, that
+        // they need the graphics card, and PREVIEW until the skipped-words check is in.
+        MonoLabel {
+            objectName: "premiumNote"
+            Layout.fillWidth: true
+            visible: Backend.premiumNote !== ""
+            text: Backend.premiumNote
+            size: 11
+            wrapMode: Text.Wrap
+        }
+
         MonoLabel {
             Layout.fillWidth: true
             text: "ENGLISH VOICES SHOWN · 54 VOICES IN 9 LANGUAGES"

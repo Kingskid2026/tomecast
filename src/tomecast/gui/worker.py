@@ -580,6 +580,7 @@ class ConversionWorker(QObject):
             PackagingError,
             OSError,
             wave.Error,
+            ming.CardStopped,
         ) as error:
             self._close_preview_engine()  # start afresh next time
             self.failed.emit(job.job, _as_sentence(f"The preview failed: {error}"))
@@ -594,6 +595,8 @@ class ConversionWorker(QObject):
             self._close_preview_engine()  # the choice changed: start on the other hardware
         if self._preview_engine is None:
             engine = self._engine_factory(self._root, voice, speed, use_gpu)
+            if isinstance(engine, ming.AutoMing):
+                engine.if_card_fails = "stop"  # a premium preview never turns into Kokoro
             engine.start()
             self._preview_engine = engine
             self._preview_gpu = use_gpu
@@ -690,7 +693,7 @@ class ConversionWorker(QObject):
             return
         except (
             EngineError, MissingAudioError, PackagingError, CoverageError, DownloadError,
-            WorkFolderBusy, OSError, wave.Error,
+            WorkFolderBusy, OSError, wave.Error, ming.CardStopped,
         ) as error:  # fmt: skip
             message = _as_sentence(str(error))
             # A switched-to update that crashes (or makes no usable audio) on its first book.
@@ -746,8 +749,17 @@ class ConversionWorker(QObject):
         def tell_out_of_memory() -> None:
             """The card ran out of memory, so the CPU is in use: say so in the banner now,
             not only on the done screen, with the thread count the engine really uses (the
-            window would otherwise read today's, which on battery may differ)."""
+            window would otherwise read today's, which on battery may differ). When Kokoro
+            took over from the premium voice and still runs on the card, the card is named
+            again after that."""
             self.noticed.emit(job.job, engine.warning or "", engine.threads)
+            if engine.gpu_description:
+                self.deviceChosen.emit(engine.gpu_description)
+
+        # Which chapter the book is in, so a takeover's note says which are premium.
+        position = ming.BookPosition(chunks)
+        if isinstance(engine, ming.AutoMing):
+            engine.where = position.where
 
         try:
             engine.start()
@@ -762,6 +774,7 @@ class ConversionWorker(QObject):
             )
 
             def report(progress: ConversionProgress) -> None:
+                position.update(progress.chunks_done)
                 self._report(job.job, meter, progress)
 
             result = convert_book(

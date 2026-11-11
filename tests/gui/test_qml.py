@@ -645,7 +645,8 @@ def test_backend_property_list_matches_the_contract(backend: DemoBackend) -> Non
 
 
         "bookHasPages", "skipPageNumbers",
-        "footnotesAtEnd", "previewAvailable", "downloadNote", "stage", "downloadLabel",
+        "footnotesAtEnd", "previewAvailable", "downloadNote", "premiumNote", "stage",
+        "downloadLabel",
         "chunksDone", "chunksTotal",
         "chapterLabel", "timeLeft", "progressLabel", "speedLabel", "nowSpeaking", "paused",
         "outputPath", "audioLength", "doneSummary", "warnings",
@@ -850,6 +851,22 @@ def test_voice_screen_shows_what_start_will_download(
     app_window.backend.set_download_note("")
     app_window.settle()
     assert not note.isVisible()
+    assert_clean(messages)
+
+
+def test_the_premium_note_sits_under_the_voice_groups(
+    app_window: Window, messages: Messages
+) -> None:
+    app_window.show("voice")
+    note = app_window.get("premiumNote")
+    assert not note.isVisible()  # no premium voices listed
+    text = "PREMIUM VOICES · 1.8 GB DOWNLOAD · NEED A GRAPHICS CARD · PREVIEW"
+    app_window.backend.set_premium_note(text)
+    app_window.settle()
+    assert note.isVisible()
+    assert app_window.text("premiumNote") == text
+    last_voice = app_window.get("voice_bm_fable")  # the last pill of the last group shown
+    assert last_voice.mapToScene(QPointF(0, 0)).y() < note.mapToScene(QPointF(0, 0)).y()
     assert_clean(messages)
 
 

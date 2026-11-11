@@ -213,7 +213,13 @@ class GpuOutOfMemory(GpuUnavailable):
     failed build: the same build carries on on its CPU backend (:class:`AutoKokoro`)."""
 
 
-class _ConnectionLost(EngineError):
+class EngineCrashed(EngineError):
+    """The engine's program died, hung or wouldn't start again, as opposed to answering a
+    request with an error. On the graphics card, that's what a lost device looks like: the
+    premium voice treats it as the card failing (:mod:`tomecast.engines.ming`)."""
+
+
+class _ConnectionLost(EngineCrashed):
     """The engine didn't answer at all (as opposed to answering with an error)."""
 
 
@@ -530,7 +536,7 @@ class KokoroServer:
                     f"\n{log}"
                 ) from error
             if self._consecutive_restarts >= _MAX_RESTARTS:
-                raise EngineError(f"the voice engine keeps crashing. Its log:\n{log}") from error
+                raise EngineCrashed(f"the voice engine keeps crashing. Its log:\n{log}") from error
             self._consecutive_restarts += 1
             self._stop_process()
             try:
@@ -544,7 +550,7 @@ class KokoroServer:
             try:
                 data = self._request(text)
             except _ConnectionLost as retry_error:
-                raise EngineError(
+                raise EngineCrashed(
                     f"the voice engine crashed and didn't recover. Its log:\n{log}"
                 ) from retry_error
         self._consecutive_restarts = 0
@@ -626,7 +632,7 @@ class KokoroServer:
                         f"the graphics card ran out of memory while the voice engine started:"
                         f"\n{said}"
                     )
-                raise EngineError(f"the voice engine stopped while starting:\n{said}")
+                raise EngineCrashed(f"the voice engine stopped while starting:\n{said}")
             if self._healthy():
                 if self.backend == "vulkan" and self._reported_backend != "vulkan":
                     raise GpuUnavailable(
@@ -648,7 +654,7 @@ class KokoroServer:
             raise GpuOutOfMemory(
                 f"the graphics card ran out of memory and {problem}:\n{_tail(self._log_path)}"
             )
-        raise EngineError(f"{problem}:\n{_tail(self._log_path)}")
+        raise EngineCrashed(f"{problem}:\n{_tail(self._log_path)}")
 
     def _stop_if_asked(self) -> None:
         if self._aborted.is_set() or (self._cancelled is not None and self._cancelled()):

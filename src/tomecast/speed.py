@@ -229,6 +229,13 @@ def engine_speed(
     return None
 
 
+def known_card_speed(root: Path, engine: KokoroServer) -> float | None:
+    """The speed measured before for ``engine`` as it runs now on the graphics card (its
+    build, card and voice model), if it has been. For the new estimate once Kokoro has taken
+    over from the premium voice on the card."""
+    return known_speed(root, _key_of(engine))
+
+
 def known_cpu_speed(root: Path, engine: KokoroServer) -> float | None:
     """The speed measured before on the CPU for ``engine``'s build, or else for the CPU build
     (the same code: a CPU run hides the card from the graphics-card build), with the engine's

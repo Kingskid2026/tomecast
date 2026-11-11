@@ -14,14 +14,38 @@ from tomecast.speed import Speeds
 
 
 class FakeMing(FakeKokoro):
-    """Stands in for AutoMing: records the language it was told to speak."""
+    """Stands in for AutoMing: records the language it was told to speak and what to do if
+    the card fails, and can have the card fail: Kokoro takes over at the ``switch_at``th
+    voicing (as AutoMing does by default), or it stops there (``"stop"``)."""
 
     languages: list[str] = []  # noqa: RUF012
+    policies: list[str] = []  # noqa: RUF012
+    fail_at: int | None = None  # the card fails on this voicing (1 is the first)
 
-    def __init__(self, root: Path, *, voice: str, language: str, **kwargs: object) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        voice: str,
+        language: str,
+        if_card_fails: str = ming.DEFAULT_CARD_POLICY,
+        **kwargs: object,
+    ) -> None:
         super().__init__(root, voice=voice, **kwargs)  # type: ignore[arg-type]
         self.label = f"Ming ({voice})"
+        self.premium = voice
+        self.if_card_fails = if_card_fails
         FakeMing.languages.append(language)
+        FakeMing.policies.append(if_card_fails)
+
+    def synthesize(self, text: str, output: Path) -> None:
+        if FakeMing.fail_at == self.calls + 1 and not self.fell_back:
+            if self.if_card_fails == "stop":
+                raise ming.CardStopped(ming.STOPPED_NOTE)
+            self.warning = ming.switch_note(self.premium, chapters_done=1, partway=True)
+            self.fell_back = self.out_of_memory = True
+            self.label = f"Ming ({self.premium}) and Kokoro (bm_george)"
+        super().synthesize(text, output)
 
 
 @pytest.fixture(autouse=True)
@@ -33,6 +57,7 @@ def no_real_engine(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(ming, "required_assets", lambda use_gpu: ())
     monkeypatch.setattr(cli, "engine_speed", lambda root, engine, measuring=None: None)
     monkeypatch.setattr(cli, "known_cpu_speed", lambda root, engine: None)
+    monkeypatch.setattr(cli, "known_card_speed", lambda root, engine: None)
     monkeypatch.setattr(cli, "vulkan_possible", lambda: True)
     monkeypatch.setattr(cli, "data_dir", lambda: tmp_path / "data")
     FakeKokoro.fail_with = None
@@ -45,6 +70,8 @@ def no_real_engine(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     FakeKokoro.on_card = []
     FakeKokoro.on_exit = None
     FakeMing.languages = []
+    FakeMing.policies = []
+    FakeMing.fail_at = None
 
 
 def _book(tmp_path: Path, language: str = "en") -> Path:
@@ -149,3 +176,84 @@ def test_scan_recommends_the_premium_voice_on_a_card_with_room(
     monkeypatch.setattr(voices, "scan_recommendation", lambda root: Recommendation("ming", 8, 8))
     assert cli.main(["scan"]) == 0
     assert cli.PREMIUM_RECOMMENDED in capsys.readouterr().out
+
+
+# --- If the graphics card fails --------------------------------------------------------------
+
+
+def _book_of_three(tmp_path: Path) -> Path:
+    pages = [
+        Page(f"c{i}.xhtml", f"<h1>Chapter {i}</h1><p>It began. It went on. It ended.</p>")
+        for i in (1, 2, 3)
+    ]
+    toc = [NavPoint(f"Chapter {i}", f"c{i}.xhtml") for i in (1, 2, 3)]
+    return build_epub(tmp_path / "three.epub", pages, toc=toc, title="Three")
+
+
+def test_kokoro_takes_over_by_default_and_the_run_proves_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    proven: list[object] = []
+    monkeypatch.setattr(cli, "mark_proven", lambda *args: proven.append(args))
+    FakeMing.fail_at = 4
+    assert cli.main(["convert", str(_book_of_three(tmp_path)), "--voice", "UK_George"]) == 0
+    assert FakeMing.policies == ["kokoro"]
+    out = capsys.readouterr().out
+    assert "Note: The graphics card stopped working, so the rest of this book uses Kokoro's " in out
+    assert "Chapter 1 and the start of chapter 2 are in the premium voice." in out
+    assert proven == []  # a run where the card failed says nothing about the build
+    # Every piece voiced once, in order, whichever voice made it.
+    assert FakeKokoro.texts[0] == "Chapter one" and FakeKokoro.texts[-1] == "It ended."
+    assert len(FakeKokoro.texts) == 12
+
+
+def test_if_card_fails_is_passed_on(tmp_path: Path) -> None:
+    book = _book(tmp_path)
+    for policy in ("cpu", "stop", "kokoro"):
+        assert (
+            cli.main(
+                ["convert", str(book), "--voice", "UK_George", "--if-card-fails", policy, "--force"]
+            )
+            == 0
+        )
+    assert FakeMing.policies == ["cpu", "stop", "kokoro"]
+
+
+def test_without_kokoro_taking_over_kokoro_isnt_downloaded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    asked: list[bool] = []
+    real = voices.prepare_voice
+
+    def recording(*args: object, with_kokoro: bool = True, **kwargs: object) -> object:
+        asked.append(with_kokoro)
+        return real(*args, with_kokoro=with_kokoro, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(voices, "prepare_voice", recording)
+    book = _book(tmp_path)
+    assert cli.main(["convert", str(book), "--voice", "UK_George", "--if-card-fails", "cpu"]) == 0
+    assert cli.main(["convert", str(book), "--voice", "UK_George", "--force"]) == 0
+    assert asked == [False, True]
+
+
+def test_with_stop_the_book_stops_keeps_its_audio_and_blames_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def no_rollback(*args: object) -> bool:
+        raise AssertionError("a card that stopped working must not roll a build back")
+
+    monkeypatch.setattr(cli, "roll_back", no_rollback)
+    FakeMing.fail_at = 3
+    book = _book_of_three(tmp_path)
+    args = ["convert", str(book), "--voice", "UK_George", "--if-card-fails", "stop"]
+    assert cli.main(args) == 1
+    err = capsys.readouterr().err
+    assert ming.STOPPED_NOTE in err
+    assert "The audio made so far is saved. Run the same command again to continue." in err
+    assert not (tmp_path / "three.m4b").exists()
+
+    FakeMing.fail_at = None  # a working card: the same command finishes it
+    assert cli.main(args) == 0
+    out = capsys.readouterr().out
+    assert "Picked up where the last run stopped (2 pieces)." in out
+    assert len(FakeKokoro.texts) == 12  # 2, then the other 10: nothing voiced twice

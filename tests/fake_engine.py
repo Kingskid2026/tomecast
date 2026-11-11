@@ -25,7 +25,15 @@ with it) change how it behaves:
                           and keep running without ever serving
 ``FAKE_OOM_LOG``          log this at start-up (a warning the engine carries on after)
 ``FAKE_BUSY``             a file it creates as each request begins (one is under way)
-``FAKE_RATE``             the sample rate it voices at (default: 24000, Kokoro's)
+``FAKE_RATE``             the sample rate it voices at (default: the model's, 44100 for Ming and
+                          24000 for Kokoro)
+``FAKE_ONLY_MODEL``       the failures above (crashes, out of memory) only happen to this model
+                          (``ming`` or ``kokoro``), so one voice fails on the card and the other
+                          doesn't
+``FAKE_CARD_LOST_AFTER``  the graphics card is lost after this many requests voiced on the
+                          Vulkan backend, counted across restarts: the next one crashes the
+                          engine, and from then on every Vulkan start exits and
+                          ``--list-devices`` fails (as with a lost device), until the test ends
 
 Each voiced request is logged with the backend that voiced it.
 
@@ -67,7 +75,10 @@ FAKE_SERVER = textwrap.dedent(
     """
     import http.server, json, math, os, socket, struct, sys, time, wave, io
 
+    CARD_LOST = os.environ.get("FAKE_LOG", "fake.log") + ".card-lost"
     if "--list-devices" in sys.argv:
+        if os.path.exists(CARD_LOST):
+            sys.exit(3)  # the driver has lost the device
         if os.environ.get("FAKE_LOG"):
             with open(os.environ["FAKE_LOG"], "a") as listed:
                 listed.write(json.dumps({"event": "list", "exe": sys.argv[0]}) + "\\n")
@@ -105,14 +116,19 @@ FAKE_SERVER = textwrap.dedent(
     signal.signal(signal.SIGTERM, on_signal)
 
     time.sleep(float(os.environ.get("FAKE_START_DELAY", "0")))  # a slow first start
-    if os.environ.get("FAKE_CRASH") or (
+    MODEL = config["models"][0]["id"]
+    TARGETED = os.environ.get("FAKE_ONLY_MODEL", MODEL) == MODEL
+    if config["backend"] == "vulkan" and os.path.exists(CARD_LOST):
+        print("ggml_vulkan: vk::DeviceLostError", flush=True)
+        sys.exit(1)
+    if TARGETED and (os.environ.get("FAKE_CRASH") or (
         os.environ.get("FAKE_CRASH_VULKAN") and config["backend"] == "vulkan"
-    ):
+    )):
         print("model failed to load", flush=True)
         sys.exit(3)
     if os.environ.get("FAKE_OOM_LOG"):
         print(os.environ["FAKE_OOM_LOG"], file=sys.stderr, flush=True)
-    if os.environ.get("FAKE_OOM_VULKAN_START") and config["backend"] == "vulkan":
+    if TARGETED and os.environ.get("FAKE_OOM_VULKAN_START") and config["backend"] == "vulkan":
         print("\\n".join(OOM_MING_START), file=sys.stderr, flush=True)
         if os.environ.get("FAKE_OOM_HANG"):
             time.sleep(60)
@@ -121,7 +137,7 @@ FAKE_SERVER = textwrap.dedent(
         sys.exit(0)
 
     def wav_for(text):
-        rate = int(os.environ.get("FAKE_RATE", "24000"))
+        rate = int(os.environ.get("FAKE_RATE") or (44100 if MODEL == "ming" else 24000))
         frames = max(1, int(len(text) / 15 * rate))
         loud = 0 if os.environ.get("FAKE_SILENT") else 8000
         buf = io.BytesIO()
@@ -169,8 +185,18 @@ FAKE_SERVER = textwrap.dedent(
             if os.environ.get("FAKE_BUSY"):
                 open(os.environ["FAKE_BUSY"], "a").close()
             time.sleep(float(os.environ.get("FAKE_DELAY", "0")))
+            lost_after = os.environ.get("FAKE_CARD_LOST_AFTER")
+            if lost_after is not None and config["backend"] == "vulkan":
+                counter = CARD_LOST + ".count"
+                done = int(open(counter).read()) if os.path.exists(counter) else 0
+                if done >= int(lost_after):
+                    open(CARD_LOST, "w").close()
+                    print("ggml_vulkan: vk::DeviceLostError", file=sys.stderr, flush=True)
+                    os._exit(1)
+                with open(counter, "w") as count:
+                    count.write(str(done + 1))
             die_after = os.environ.get("FAKE_DIE_AFTER")
-            if die_after is not None and REQUESTS[0] > int(die_after):
+            if TARGETED and die_after is not None and REQUESTS[0] > int(die_after):
                 if os.environ.get("FAKE_DIE_SAYING"):
                     print(os.environ["FAKE_DIE_SAYING"], file=sys.stderr, flush=True)
                 if os.environ.get("FAKE_SLOW_EXIT"):
@@ -186,7 +212,8 @@ FAKE_SERVER = textwrap.dedent(
                 return self.fail("something broke")
             oom_after = os.environ.get("FAKE_OOM_VULKAN_AFTER")
             if (
-                oom_after is not None
+                TARGETED
+                and oom_after is not None
                 and (config["backend"] == "vulkan" or os.environ.get("FAKE_OOM_CPU_TOO"))
                 and REQUESTS[0] > int(oom_after)
             ):
@@ -196,7 +223,8 @@ FAKE_SERVER = textwrap.dedent(
                     print("\\n".join(OOM_KOKORO_LOG), file=sys.stderr, flush=True)
                 return self.fail(os.environ.get("FAKE_OOM_MESSAGE", OOM_KOKORO_REPLY))
             log.write(json.dumps(
-                {"event": "voiced", "body": body, "backend": config["backend"]}) + "\\n")
+                {"event": "voiced", "body": body, "backend": config["backend"], "model": MODEL})
+                + "\\n")
             log.flush()
             data = wav_for(text)
             self.send_response(200)

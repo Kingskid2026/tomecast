@@ -116,11 +116,18 @@ def route(voice: str, language: str | None, *, premium_possible: bool) -> Route:
     return Route(voice, "en", f"No voice speaks {name} yet, so it's read with English rules.")
 
 
-def required_assets(voice: str, use_gpu: bool) -> tuple[Asset, ...]:
-    """Everything a run with ``voice`` needs installed."""
+def required_assets(voice: str, use_gpu: bool, *, with_kokoro: bool = True) -> tuple[Asset, ...]:
+    """Everything a run with ``voice`` needs installed. For a premium voice that's also
+    Kokoro's files (eSpeak and its model) when Kokoro is to take over if the graphics card
+    fails (``with_kokoro``: the default, ``--if-card-fails kokoro``), so a takeover never
+    has to download anything partway through a book."""
+    kokoro = audiocpp.required_assets(use_gpu)
     if engine_of(voice) == "ming":
-        return ming.required_assets(use_gpu)
-    return audiocpp.required_assets(use_gpu)
+        premium = ming.required_assets(use_gpu)
+        if not with_kokoro:
+            return premium
+        return (*premium, *(asset for asset in kokoro if asset not in premium))
+    return kokoro
 
 
 def work_key(voice: str) -> str:
@@ -165,11 +172,13 @@ def prepare_voice(
     on_check: Callable[[], None] | None = None,
     cancelled: IsCancelled | None = None,
     take_over: bool = False,
+    with_kokoro: bool = True,
 ) -> Prepared:
-    """Install what a run with ``voice`` needs, switching to new engine builds only once
-    they pass :func:`voice_checks` (see :func:`tomecast.downloads.prepare`)."""
+    """Install what a run with ``voice`` needs (:func:`required_assets`), switching to new
+    engine builds only once they pass :func:`voice_checks` (see
+    :func:`tomecast.downloads.prepare`)."""
     return prepare(
-        required_assets(voice, use_gpu),
+        required_assets(voice, use_gpu, with_kokoro=with_kokoro),
         root,
         check=voice_checks(root, voice, use_gpu, cancelled),
         consent=consent,

@@ -30,6 +30,7 @@ from tomecast.packaging import (
     PackagingError,
     cover_is_usable,
     write_m4b,
+    write_mp3s,
 )
 
 FFMPEG: str = imageio_ffmpeg.get_ffmpeg_exe()
@@ -541,11 +542,6 @@ def test_special_characters_in_titles_survive(tmp_path: Path) -> None:
 # --- Bad input ----------------------------------------------------------------------------
 
 
-def _mismatched_rates(folder: Path) -> list[ChapterAudio]:
-    fast = write_tone(folder / "fast.wav", 0.3, rate=22_050)
-    return [chapter(folder, "One", [(0.3, 0.1)]), ChapterAudio("Two", (fast,), (0.1,))]
-
-
 def _stereo(folder: Path) -> list[ChapterAudio]:
     return [ChapterAudio("One", (write_tone(folder / "stereo.wav", 0.3, channels=2),), (0.1,))]
 
@@ -594,7 +590,6 @@ def _no_chapters(folder: Path) -> list[ChapterAudio]:
 @pytest.mark.parametrize(
     ("make_chapters", "message"),
     [
-        (_mismatched_rates, r"fast\.wav is 22050 Hz, but .*One-0\.wav is 24000 Hz"),
         (_stereo, r"stereo\.wav has 2 channels; segments must be mono"),
         (_eight_bit, r"eight-bit\.wav has 8-bit samples; segments must be 16-bit PCM"),
         (_not_a_wav, r"notes\.wav is not a readable PCM WAV file"),
@@ -685,3 +680,67 @@ def test_cover_is_usable_accepts_real_images_and_rejects_damaged_ones(tmp_path: 
     assert cover_is_usable(Cover(tiny_jpeg(tmp_path), "image/jpeg"))
     assert not cover_is_usable(Cover(tiny_png()[:30], "image/png"))  # cut off mid-file
     assert not cover_is_usable(Cover(b"\xff\xd8\xff" + b"\x00" * 40, "image/jpeg"))
+
+
+# --- Mixed sample rates: the premium voice, then Kokoro ------------------------------------------
+
+PREMIUM_RATE = 44_100
+
+
+def _premium_then_kokoro(folder: Path) -> list[ChapterAudio]:
+    """What a book looks like after the graphics card failed partway under the premium voice:
+    chapter 1 and the start of chapter 2 at 44.1 kHz (Ming), the rest at 24 kHz (Kokoro)."""
+    ming = [write_tone(folder / f"ming-{i}.wav", 0.5, rate=PREMIUM_RATE) for i in range(3)]
+    kokoro = [write_tone(folder / f"kokoro-{i}.wav", 0.4, rate=RATE) for i in range(2)]
+    return [
+        ChapterAudio("One", (ming[0], ming[1]), (0.2, 0.3)),
+        ChapterAudio("Two", (ming[2], kokoro[0]), (0.25, 0.1)),
+        ChapterAudio("Three", (kokoro[1],), (0.5,)),
+    ]
+
+
+def test_mixed_sample_rates_are_resampled_to_the_highest(tmp_path: Path) -> None:
+    run = package(tmp_path, _premium_then_kokoro(tmp_path / "in"))
+
+    streams = probe(run.output)
+    assert "44100 Hz, mono" in streams.audio[0]
+    # 1.5 + 1.25 + 0.9 s: every segment and gap at its own length, whatever its rate.
+    assert [c.title for c in run.chapters] == ["One", "Two", "Three"]
+    marks = [mark for c in run.chapters for mark in (c.start_seconds, c.end_seconds)]
+    assert marks == pytest.approx([0.0, 1.5, 1.5, 2.75, 2.75, 3.65])
+    assert len(decode(run.output)) == pytest.approx(3.65 * PREMIUM_RATE, abs=PREMIUM_RATE // 100)
+    # Each Kokoro segment was resampled once, into the work folder; Ming's were used as is.
+    assert len(list((run.workdir / "resampled-44100").glob("*.wav"))) == 2
+
+
+def test_a_resampled_kokoro_segment_starts_where_its_marker_says(tmp_path: Path) -> None:
+    run = package(tmp_path, _premium_then_kokoro(tmp_path / "in"))
+    samples = decode(run.output)
+    three = run.chapters[2]
+    marker = round(three.start_seconds * PREMIUM_RATE)
+    onset = next(
+        i for i in range(marker - PREMIUM_RATE // 10, len(samples)) if abs(samples[i]) > 4000
+    )
+    assert abs(onset - marker) / PREMIUM_RATE < 0.005
+
+
+def test_mixed_sample_rates_work_for_mp3s_too(tmp_path: Path) -> None:
+    folder = tmp_path / "out" / "Book"
+    (tmp_path / "out").mkdir()
+    packaged = write_mp3s(
+        _premium_then_kokoro(tmp_path / "in"), INFO, folder, workdir=tmp_path / "work"
+    )
+    files = sorted(packaged.output.glob("*.mp3"))
+    assert len(files) == 3
+    for file in files:
+        assert "44100 Hz, mono" in probe(file).audio[0]
+    assert probe(files[2]).duration == pytest.approx(0.9, abs=0.06)
+
+
+def test_a_segment_voiced_again_is_resampled_again(tmp_path: Path) -> None:
+    chapters = _premium_then_kokoro(tmp_path / "in")
+    package(tmp_path, chapters)
+    write_tone(tmp_path / "in" / "kokoro-1.wav", 0.8, rate=RATE)  # the same piece, voiced again
+    (tmp_path / "out" / "book.m4b").unlink()
+    run = package(tmp_path, chapters)
+    assert run.chapters[2].end_seconds == pytest.approx(3.65 + 0.4)
