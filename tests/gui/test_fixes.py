@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from tomecast import pronunciations
-from tomecast.gui.fixes import SLASHES, BadFix, Fix, FixLists, FixNotSaved, ListFile
+from tomecast.gui.fixes import PHONETIC, BadFix, Fix, FixLists, FixNotSaved, ListFile
 
 BOOK_LIST = """\
 # Alice: checked by ear
@@ -110,7 +110,16 @@ def test_an_unchanged_fix_is_not_written_again(folders: tuple[Path, Path]) -> No
 
 @pytest.mark.parametrize(
     ("say", "message"),
-    [("/ˈɡrɪfən/", SLASHES), ("griff #on", "Leave out the “#”"), ("#griff", "Leave out the “#”")],
+    [
+        ("/ˈɡrɪfən/", PHONETIC),
+        ("ˈdaɪnə", PHONETIC),  # plain IPA
+        ("[ˈdaɪnə]", PHONETIC),  # as Wikipedia writes it
+        ("[[d'aIn@]]", PHONETIC),  # eSpeak's phoneme markup
+        ("DIE-nˈuh", PHONETIC),  # a stress mark is enough
+        ("die-nuː", PHONETIC),  # and so is a length mark
+        ("griff #on", "Leave out the “#”"),
+        ("#griff", "Leave out the “#”"),
+    ],
 )
 def test_a_fix_the_list_cant_hold_is_refused(
     folders: tuple[Path, Path], say: str, message: str
@@ -121,6 +130,29 @@ def test_a_fix_the_list_cant_hold_is_refused(
         lists.set_for_name("Dinah", say)
     assert _book_text(book) == BOOK_LIST
     assert lists.fix_for("Dinah") is None
+
+
+@pytest.mark.parametrize("say", ["ha-WAI-ʻee", "Hawaiʼi", "Hawai'i", "DEE-nah", "Dína", "Ðina"])
+def test_names_marks_and_accents_are_saved(folders: tuple[Path, Path], say: str) -> None:
+    book, data = folders
+    lists = _lists(book, data)
+    lists.set_for_name("Dinah", say)
+    assert lists.fix_for("Dinah") == Fix("Dinah", say, "book")
+    assert _book_text(book) == f"{BOOK_LIST}Dinah → {say}\n"
+
+
+def test_an_ipa_line_already_in_a_list_is_skipped_and_a_new_fix_replaces_it(
+    folders: tuple[Path, Path],
+) -> None:
+    book, data = folders
+    path = pronunciations.book_list_path(book)
+    path.write_text(f"{BOOK_LIST}Dinah → ˈdaɪnə   # from Wikipedia\n", encoding="utf-8")
+    lists = _lists(book, data)
+    assert lists.fix_for("Dinah") is None  # no fix: said as written, as when converting
+    assert lists.combined().apply("Dinah") == "Dinah"
+    lists.set_for_name("Dinah", "DIE-nuh")
+    assert _book_text(book) == f"{BOOK_LIST}Dinah → DIE-nuh   # from Wikipedia\n"
+    assert lists.fix_for("Dinah") == Fix("Dinah", "DIE-nuh", "book")
 
 
 def test_a_respelling_with_a_hash_inside_a_word_is_fine(folders: tuple[Path, Path]) -> None:

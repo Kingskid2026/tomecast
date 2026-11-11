@@ -123,7 +123,7 @@ New Zealand → noo zee-lund  # several words are fine
 
 - **Two places.** `~/.local/share/tomecast/pronunciations.txt` applies to every book. A file next to the book, named like the book with `.pronunciations.txt` (`Title.epub` → `Title.pronunciations.txt`), applies to that book only and wins where the two disagree.
 - **Whole words only.** `Ron` doesn't change *Ronald*. A fix written with a capital letter matches that spelling (and its ALL-CAPS form in headings), so `Mark` leaves *mark* alone.
-- **The "say it as" part is a respelling**, written the way an English reader would sound it out, not a phonetic alphabet. The voice engine can't take exact phonetic spellings, so an IPA value like `/ɡəˈlædriəl/` is skipped with a warning. Hyphens make each piece its own word, and capital letters are lowercased when spoken (they only help you read the line), so try each fix with `tomecast preview` and adjust.
+- **The "say it as" part is a respelling**, written the way an English reader would sound it out, not a phonetic alphabet. The voice engine can't take phonetic spellings (it would read the symbols out by name), so a line written in IPA is skipped with a note, and the window won't save one. That means IPA in slashes or square brackets (`/ɡəˈlædriəl/`, `[ɡəˈlædriəl]`), eSpeak's `[[…]]` markup, or any IPA symbol or stress mark (`ɡəˈlædriəl`, `gal-ˈad-ree-el`). Accented letters and the ʻokina are fine (`Zoë`, `Hawaiʻi`). Hyphens make each piece its own word, and capital letters are lowercased when spoken (they only help you read the line), so try each fix with `tomecast preview` and adjust.
 - A line it can't use is skipped with a note naming the line; the rest of the list still works.
 
 ## How it works

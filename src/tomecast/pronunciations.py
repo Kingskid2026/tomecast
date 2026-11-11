@@ -20,9 +20,11 @@ it so an English reader says it right, with hyphens between syllables. Capital l
 for the stressed syllable are fine for readability; Tomecast lowercases them before speaking,
 because the pronouncer (eSpeak NG) would spell out a word in capitals letter by letter.
 
-Exact phonetic spellings in ``/slashes/`` are not supported: audio.cpp's server can't take
-phonemes (checked in v0.9.4; see docs/architecture.md, section 10). Such a line is skipped
-with a warning.
+Phonetic spellings are not supported: audio.cpp's server can't take phonemes (checked in
+v0.9.4; see docs/architecture.md, section 10), and eSpeak reads IPA symbols out by name
+("small capital I", "stress"). :func:`is_phonetic` says what counts as one (IPA in
+``/slashes/`` or ``[brackets]``, eSpeak's ``[[phoneme]]`` markup, or any IPA symbol at all).
+Such a line is skipped with a warning, and the window refuses to save one.
 
 The window edits these files with :func:`edit` and :func:`save`, which change only the line
 for the word being fixed and keep every other line and comment as the user wrote it.
@@ -44,6 +46,22 @@ BOOK_FILE_SUFFIX = ".pronunciations.txt"
 _SEPARATOR = re.compile(r"\s*(?:→|->)\s*")
 _COMMENT = re.compile(r"(?:^|\s)#.*$")
 _CAPITALS = re.compile(r"[A-Za-z]{2,}")
+# Symbols only a phonetic alphabet uses. Letters that real spellings use too (æ, ð, þ, ŋ, ø,
+# accented letters) are left out, and so are the marks that transliterations of names use:
+# the ʻokina (U+02BB), the apostrophe ʼ (U+02BC), the primes ʹ ʺ and the half rings ʾ ʿ.
+_IPA = re.compile(
+    "["
+    "\u0250-\u02af"  # IPA Extensions: ɐ ɑ ə ɛ ɡ ɪ ɔ ʃ ʊ ʌ ʒ ʔ ...
+    "\u02b0-\u02b8"  # raised letters for aspiration, palatalisation and so on: ʰ ʲ ʷ
+    "\u02c0\u02c1"  # ˀ ˁ
+    "\u02c8\u02cc"  # stress: ˈ (primary) and ˌ (secondary)
+    "\u02d0\u02d1"  # length: ː (long) and ˑ (half long)
+    "\u02de"  # ˞ (r-coloured)
+    "\u02e0-\u02e9"  # ˠ ˡ ˢ ˣ ˤ, and the tone letters ˥ ˦ ˧ ˨ ˩
+    "\u035c\u0361"  # tie bars, as in t͡ʃ
+    "\u1d00-\u1dbf"  # Phonetic Extensions: ᴜ ᵊ ᵻ ᵿ ...
+    "]"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +81,24 @@ def book_list_path(book: Path) -> Path:
     """The list for one book: next to the book file, ``Title.pronunciations.txt`` for
     ``Title.epub``. It travels with the book and is easy to find and edit."""
     return book.with_suffix(BOOK_FILE_SUFFIX)
+
+
+def is_phonetic(spoken: str) -> bool:
+    """True if a right-hand side is written in phonetic symbols rather than as a respelling.
+
+    That is IPA between slashes (``/ʃɪˈvɔːn/``) or square brackets (``[ʃɪˈvɔːn]``, the way
+    Wikipedia writes it), eSpeak's ``[[phoneme]]`` markup, or any IPA symbol, stress or
+    length mark (``ʃɪˈvɔːn``, ``shiv-ˈawn``). The voice can't use any of them: it would read
+    the symbols and brackets out. Accented letters (é, ñ, ø, ł, ð) and the marks names use,
+    such as the ʻokina in *Hawaiʻi*, are fine.
+    """
+    spoken = spoken.strip()
+    return (
+        (len(spoken) > 2 and spoken.startswith("/") and spoken.endswith("/"))
+        or (spoken.startswith("[") and spoken.endswith("]"))
+        or "[[" in spoken
+        or _IPA.search(spoken) is not None
+    )
 
 
 def respelling(value: str) -> str:
@@ -165,11 +201,11 @@ def parse(text: str, source: str = "pronunciations") -> tuple[Pronunciations, li
             warnings.append(f"{source}, line {number}: expected 'written → say it as'")
             continue
         written, spoken = parts[0].strip(), parts[1].strip()
-        if len(spoken) > 2 and spoken.startswith("/") and spoken.endswith("/"):
+        if is_phonetic(spoken):
             warnings.append(
-                f"{source}, line {number}: exact phonetic spellings in /slashes/ aren't "
-                f"supported (the voice engine can't take them); write a respelling for "
-                f"'{written}' instead, like her-my-oh-nee"
+                f"{source}, line {number}: '{spoken}' looks like IPA, and the voice can't use "
+                f"phonetic symbols, so the line is skipped; write a respelling for "
+                f"'{written}' instead, the way it sounds in plain letters, like shiv-AWN"
             )
             continue
         entries.append(Pronunciation(written, spoken))

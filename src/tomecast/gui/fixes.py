@@ -20,6 +20,7 @@ from tomecast.pronunciations import (
     Pronunciation,
     Pronunciations,
     edit,
+    is_phonetic,
     matches,
     parse,
     same_written,
@@ -29,9 +30,9 @@ from tomecast.pronunciations import (
 Scope = Literal["book", "all"]  # this book's list, or the one for every book
 SCOPES: tuple[Scope, ...] = ("book", "all")
 
-SLASHES = (
-    "Type the word the way it sounds, like her-MY-oh-nee. This voice can't use phonetic "
-    "symbols in /slashes/."
+PHONETIC = (
+    "That looks like IPA. This voice can't use phonetic symbols, so type the word the way it "
+    "sounds in plain letters, like shiv-AWN."
 )
 COMMENT = "Leave out the “#”: in a pronunciation list it starts a comment."
 
@@ -141,11 +142,12 @@ def check(written: str, say: str) -> None:
     """Make sure ``written → say`` can be saved as a line and read back the same.
 
     Raises:
-        BadFix: for a phonetic spelling in /slashes/, a "#" that would start a comment, or
-            anything else that wouldn't read back as typed.
+        BadFix: for a phonetic spelling (IPA, see
+            :func:`tomecast.pronunciations.is_phonetic`), a "#" that would start a comment,
+            or anything else that wouldn't read back as typed.
     """
-    if len(say) > 2 and say.startswith("/") and say.endswith("/"):
-        raise BadFix(SLASHES)
+    if is_phonetic(say):
+        raise BadFix(PHONETIC)
     fixes, warnings = parse(f"{written} → {say}")
     if warnings or fixes.entries != (Pronunciation(written, say),):
         raise BadFix(COMMENT if "#" in say else f"Tomecast can't save “{say}” as a fix.")

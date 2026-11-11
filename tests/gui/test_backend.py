@@ -2114,10 +2114,11 @@ def test_a_respelling_the_list_cant_hold_is_explained_and_not_saved(
 ) -> None:
     backend = make_backend()
     _open(qtbot, backend, _names_book(tmp_path))
-    backend.setNameFix("Zorp", "/zɔrp/")
-    assert backend.errorMessage == fixes_module.SLASHES
-    assert backend.nameFixes == {}
-    assert not _book_list(tmp_path).exists()
+    for ipa in ("/zɔrp/", "zɔrp", "[zɔrp]", "[[z'O@p]]", "ˈzawrp"):
+        backend.setNameFix("Zorp", ipa)
+        assert backend.errorMessage == fixes_module.PHONETIC, ipa
+        assert backend.nameFixes == {}
+        assert not _book_list(tmp_path).exists()
     backend.setNameFix("Zorp", "zawrp")  # a good one clears the banner the bad one put up
     assert backend.errorMessage == ""
     assert backend.nameFixes == {"Zorp": "zawrp"}
@@ -2182,14 +2183,18 @@ def test_list_lines_that_cant_be_used_are_noted_on_the_done_screen(
 ) -> None:
     backend = make_backend()
     book = _names_book(tmp_path)
-    _book_list(tmp_path).write_text("Zorp → /zɔrp/\n", encoding="utf-8")
+    _book_list(tmp_path).write_text("Zorp → /zɔrp/\nMira → ˈmɪərə\n", encoding="utf-8")
     _open(qtbot, backend, book)
     _convert(qtbot, backend)
     assert backend.screen == "done"
-    assert any(
-        w.startswith("Pronunciation list: names.pronunciations.txt, line 1: exact phonetic")
-        for w in backend.warnings
-    ), backend.warnings
+    for number, say in ((1, "/zɔrp/"), (2, "ˈmɪərə")):
+        assert any(
+            w.startswith(
+                f"Pronunciation list: names.pronunciations.txt, line {number}: "
+                f"'{say}' looks like IPA"
+            )
+            for w in backend.warnings
+        ), backend.warnings
 
 
 def test_one_thing_plays_at_a_time_with_the_fixes(
