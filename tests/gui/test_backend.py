@@ -1863,6 +1863,33 @@ def test_the_preview_follows_the_hardware_choice(
     assert engines.made[0].closed
 
 
+def test_switching_the_card_off_stops_the_preview_engine_on_it(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    """With "Use graphics card" off, nothing of Tomecast's stays on the card: the preview
+    engine left running there stops now, not at the next preview, conversion or scan."""
+    engines = Engines()
+    backend = make_backend(engines, gpu=True, scan=NVIDIA, player="true")
+    qtbot.waitUntil(lambda: backend.gpuName != "")  # the start-up scan is done
+    _open(qtbot, backend, _short_book(tmp_path))
+    backend.goTo("voice")
+    backend.togglePreview()
+    qtbot.waitUntil(lambda: not backend.previewPlaying)
+    assert backend.errorMessage == ""
+    [engine] = engines.made
+    assert engine.use_gpu and engine.started and not engine.closed  # kept between previews
+
+    backend.setUseGpu(False)
+    qtbot.waitUntil(lambda: engine.closed)
+    assert len(engines.made) == 1  # and nothing was started on the CPU in its place
+
+    backend.setSpeed(1.2)  # not in the preview cache
+    backend.togglePreview()  # the next preview starts on the CPU, as before
+    qtbot.waitUntil(lambda: len(engines.made) == 2)
+    qtbot.waitUntil(lambda: not backend.previewPlaying)
+    assert engines.made[1].use_gpu is False
+
+
 # --- PDF books and the skip switches ---------------------------------------------------------
 
 
