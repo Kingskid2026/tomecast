@@ -16,9 +16,10 @@ from typing import ClassVar
 import pytest
 from epub_factory import NavPoint, Page, build_epub
 from format_factory import book_in_format
+from machine_factory import ON_BATTERY, PLUGGED_IN, pin_machine
 from pdf_factory import PageBuilder, build_pdf
 
-from tomecast import __version__, cli
+from tomecast import __version__, cli, machine
 from tomecast.downloads import Asset, build_in_use, roll_back
 from tomecast.engines import audiocpp
 from tomecast.engines.audiocpp import EngineError
@@ -93,6 +94,9 @@ def no_real_engine(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(cli, "engine_speed", lambda root, engine, measuring=None: None)
     monkeypatch.setattr(cli, "vulkan_possible", lambda: False)
     monkeypatch.setattr(cli, "data_dir", lambda: tmp_path / "data")
+    # The scan finds nothing to read, so a laptop on battery runs these like any machine.
+    monkeypatch.setattr(machine, "MEMINFO", tmp_path / "no-meminfo")
+    monkeypatch.setattr(machine, "POWER_SUPPLY", tmp_path / "no-power-supply")
     FakeKokoro.fail_with = None
     FakeKokoro.fail_after = None
     FakeKokoro.voiced = 0
@@ -951,6 +955,91 @@ def test_scan_without_a_card_says_so(
     assert cli.main(["scan"]) == 0
 
     assert "Graphics card: not usable, so Tomecast uses the CPU." in capsys.readouterr().out
+
+
+# --- Memory and battery ----------------------------------------------------------------------
+
+
+def test_doctor_prints_memory_power_and_the_thread_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(machine, "cpu_count", lambda: 16)
+    pin_machine(
+        monkeypatch, tmp_path / "laptop", total_gib=16, available_gib=9.5, supplies=ON_BATTERY
+    )
+
+    assert cli.main(["doctor"]) == 0
+
+    out = capsys.readouterr().out
+    assert "CPU threads: 16\n" in out
+    assert "Memory: 16.0 GiB, 9.5 GiB available\n" in out
+    assert "Power: on battery (a laptop)\n" in out
+    assert "Voice threads: 4 (usually 8; fewer on battery)\n" in out
+
+
+def test_doctor_on_a_desktop_and_on_a_machine_it_cant_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(machine, "cpu_count", lambda: 4)
+    pin_machine(monkeypatch, tmp_path / "desktop", total_gib=3.7, available_gib=None, supplies={})
+    assert cli.main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    assert "Memory: 3.7 GiB, unknown available\n" in out
+    assert "Power: no battery (a desktop)\n" in out
+    assert "Voice threads: 1 (usually 2; fewer with little memory)\n" in out
+
+    monkeypatch.setattr(machine, "MEMINFO", tmp_path / "missing")
+    monkeypatch.setattr(machine, "POWER_SUPPLY", tmp_path / "missing")
+    assert cli.main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    assert "Memory: unknown\nPower: unknown\nVoice threads: 2\n" in out
+
+
+def test_convert_on_battery_uses_fewer_threads_and_warns_about_free_memory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(machine, "cpu_count", lambda: 16)
+    pin_machine(monkeypatch, tmp_path / "laptop", total_gib=8, available_gib=1, supplies=ON_BATTERY)
+
+    assert cli.main(["convert", str(_epub(tmp_path))]) == 0
+
+    out = capsys.readouterr().out
+    assert FakeKokoro.made[-1].kwargs["threads"] == 4
+    assert "Using 4 CPU threads (usually 8; fewer on battery).\n" in out
+    note = "Note: Only 1.1 GB of memory is free, and the voice needs about 1.8 GB while it works"
+    assert note in out
+    assert out.index(note) < out.index("Using the CPU") < out.index("Done:")
+
+
+def test_convert_plugged_in_uses_the_usual_threads_and_says_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(machine, "cpu_count", lambda: 16)
+    pin_machine(monkeypatch, tmp_path / "laptop", supplies=PLUGGED_IN)
+
+    assert cli.main(["convert", str(_epub(tmp_path))]) == 0
+
+    out = capsys.readouterr().out
+    assert FakeKokoro.made[-1].kwargs["threads"] == 8
+    assert "CPU thread" not in out
+    assert "memory" not in out
+
+
+def test_scan_shows_the_machine_and_why_it_uses_fewer_threads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(machine, "cpu_count", lambda: 16)
+    pin_machine(
+        monkeypatch, tmp_path / "laptop", total_gib=16, available_gib=1, supplies=ON_BATTERY
+    )
+    monkeypatch.setattr(cli, "probe", lambda root, gpu, cancelled=None: Speeds(cpu=2.6))
+
+    assert cli.main(["scan"]) == 0
+
+    out = capsys.readouterr().out
+    assert "This computer: 16 CPU threads, 17.2 GB of memory (1.1 GB free), on battery.\n" in out
+    assert "Note: Only 1.1 GB of memory is free" in out
+    assert "CPU, 4 threads (usually 8; fewer on battery): about 2.6× real time.\n" in out
 
 
 def test_an_update_that_crashes_on_the_book_is_rolled_back(

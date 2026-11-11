@@ -66,6 +66,7 @@ from tomecast.gui.worker import (
     scan_devices,
 )
 from tomecast.hardware import short_name, vulkan_possible
+from tomecast.machine import scan_machine
 from tomecast.names import Name
 from tomecast.packaging import portable_name
 from tomecast.pronunciations import book_list_path
@@ -221,6 +222,21 @@ def _took(seconds: float) -> str:
     return f"{hours} H {rest:02d} MIN" if hours else f"{rest} MIN"
 
 
+def cpu_label(speedup: float | None = None) -> str:
+    """The corner's hardware label for the CPU: ``"CPU · 8 THREADS"``, or ``"CPU · ABOUT 4.7x
+    REAL TIME"`` once measured, with ``"ON BATTERY"`` after ``"CPU"`` while the computer runs
+    on its battery (it voices with fewer threads then). Reads the power state now."""
+    parts = ["CPU"]
+    if scan_machine().power.on_battery:
+        parts.append("ON BATTERY")
+    if speedup is not None:
+        parts.append(f"ABOUT {speedup:.1f}\u00d7 REAL TIME")
+    else:
+        threads = default_threads()
+        parts.append(f"{threads} THREAD{'' if threads == 1 else 'S'}")
+    return " \u00b7 ".join(parts)
+
+
 def name_rows(names: Sequence[Name]) -> list[dict[str, Any]]:
     """The Names screen's rows: ``{word, count, countLabel, meterLit}``. The label is the
     count and a multiplication sign; the 11-dot meter is log-scaled to the most frequent
@@ -366,9 +382,7 @@ class Backend(QObject):
         self._themeSetting = saved_theme if saved_theme in THEME_SETTINGS else "system"
         self._theme = self._effective_theme()
         self._reduceMotion = system_reduce_motion()
-        threads = default_threads()
-        self._cpuLabel = f"CPU · {threads} THREAD{'' if threads == 1 else 'S'}"
-        self._hardwareLabel = self._cpuLabel
+        self._hardwareLabel = cpu_label()
         self._gpuAvailable = gpu_check()
         self._useGpu = _as_bool(self._settings.value("useGpu", True), default=True)
         self._gpuName = ""
@@ -1167,10 +1181,10 @@ class Backend(QObject):
     def _refresh_hardware_label(self) -> None:
         device = self._device_label()
         speedup = self._speeds.get(device)
-        if speedup is not None:
+        if device == "CPU":
+            self._update("hardwareLabel", cpu_label(speedup))
+        elif speedup is not None:
             self._update("hardwareLabel", f"{device} \u00b7 ABOUT {speedup:.1f}\u00d7 REAL TIME")
-        elif device == "CPU":
-            self._update("hardwareLabel", self._cpuLabel)
         else:
             self._update("hardwareLabel", device)
         self._update("gpuNote", self._gpu_note())

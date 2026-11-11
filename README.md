@@ -25,7 +25,7 @@ tomecast scan                                 # measure the speed here, retry en
 
 `--format mp3` writes `book/01 - Chapter title.mp3`, `02 - …` and so on, for players and car stereos that don't know `.m4b`. Each file is tagged (album, author, track n/total, chapter title) and carries the cover. MP3 is 64 kbps mono, about 29 MB per hour, the same as the M4B. Like the M4B, it never overwrites without `--force`; the window always picks a free name ("book (2)").
 
-The first conversion downloads the voice engine, eSpeak NG and the Kokoro model (about 228 MB, after asking). On an 8-core laptop CPU, a 13-minute story took about 3 minutes to make.
+The first conversion downloads the voice engine, eSpeak NG and the Kokoro model (about 228 MB, after asking). On an 8-core laptop CPU, a 13-minute story took about 3 minutes to make. On a laptop running on battery, or a computer with less than 6 GB of memory, it uses half as many CPU threads, so it's slower but gentler.
 
 If your computer has a graphics card with a working Vulkan driver (NVIDIA, AMD or Intel), Tomecast uses it automatically through the driver you already have, which was about 4 times faster on an NVIDIA laptop card (the story took 41 seconds). It downloads a different engine build for that (about 245 MB in all), never installs drivers, and falls back to the CPU if the card doesn't work. Turn it off with `--no-gpu` or the "Use graphics card" switch; `tomecast doctor` prints what Tomecast sees, for bug reports.
 

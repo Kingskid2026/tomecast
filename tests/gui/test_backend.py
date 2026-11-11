@@ -58,6 +58,7 @@ from tomecast.textprep import TextPrep
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # for epub_factory, pdf_factory
 from epub_factory import NavPoint, Page, build_epub, tiny_png
 from format_factory import book_in_format
+from machine_factory import ON_BATTERY, PLUGGED_IN, pin_machine
 from pdf_factory import SAMPLE_CHAPTERS, build_sample_book, plain
 
 SAMPLE_RATE = 24000
@@ -680,6 +681,23 @@ def test_reduce_motion_and_the_hardware_label(
 
     assert backend.reduceMotion is True
     assert backend.hardwareLabel == "CPU · 8 THREADS"
+
+
+def test_the_hardware_label_says_when_the_cpu_runs_on_battery(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(backend_module, "default_threads", lambda: 4)
+    pin_machine(monkeypatch, tmp_path / "laptop", supplies=ON_BATTERY)
+
+    backend = make_backend(speeds=Speeds(cpu=2.6))
+
+    assert backend.hardwareLabel == "CPU · ON BATTERY · 4 THREADS"
+    qtbot.waitUntil(lambda: "REAL TIME" in backend.hardwareLabel)
+    assert backend.hardwareLabel == "CPU · ON BATTERY · ABOUT 2.6× REAL TIME"
+    # Plugged in again: the label says so the next time it's refreshed.
+    pin_machine(monkeypatch, tmp_path / "plugged", supplies=PLUGGED_IN)
+    backend.setUseGpu(not backend.useGpu)
+    assert backend.hardwareLabel == "CPU · ABOUT 2.6× REAL TIME"
 
 
 # --- Converting ------------------------------------------------------------------------------

@@ -1,4 +1,5 @@
-"""Run every GUI test headless, and never leave a window's worker thread running.
+"""Run every GUI test headless, on the same machine whatever runs it, and never leave a
+window's worker thread running.
 
 The environment is assigned, not defaulted: a desktop session sets QT_QPA_PLATFORM (for
 example to "wayland;xcb"), and the tests would then open real windows.
@@ -6,9 +7,12 @@ example to "wayland;xcb"), and the tests would then open real windows.
 
 import os
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 
 import pytest
+
+from tomecast import machine
 
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 os.environ["QT_QUICK_BACKEND"] = "software"
@@ -49,3 +53,11 @@ def every_backend_is_shut_down(monkeypatch: pytest.MonkeyPatch) -> Iterator[None
             stuck.append(backend)
     if stuck:
         pytest.fail(f"{len(stuck)} backend worker(s) still running after shutdown()")
+
+
+@pytest.fixture(autouse=True)
+def _unknown_memory_and_power(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The hardware scan finds nothing to read, so it never picks fewer threads: a laptop on
+    battery would otherwise change the hardware label."""
+    monkeypatch.setattr(machine, "MEMINFO", tmp_path / "no-meminfo")
+    monkeypatch.setattr(machine, "POWER_SUPPLY", tmp_path / "no-power-supply")
