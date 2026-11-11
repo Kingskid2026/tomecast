@@ -11,7 +11,7 @@ import sys
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 
-from PySide6.QtCore import QSocketNotifier, QUrl
+from PySide6.QtCore import QSocketNotifier, QTimer, QUrl
 from PySide6.QtGui import QFontDatabase, QGuiApplication, QIcon
 from PySide6.QtQml import (
     QQmlApplicationEngine,
@@ -60,12 +60,15 @@ def _image_provider() -> tuple[QQmlImageProviderBase | None, CoverSink | None]:
 
 @contextlib.contextmanager
 def quit_on_signals(app: QGuiApplication) -> Iterator[None]:
-    """Quit cleanly on SIGTERM (logout, ``kill``) and Ctrl-C while the window is open.
+    """Quit cleanly on SIGTERM (logout, ``kill``) and Ctrl-C while the window runs.
 
     Python only runs signal handlers between bytecodes, and Qt's event loop keeps it inside C++,
     so without this the signals would be ignored until the system gave up and killed Tomecast
     (leaving no chance to stop the voice engine tidily). Python's C-level handler writes a byte
     to a socket that Qt watches; reading that byte runs Python again, and so the handler.
+
+    The quit is queued, so a signal that comes before the event loop runs (while the window
+    starts) quits as soon as it does: ``app.quit()`` on its own does nothing until then.
     """
     reader, writer = socket.socketpair()
     reader.setblocking(False)
@@ -78,10 +81,12 @@ def quit_on_signals(app: QGuiApplication) -> Iterator[None]:
                 pass
 
     notifier.activated.connect(drain)
+
+    def ask_to_quit(*_: object) -> None:
+        QTimer.singleShot(0, app.quit)
+
     previous_fd = signal.set_wakeup_fd(writer.fileno(), warn_on_full_buffer=False)
-    previous = {
-        sig: signal.signal(sig, lambda *_: app.quit()) for sig in (signal.SIGTERM, signal.SIGINT)
-    }
+    previous = {sig: signal.signal(sig, ask_to_quit) for sig in (signal.SIGTERM, signal.SIGINT)}
     try:
         yield
     finally:
@@ -107,34 +112,37 @@ def run(argv: Sequence[str] | None = None) -> int:
     load_fonts()
 
     provider, cover_sink = _image_provider()
-    # The backend is created before the QML engine and outlives it.
-    backend = Backend(cover_sink=cover_sink)
-    app.aboutToQuit.connect(backend.shutdown)
-    # The stubs say bytes for the name, but PySide6 only accepts str here.
-    qmlRegisterSingletonInstance(Backend, "TomecastNative", 1, 0, "Backend", backend)  # type: ignore[arg-type]
-    _register_dot_grid()
-
-    engine = QQmlApplicationEngine()
-    if provider is not None:
-        engine.addImageProvider("dots", provider)
-    engine.load(QUrl.fromLocalFile(str(QML_MAIN)))
-    if not engine.rootObjects():
-        print(f"tomecast: error: couldn't load the window from {QML_MAIN}", file=sys.stderr)
-        del engine
-        return finish(backend, 1)
-    if args.book is not None:
-        backend.openBook(QUrl.fromLocalFile(str(args.book.expanduser().resolve())))
+    # From before the backend starts its worker thread until finish() has stopped it, SIGTERM
+    # and Ctrl-C ask the window to quit. Python's default (KeyboardInterrupt) would otherwise
+    # leave run() with the thread still running, for Qt to destroy: SIGABRT and a core dump.
     with quit_on_signals(app):
+        # The backend is created before the QML engine and outlives it.
+        backend = Backend(cover_sink=cover_sink)
+        app.aboutToQuit.connect(backend.shutdown)
+        # The stubs say bytes for the name, but PySide6 only accepts str here.
+        qmlRegisterSingletonInstance(Backend, "TomecastNative", 1, 0, "Backend", backend)  # type: ignore[arg-type]
+        _register_dot_grid()
+
+        engine = QQmlApplicationEngine()
+        if provider is not None:
+            engine.addImageProvider("dots", provider)
+        engine.load(QUrl.fromLocalFile(str(QML_MAIN)))
+        if not engine.rootObjects():
+            print(f"tomecast: error: couldn't load the window from {QML_MAIN}", file=sys.stderr)
+            del engine
+            return finish(backend, 1)
+        if args.book is not None:
+            backend.openBook(QUrl.fromLocalFile(str(args.book.expanduser().resolve())))
         code = app.exec()
-    del engine  # the QML engine goes first, while the backend it uses still exists
-    return finish(backend, code)
+        del engine  # the QML engine goes first, while the backend it uses still exists
+        return finish(backend, code)
 
 
 def finish(backend: Backend, code: int) -> int:
     """Shut ``backend`` down and return ``code``. If its worker is still busy even so (an
     engine stuck in a graphics driver, a download read that stalled), leave the process at
     once instead: returning would let Qt destroy a running thread, which aborts with a core
-    dump. Settings and output are written first; the engines get SIGTERM anyway, from the
+    dump. Settings and output are written first; the engines get SIGKILL anyway, from the
     parent-death signal each one was started with."""
     backend.shutdown()
     if backend.worker_thread.isRunning():

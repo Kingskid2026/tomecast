@@ -29,6 +29,7 @@ from tomecast.book import Cover
 from tomecast.packaging import (
     AudiobookInfo,
     ChapterAudio,
+    OutputExistsError,
     PackagedBook,
     PackagingError,
     mp3_file_name,
@@ -285,6 +286,69 @@ def test_never_overwrite_survives_a_folder_appearing_while_encoding(tmp_path: Pa
     assert packaged.output == out / "The Test Book (2)"
     assert (target / "theirs.mp3").read_bytes() == b"theirs"
     assert [p.name for p in target.iterdir()] == ["theirs.mp3"]
+
+
+@pytest.mark.parametrize("empty", [True, False])
+def test_no_overwrite_no_rename_refuses_a_folder_that_appeared_while_encoding(
+    tmp_path: Path, empty: bool
+) -> None:
+    """The command line's mode: nothing is written, and the folder that appeared (empty, or
+    with somebody's files in it) is left as it is."""
+    out = tmp_path / "out"
+    out.mkdir()
+    target = out / "The Test Book"
+    real = packaging._encode
+
+    def encode_then_someone_saves(*args: object, **kwargs: object) -> None:
+        real(*args, **kwargs)  # type: ignore[arg-type]
+        target.mkdir(exist_ok=True)
+        if not empty:
+            (target / "theirs.mp3").write_bytes(b"theirs")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(packaging, "_encode", encode_then_someone_saves)
+        with pytest.raises(OutputExistsError, match="The Test Book already exists"):
+            write_mp3s(
+                [chapter(tmp_path, "A", [(0.3, 0.1)])],
+                INFO,
+                target,
+                workdir=tmp_path / "w",
+                overwrite=False,
+                rename=False,
+            )
+
+    assert [p.name for p in target.iterdir()] == ([] if empty else ["theirs.mp3"])
+    assert [p.name for p in out.iterdir()] == ["The Test Book"]  # no partial folder left
+
+
+def test_no_overwrite_no_rename_refuses_a_folder_filled_after_its_name_was_claimed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The name was free when it was claimed, but somebody put files in the empty claim
+    before the finished folder was moved there: those files are theirs, and stay."""
+    out = tmp_path / "out"
+    out.mkdir()
+    target = out / "The Test Book"
+    real_mkdir = Path.mkdir
+
+    def mkdir_then_someone_saves(self: Path, *args: object, **kwargs: object) -> None:
+        real_mkdir(self, *args, **kwargs)  # type: ignore[arg-type]
+        if self == target:
+            (target / "theirs.mp3").write_bytes(b"theirs")
+
+    monkeypatch.setattr(Path, "mkdir", mkdir_then_someone_saves)
+    with pytest.raises(OutputExistsError, match="The Test Book already exists"):
+        write_mp3s(
+            [chapter(tmp_path, "A", [(0.3, 0.1)])],
+            INFO,
+            target,
+            workdir=tmp_path / "w",
+            overwrite=False,
+            rename=False,
+        )
+
+    assert [p.name for p in target.iterdir()] == ["theirs.mp3"]
+    assert [p.name for p in out.iterdir()] == ["The Test Book"]
 
 
 def test_overwrite_replaces_old_chapters_but_keeps_other_files(tmp_path: Path) -> None:

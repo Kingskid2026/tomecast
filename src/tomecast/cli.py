@@ -72,7 +72,7 @@ from tomecast.machine import (
 )
 from tomecast.manifest import ASSETS
 from tomecast.names import DEFAULT_MIN_COUNT, find_book_names
-from tomecast.packaging import PackagingError
+from tomecast.packaging import OutputExistsError, PackagingError, stretch_wav
 from tomecast.playback import PLAYERS, find_player, play
 from tomecast.readers import FORMATS, InvalidEbookError, read_book
 from tomecast.speed import (
@@ -349,10 +349,7 @@ def _convert(args: argparse.Namespace) -> int:
     output: Path = args.output or (
         book_path.with_suffix("") if output_format == "mp3" else book_path.with_suffix(".m4b")
     )
-    if (output.exists() or output.is_symlink()) and not args.force:
-        raise CliError(f"{output} already exists (use --force to overwrite it)")
-    if not output.parent.is_dir():
-        raise CliError(f"the folder {output.parent} doesn't exist")
+    _check_output(output, output_format, book_path, force=args.force)
 
     try:
         book = read_book(book_path)
@@ -451,6 +448,10 @@ def _convert(args: argparse.Namespace) -> int:
                     format=output_format,
                     prep=prep,
                     chapters=chapters,
+                    # Without --force, a file that appears at the output while the book is
+                    # made (another run's, say) is never replaced: the run stops instead.
+                    overwrite=args.force,
+                    rename=False,
                 )
         except KeyboardInterrupt:
             progress.finish()
@@ -469,6 +470,13 @@ def _convert(args: argparse.Namespace) -> int:
             if not out_of_memory and roll_back(root, builds, str(error)):
                 raise CliError(f"{error}\nNote: {UPDATE_FAILED_NOTE} {AGAIN_NOTE}") from error
             raise CliError(f"{error}\n{_saved_note(workdir)}".rstrip()) from error
+        except OutputExistsError as error:
+            progress.finish()
+            raise CliError(
+                f"{error}: it appeared while this book was being made, so it wasn't replaced. "
+                "The audio made so far is saved: run the command again with -o to save the "
+                "audiobook under another name, or with --force to replace it."
+            ) from error
         except (PackagingError, CoverageError, OSError, wave.Error) as error:
             progress.finish()
             raise CliError(f"{error}\n{_saved_note(workdir)}".rstrip()) from error
@@ -634,7 +642,7 @@ def _scan(args: argparse.Namespace) -> int:
     print(f"This computer: {_machine_summary(machine)}.")
     if note := memory_note(machine):
         print(f"Note: {note}")
-    forget_failures(root)
+    forget_failures(root, on_wait=_waiting_for_install)
     forget_speeds(root)
     _prepare(use_gpu, root, assume_yes=args.yes, take_over=True)
     print("Measuring how fast this computer voices (a few seconds each)…")
@@ -799,6 +807,12 @@ def _preview(args: argparse.Namespace) -> int:
                 notes.say(sys.stderr)  # the card ran out of memory partway
             if problem := audio_problem(wav, spoken):
                 raise CliError(f"the voice made no usable audio: {problem}")
+            # Above 1.5x the voice speaks at 1.5x and the rest is a time-stretch, which the
+            # book gets when it's packaged: the preview gets it too, so it sounds the same.
+            if engine.tempo != 1.0:
+                stretched = Path(folder) / "stretched.wav"
+                stretch_wav(wav, stretched, engine.tempo)
+                wav = stretched
             if output is not None:
                 shutil.copyfile(wav, output)
                 print(f"Saved {output}")
@@ -859,6 +873,34 @@ def _interrupt(signum: int, frame: object) -> None:
     raise KeyboardInterrupt
 
 
+def _check_output(
+    output: Path, output_format: Literal["m4b", "mp3"], book: Path, *, force: bool
+) -> None:
+    """Refuse an output path that can't work, before anything is voiced: one that exists
+    (without ``force``), is the wrong kind for the format (``force`` doesn't change that),
+    or is in a folder that doesn't exist."""
+    taken = output.exists() or output.is_symlink()
+    if output_format == "m4b" and output.is_dir():
+        raise CliError(
+            f"{output} is a folder. Give the audiobook a file name, like "
+            f"-o {output / book.with_suffix('.m4b').name}"
+        )
+    if output_format == "m4b" and output.suffix.lower() == ".mp3":
+        raise CliError(
+            f"{output} ends in .mp3, but the audiobook is an M4B file. Use --format mp3 for "
+            "MP3s (one per chapter, in a folder), or a name ending in .m4b"
+        )
+    if output_format == "mp3" and taken and not output.is_dir():
+        raise CliError(
+            f"{output} is a file, but --format mp3 makes a folder of MP3s. "
+            "Choose a folder name with -o"
+        )
+    if taken and not force:
+        raise CliError(f"{output} already exists (use --force to overwrite it)")
+    if not output.parent.is_dir():
+        raise CliError(f"the folder {output.parent} doesn't exist")
+
+
 def _saved_note(workdir: Path) -> str:
     if any((workdir / "chunks").glob("*.wav")):
         return "The audio made so far is saved. Run the same command again to continue."
@@ -882,7 +924,9 @@ def _prepare(use_gpu: bool, root: Path, *, assume_yes: bool, take_over: bool = F
         print(f"Total: {_megabytes(total)}, saved in {root}")
         if assume_yes:
             return True
-        if not sys.stdin.isatty():
+        # Only asked where the question can be seen: with the output going to a file, it
+        # would end up in the file, and the command would seem to hang.
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
             if updates:
                 print(
                     "Note: Tomecast will keep using the version it has; run again with --yes "
@@ -890,7 +934,12 @@ def _prepare(use_gpu: bool, root: Path, *, assume_yes: bool, take_over: bool = F
                 )
                 return False
             raise CliError("downloads are needed; run again with --yes to allow them")
-        if input("Download now? [y/N] ").strip().lower() in {"y", "yes"}:
+        try:
+            answer = input("Download now? [y/N] ")
+        except EOFError:  # Ctrl-D: no
+            print()
+            answer = ""
+        if answer.strip().lower() in {"y", "yes"}:
             return True
         if updates:
             print("Tomecast will keep using the version it has.")
@@ -908,6 +957,7 @@ def _prepare(use_gpu: bool, root: Path, *, assume_yes: bool, take_over: bool = F
             on_download=_download_printer,
             on_check=checking,
             take_over=take_over,
+            on_wait=_waiting_for_install,
         )
     except DownloadError as error:
         raise CliError(str(error)) from error
@@ -916,13 +966,21 @@ def _prepare(use_gpu: bool, root: Path, *, assume_yes: bool, take_over: bool = F
     return prepared
 
 
+def _waiting_for_install() -> None:
+    print("Waiting for another Tomecast to finish installing…", flush=True)
+
+
 def _download_printer(asset: Asset, number: int, count: int) -> ProgressCallback:
     stream: TextIO = sys.stderr
     finished = False
+    shown = -1
 
     def show(done: int, total: int) -> None:
-        nonlocal finished
+        nonlocal finished, shown
         percent = 100 * done // total if total else 100
+        if percent == shown:
+            return  # progress comes in small pieces; the line changes once per percent
+        shown = percent
         stream.write(f"\r  Downloading {asset.name}: {percent}% of {_megabytes(total)}")
         if done >= total and not finished:
             finished = True
@@ -933,28 +991,42 @@ def _download_printer(asset: Asset, number: int, count: int) -> ProgressCallback
 
 
 class _ProgressPrinter:
-    """Shows conversion progress on one updating line (or occasional lines in logs)."""
+    """Shows conversion progress on one updating line (or occasional lines in logs).
+
+    The time left is measured on the pieces voiced in this run, from the time between
+    reports: the engine's start and the speed test (before the first report) don't count,
+    and neither do pieces an earlier run made (reused in a moment, on a resumed book)."""
 
     def __init__(self, stream: TextIO) -> None:
         self._stream = stream
         self._interactive = stream.isatty()
-        self._started = time.monotonic()
-        self._counted_from = 0  # the time left is measured from this piece on
+        self._last: float | None = None  # when the last report came
+        self._done = self._reused = 0  # as of the last report
+        self._voiced = 0  # pieces voiced since the time left was last measured from scratch
+        self._voicing = 0.0  # the seconds they took
         self._last_percent = -1
         self._shown = False
 
     def restart(self, done: int) -> None:
-        """Measure the time left again from here (the engine moved to the CPU)."""
-        self._started = time.monotonic()
-        self._counted_from = done
+        """Measure the time left again from the next piece on (the engine moved to the
+        CPU while voicing piece ``done``, so the card's speed and that piece don't count)."""
+        self._last = time.monotonic()
+        self._done = done
+        self._voiced = 0
+        self._voicing = 0.0
 
     def update(self, progress: ConversionProgress) -> None:
-        measured = progress.chunks_done - self._counted_from
-        if measured <= 0 or progress.stage == "packaging":
+        now = time.monotonic()
+        finished = progress.chunks_done - self._done
+        voiced = finished - (progress.chunks_reused - self._reused)
+        if self._last is not None and voiced > 0:
+            self._voiced += voiced
+            self._voicing += now - self._last
+        self._last, self._done, self._reused = now, progress.chunks_done, progress.chunks_reused
+        if self._voiced <= 0 or progress.stage == "packaging":
             return
         percent = 100 * progress.chunks_done // max(1, progress.chunks_total)
-        elapsed = time.monotonic() - self._started
-        remaining = elapsed / measured * (progress.chunks_total - progress.chunks_done)
+        remaining = self._voicing / self._voiced * (progress.chunks_total - progress.chunks_done)
         line = (
             f"Chapter {progress.chapter_index + 1}/{progress.chapter_count} · "
             f"{progress.chunks_done:,}/{progress.chunks_total:,} pieces · {percent}% · "

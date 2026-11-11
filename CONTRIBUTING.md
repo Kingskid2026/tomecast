@@ -29,6 +29,7 @@ uv run ruff check           # lint
 uv run ruff format          # auto-format (CI runs `ruff format --check`)
 uv run mypy                 # type checks (strict)
 uv run pytest               # tests
+uv run pytest -m integration  # opt-in checks against your installed engines (skipped if absent)
 ```
 
 If your change affects audio, **listen to the result** and say what you checked in the pull request.

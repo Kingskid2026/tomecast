@@ -1163,6 +1163,50 @@ def test_a_fix_removed_in_the_list_clears_its_row(app_window: Window, messages: 
     assert_clean(messages)
 
 
+@pytest.mark.parametrize(
+    ("button", "call"),
+    [("fixRemove0", ("removeFix", ("book", "Gryphon"))),
+     ("fixScope0", ("toggleFixScope", ("book", "Gryphon")))],
+)  # fmt: skip
+def test_a_fix_button_works_on_the_first_click_while_a_name_is_being_typed(
+    app_window: Window, messages: Messages, button: str, call: tuple[str, tuple[str, str]]
+) -> None:
+    """Saving the name being typed rebuilds the list of fixes. That used to happen on the
+    button's press, so the release landed on a new row and the click was lost."""
+    app_window.show("names")
+    app_window.click("nameField2")  # Dinah
+    _type(app_window, "DIE-nuh")
+    before = len(app_window.backend.calls)
+    app_window.click(button)  # once
+    assert app_window.backend.calls[before:] == [("setNameFix", ("Dinah", "DIE-nuh")), call]
+    focused = app_window.window.activeFocusItem()
+    assert focused is not None and focused.objectName() == button  # the same fix's button
+    assert focused.property("visualFocus") is False  # clicked: no keyboard ring
+    assert_clean(messages)
+
+
+def test_a_fix_whose_name_was_emptied_is_gone_before_its_remove_acts(
+    app_window: Window, messages: Messages
+) -> None:
+    app_window.show("names")
+    app_window.click("nameField1")  # Gryphon, the first fix
+    QTest.keyClick(app_window.window, Qt.Key.Key_A, Qt.KeyboardModifier.ControlModifier)
+    QTest.keyClick(app_window.window, Qt.Key.Key_Backspace)
+    app_window.settle()
+    before = len(app_window.backend.calls)
+    app_window.click("fixRemove0")
+    assert app_window.backend.calls[before:] == [("setNameFix", ("Gryphon", ""))]  # that did it
+    assert app_window.text("fixesCount") == "YOUR FIXES · 2"
+    # The next name saved keeps its field's focus (no row is waiting to take it).
+    app_window.click("nameField2")
+    _type(app_window, "DIE-nuh")
+    QTest.keyClick(app_window.window, Qt.Key.Key_Return)
+    app_window.settle()
+    assert app_window.text("fixesCount") == "YOUR FIXES · 3"
+    assert app_window.window.activeFocusItem().objectName() == "nameField2"
+    assert_clean(messages)
+
+
 def test_the_scope_switch_keeps_keyboard_focus(app_window: Window, messages: Messages) -> None:
     app_window.show("names")
     pill = app_window.get("fixScope0")

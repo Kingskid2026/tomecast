@@ -52,7 +52,8 @@ from tomecast import __version__
 ProgressCallback = Callable[[int, int], None]  # (bytes done, total bytes)
 IsCancelled = Callable[[], bool]  # True once the user has stopped the run
 
-_CHUNK_SIZE = 1024 * 1024
+_CHUNK_SIZE = 1024 * 1024  # bytes hashed at a time
+_DOWNLOAD_READ = 64 * 1024  # the most bytes taken from a download at a time
 _MARKER = ".tomecast-sha256"
 _INSTALLED_BY = ".tomecast-installed-by"  # in a build folder: the Tomecast that installed it
 _VERIFIED = ".tomecast-verified"  # beside a file: its SHA-256, size and mtime once hashed
@@ -207,8 +208,10 @@ def build_in_use(asset: Asset, root: Path) -> Path | None:
 
 def run_builds(assets: Sequence[Asset], root: Path) -> dict[str, Path]:
     """The build of each archive in ``assets`` that a run of this Tomecast uses: the build in
-    use, except where a newer Tomecast chose it, when this one's own pinned build is used if
-    it's there (without switching to it), so each version runs what it was tested with."""
+    use, except where a newer Tomecast chose it, when this one's own pinned build is used
+    (without switching to it), so each version runs what it was tested with. Only if that's
+    the build the newer one switched away from (``previous``), so it has worked here: one
+    that ``tomecast scan`` downloaded but that hasn't passed its check is never run."""
     slots = _load(root)
     builds = {}
     for asset in assets:
@@ -218,6 +221,7 @@ def run_builds(assets: Sequence[Asset], root: Path) -> dict[str, Path]:
         own = build_folder(asset, root)
         if (
             _chosen_by_newer(slot)
+            and slot.previous == _relative(own, root)
             and build_sha256(own) == asset.sha256
             and not _failed_here(asset.sha256, slot)
         ):
@@ -381,6 +385,7 @@ def prepare(
     on_check: Callable[[], None] | None = None,
     cancelled: IsCancelled | None = None,
     take_over: bool = False,
+    on_wait: Callable[[], None] | None = None,
 ) -> Prepared:
     """Make sure everything in ``assets`` is installed and that new engine builds work here.
 
@@ -388,6 +393,10 @@ def prepare(
        downloads removed.
     2. What's missing is downloaded, if ``consent`` agrees. If it doesn't, or a download fails,
        but there's an older build of each missing archive to use, the run goes on with those.
+       ``consent`` is asked with the lock let go (an unanswered question must never keep
+       another Tomecast waiting), so what's missing is worked out again afterwards: what
+       another Tomecast installed meanwhile isn't downloaded twice, and anything newly
+       missing is asked about too.
     3. New archive builds that have an older build to fall back to are checked by each voice
        that uses them (``check``: one :class:`SelfCheck` for every archive, or one
        :class:`VoiceCheck` per voice), all swapped in together. A failed check is tried once
@@ -401,9 +410,11 @@ def prepare(
     4. Builds no longer needed are deleted: each archive usually keeps two (see
        :func:`_clean_up`).
 
-    Holds a lock on the data folder throughout, so two Tomecast processes don't install at
-    once. While waiting for it, and during the checks, ``cancelled`` is asked whether the user
-    has stopped; if so this raises :class:`Cancelled` and records nothing.
+    Holds a lock on the data folder throughout (except while ``consent`` is asked), so two
+    Tomecast processes don't install at once. Each time another Tomecast holds it,
+    ``on_wait`` is called once, to say so. While waiting for it, and during the checks,
+    ``cancelled`` is asked whether the user has stopped; if so this raises
+    :class:`Cancelled` and records nothing.
 
     Normally an older Tomecast leaves a build a newer one chose alone (``chosen_by``), so two
     installed versions don't take turns switching. ``take_over`` (``tomecast scan``, run by
@@ -412,48 +423,81 @@ def prepare(
     downgraded gets back onto the build it was tested with, and no choice is ever wiped.
     """
     checks = _as_checks(check, assets)
+    agreed: set[Asset] = set()
+    declined: set[Asset] = set()  # updates only: a run can go on without them
+    while True:
+        with _locked(root, cancelled, on_wait=on_wait):
+            _tidy(assets, root)
+            missing = [a for a in assets if needs_download(a, root, take_over=take_over)]
+            ask = [
+                asset
+                for asset in missing
+                if asset not in agreed and (asset not in declined or not _is_update(asset, root))
+            ]
+            if not ask:
+                return _install(
+                    assets, root, checks,
+                    downloads=[asset for asset in missing if asset in agreed],
+                    declined=[asset for asset in missing if asset in declined],
+                    on_download=on_download, on_check=on_check, cancelled=cancelled,
+                    take_over=take_over,
+                )  # fmt: skip
+            updates = all(_is_update(asset, root) for asset in ask)
+        if consent(ask, updates):
+            agreed.update(ask)
+            declined.difference_update(ask)
+        elif updates:
+            declined.update(ask)
+        else:
+            raise DownloadDeclined("nothing was downloaded")
+
+
+def _install(
+    assets: Sequence[Asset],
+    root: Path,
+    checks: Sequence[VoiceCheck],
+    *,
+    downloads: Sequence[Asset],
+    declined: Sequence[Asset],
+    on_download: DownloadReporter | None,
+    on_check: Callable[[], None] | None,
+    cancelled: IsCancelled | None,
+    take_over: bool,
+) -> Prepared:
+    """Steps 2 to 4 of :func:`prepare`, once the user has agreed to ``downloads`` and
+    declined the updates in ``declined``. Only called with the lock held."""
     notes: list[str] = []
-    held_back: list[Asset] = []
+    held_back = list(declined)
     switched: list[Asset] = []
-    with _locked(root, cancelled):
-        _tidy(assets, root)
-        missing = [a for a in assets if needs_download(a, root, take_over=take_over)]
-        if missing:
-            updates = all(_is_update(asset, root) for asset in missing)
-            if not consent(missing, updates):
-                if not updates:
-                    raise DownloadDeclined("nothing was downloaded")
-                held_back += missing
-                missing = []
-        for number, asset in enumerate(missing, start=1):
-            progress = on_download(asset, number, len(missing)) if on_download else None
-            try:
-                ensure(asset, root, progress)
-            except DownloadError:
-                if not _is_update(asset, root):
-                    raise
-                notes.append(UPDATE_NOT_DOWNLOADED_NOTE)
-                held_back.append(asset)
-        waiting = [a for a in assets if waiting_check(a, root, take_over=take_over)]
-        if waiting:
-            if on_check:
-                on_check()
-            verdicts = _judge(waiting, assets, root, checks, cancelled)
-            if all(result is None for result in verdicts.values()):
-                for asset in waiting:
-                    _promote(asset, root, proven=False)
-                switched += waiting
-            else:
-                # They were checked together, so they switch together. A build that failed
-                # is recorded; the others wait, and the next run checks them with the builds
-                # in use instead of the failed one.
-                for asset, result in verdicts.items():
-                    if isinstance(result, str):
-                        _record_failure(asset.slot, asset.sha256, root, result, during="check")
-                        notes.append(UPDATE_FAILED_NOTE)
-                held_back += waiting
-        _clean_up(assets, root)
-        builds = run_builds(assets, root)
+    for number, asset in enumerate(downloads, start=1):
+        progress = on_download(asset, number, len(downloads)) if on_download else None
+        try:
+            ensure(asset, root, progress)
+        except DownloadError:
+            if not _is_update(asset, root):
+                raise
+            notes.append(UPDATE_NOT_DOWNLOADED_NOTE)
+            held_back.append(asset)
+    waiting = [a for a in assets if waiting_check(a, root, take_over=take_over)]
+    if waiting:
+        if on_check:
+            on_check()
+        verdicts = _judge(waiting, assets, root, checks, cancelled)
+        if all(result is None for result in verdicts.values()):
+            for asset in waiting:
+                _promote(asset, root, proven=False)
+            switched += waiting
+        else:
+            # They were checked together, so they switch together. A build that failed is
+            # recorded; the others wait, and the next run checks them with the builds in use
+            # instead of the failed one.
+            for asset, result in verdicts.items():
+                if isinstance(result, str):
+                    _record_failure(asset.slot, asset.sha256, root, result, during="check")
+                    notes.append(UPDATE_FAILED_NOTE)
+            held_back += waiting
+    _clean_up(assets, root)
+    builds = run_builds(assets, root)
     return Prepared(tuple(dict.fromkeys(notes)), tuple(switched), tuple(held_back), builds)
 
 
@@ -472,9 +516,10 @@ def roll_back(
     wait: float = ROLL_BACK_WAIT,
 ) -> bool:
     """A run with the builds ``used`` (``Prepared.builds``) failed: go back to the previous
-    build of each archive that this Tomecast switched to and that hasn't finished a real run
-    yet, and record the failure, so the next run uses the build that worked and the failed
-    one isn't picked again (for :data:`FAILURE_DAYS` days). True if anything was rolled back.
+    build of each archive that this Tomecast (or an older one) switched to and that hasn't
+    finished a real run yet, and record the failure, so the next run uses the build that
+    worked and the failed one isn't picked again (for :data:`FAILURE_DAYS` days). True if
+    anything was rolled back. A build a newer Tomecast chose is left alone, as everywhere.
 
     A build that has finished a run before isn't blamed: the problem is more likely the book,
     the computer or the card. If another Tomecast holds the install lock for more than
@@ -490,7 +535,7 @@ def roll_back(
                 or slot.current is None
                 or folder != root / slot.current
                 or slot.proven
-                or slot.chosen_by != __version__
+                or _chosen_by_newer(slot)
                 or not slot.previous
                 or not build_sha256(root / slot.previous)
             ):
@@ -532,12 +577,17 @@ def mark_proven(
     return proven
 
 
-def forget_failures(root: Path, cancelled: IsCancelled | None = None) -> None:
+def forget_failures(
+    root: Path,
+    cancelled: IsCancelled | None = None,
+    *,
+    on_wait: Callable[[], None] | None = None,
+) -> None:
     """Forget every failed self-check and run, so the next :func:`prepare` tries those builds
     again (``tomecast scan`` does this). Which Tomecast chose each build in use is kept: a
     scan takes a build back through a checked switch (``prepare(take_over=True)``), never by
-    wiping that record."""
-    with _locked(root, cancelled):
+    wiping that record. ``on_wait`` is as in :func:`prepare`."""
+    with _locked(root, cancelled, on_wait=on_wait):
         slots = _load(root)
         for slot in slots.values():
             slot.failed = {}
@@ -915,11 +965,16 @@ class _Busy(Exception):
 
 @contextlib.contextmanager
 def _locked(
-    root: Path, cancelled: IsCancelled | None = None, wait: float | None = None
+    root: Path,
+    cancelled: IsCancelled | None = None,
+    wait: float | None = None,
+    *,
+    on_wait: Callable[[], None] | None = None,
 ) -> Iterator[None]:
-    """Hold the install lock, waiting while another Tomecast installs. The wait never blocks
-    for good: it asks ``cancelled`` between tries (raising :class:`Cancelled`), and gives up
-    after ``wait`` seconds if that's set (raising :class:`_Busy`)."""
+    """Hold the install lock, waiting while another Tomecast installs (``on_wait`` is called
+    once if it has to). The wait never blocks for good: it asks ``cancelled`` between tries
+    (raising :class:`Cancelled`), and gives up after ``wait`` seconds if that's set (raising
+    :class:`_Busy`)."""
     root.mkdir(parents=True, exist_ok=True)
     deadline = None if wait is None else time.monotonic() + wait
     with (root / _LOCK).open("w") as handle:
@@ -928,6 +983,9 @@ def _locked(
                 fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
             except BlockingIOError:
+                if on_wait is not None:
+                    on_wait()
+                    on_wait = None
                 if cancelled is not None and cancelled():
                     raise Cancelled from None
                 if deadline is not None and time.monotonic() >= deadline:
@@ -947,7 +1005,9 @@ def _download(asset: Asset, destination: Path, progress: ProgressCallback | None
     done = 0
     try:
         with urllib.request.urlopen(request, timeout=60) as response, destination.open("wb") as f:
-            while block := response.read(_CHUNK_SIZE):
+            # read1 returns what has arrived (read(n) waits for all n bytes), so a slow
+            # connection still reports progress, and the reporter can stop the download.
+            while block := response.read1(_DOWNLOAD_READ):
                 f.write(block)
                 digest.update(block)
                 done += len(block)

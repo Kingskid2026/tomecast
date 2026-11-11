@@ -8,22 +8,19 @@ name: Integration
 #
 # The engine builds, eSpeak NG and the model are downloaded once per change of their pinned
 # SHA-256s and cached, so the distro jobs don't each fetch them. This is the slow part of CI,
-# so it runs only when the engine, the conversion or the packaging changes (and on each
-# release, which bumps pyproject.toml), plus every week, because the fedora and archlinux
-# images move on without a change here.
+# so it runs only when the engine, the conversion or the packaging changes: any of Tomecast's
+# code but the window's own (gui/, which `tomecast convert` never loads), install.sh, and
+# the dependencies (and so each release, which bumps pyproject.toml). It also runs every
+# week, because the fedora and archlinux images move on without a change here.
 
 on:
   pull_request:
     paths: &paths
-      - src/tomecast/engines/**
-      - src/tomecast/manifest.py
-      - src/tomecast/downloads.py
-      - src/tomecast/speed.py
-      - src/tomecast/hardware.py
-      - src/tomecast/convert.py
-      - src/tomecast/workdirs.py
-      - src/tomecast/audio.py
-      - src/tomecast/packaging.py
+      # Everything `tomecast convert` runs: all of Tomecast's code but the window's (the "!"
+      # line, which must come after the line it narrows). tests/test_workflows.py checks that
+      # every module the command line imports is covered.
+      - src/tomecast/**
+      - "!src/tomecast/gui/**"
       - install.sh
       # Dependency updates, and each release (release-please bumps the version here).
       - pyproject.toml

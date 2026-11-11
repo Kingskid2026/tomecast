@@ -12,6 +12,9 @@ A list is a text file with one fix per line::
 * Matching is by whole word. A left side written in lowercase matches the word in any case
   ("kernel", "Kernel", "KERNEL"). A left side with a capital letter matches that exact
   spelling, and its ALL-CAPS version (for headings).
+* Apostrophe-like marks touching a letter count as apostrophes on both sides
+  (:func:`tomecast.marks.speakable`), so ``Qurʾān`` matches the book's ``Qur'ān`` and the
+  other way round, and a fix for ``Siobhan`` covers ``Siobhanʼs``.
 * Several words work too: ``New Zealand → noo zee-lund``.
 * Lines starting with ``#`` are comments, and so is anything after `` #`` on a line.
 
@@ -20,9 +23,15 @@ it so an English reader says it right, with hyphens between syllables. Capital l
 for the stressed syllable are fine for readability; Tomecast lowercases them before speaking,
 because the pronouncer (eSpeak NG) would spell out a word in capitals letter by letter.
 
-Exact phonetic spellings in ``/slashes/`` are not supported: audio.cpp's server can't take
-phonemes (checked in v0.9.4; see docs/architecture.md, section 10). Such a line is skipped
-with a warning.
+Phonetic spellings are not supported: audio.cpp's server can't take phonemes (checked in
+v0.9.4; see docs/architecture.md, section 10), and eSpeak reads IPA symbols out by name
+("small capital I", "stress"). :func:`phonetic_notation` says what counts as one: IPA
+symbols (the IPA letters, stress and length marks, and the others listed at ``_IPA``),
+eSpeak's ``[[phoneme]]`` markup, or a value wrapped in ``/slashes/`` or ``[brackets]`` the
+way phonetic spellings are written. Such a line is skipped with a warning, and the window
+refuses to save one.
+
+A list may start with a UTF-8 byte-order mark (some editors write one): it is ignored.
 
 The window edits these files with :func:`edit` and :func:`save`, which change only the line
 for the word being fixed and keep every other line and comment as the user wrote it.
@@ -35,8 +44,12 @@ import os
 import re
 import secrets
 import shutil
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
+
+from tomecast.marks import speakable
 
 GLOBAL_FILE_NAME = "pronunciations.txt"
 BOOK_FILE_SUFFIX = ".pronunciations.txt"
@@ -44,6 +57,24 @@ BOOK_FILE_SUFFIX = ".pronunciations.txt"
 _SEPARATOR = re.compile(r"\s*(?:→|->)\s*")
 _COMMENT = re.compile(r"(?:^|\s)#.*$")
 _CAPITALS = re.compile(r"[A-Za-z]{2,}")
+# Symbols only a phonetic alphabet uses. Letters that real spellings use too (æ, ð, þ, ŋ, ø,
+# accented letters) are left out, and so are the marks that transliterations of names use:
+# the ʻokina (U+02BB), the apostrophe ʼ (U+02BC), the primes ʹ ʺ and the half rings ʾ ʿ.
+# (eSpeak would read those marks out by name too, so tomecast.marks makes them apostrophes.)
+_IPA = re.compile(
+    "["
+    "\u03b2\u03b8\u03c7"  # β θ χ: the Greek letters IPA uses, read out as "beta", "theta"
+    "\u0250-\u02af"  # IPA Extensions: ɐ ɑ ə ɛ ɡ ɪ ɔ ʃ ʊ ʌ ʒ ʔ ...
+    "\u02b0-\u02b8"  # raised letters for aspiration, palatalisation and so on: ʰ ʲ ʷ
+    "\u02c0\u02c1"  # ˀ ˁ
+    "\u02c8\u02cc"  # stress: ˈ (primary) and ˌ (secondary)
+    "\u02d0\u02d1"  # length: ː (long) and ˑ (half long)
+    "\u02de"  # ˞ (r-coloured)
+    "\u02e0-\u02e9"  # ˠ ˡ ˢ ˣ ˤ, and the tone letters ˥ ˦ ˧ ˨ ˩
+    "\u035c\u0361"  # tie bars, as in t͡ʃ
+    "\u1d00-\u1dbf"  # Phonetic Extensions: ᴜ ᵊ ᵻ ᵿ ...
+    "]"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,11 +96,63 @@ def book_list_path(book: Path) -> Path:
     return book.with_suffix(BOOK_FILE_SUFFIX)
 
 
-def respelling(value: str) -> str:
-    """How a right-hand side is actually spoken: capitalised syllables are lowercased.
+Notation = Literal["IPA", "markup", "slashes", "brackets"]
 
-    ``her-MY-oh-nee`` -> ``her-my-oh-nee``. Single capital letters are left alone.
+
+def phonetic_notation(spoken: str) -> Notation | None:
+    """What makes a right-hand side a phonetic spelling rather than a respelling, or ``None``
+    for a respelling. The voice can't use any of these: it would read them out.
+
+    * ``"IPA"``: IPA symbols (the letters ``ə ɪ ʃ ɔ``..., ``β θ χ``, stress and length marks
+      ``ˈ ˌ ː ˑ``, raised letters ``ʰ ʲ ʷ``, tone letters, tie bars and the Phonetic
+      Extensions such as ``ᵻ``): ``ʃɪˈvɔːn``, ``shi-ˈvawn``, ``/ʃɪˈvɔːn/``, ``[ʃɪˈvɔːn]``.
+    * ``"markup"``: eSpeak's ``[[phoneme]]`` markup, anywhere in the value.
+    * ``"slashes"`` or ``"brackets"``: plain letters wrapped in one pair of slashes or
+      square brackets (``/shi-vawn/``, ``[shi-vawn]``), the way phonetic spellings are
+      written. Slashes or brackets inside a respelling (``a/b``, ``ay [bee] see``,
+      ``[ay] bee [see]``) are fine.
+
+    Accented letters (é, ñ, ø, ł, ð) and the marks names use, such as the ʻokina in
+    *Hawaiʻi*, are fine.
     """
+    spoken = spoken.strip()
+    if _IPA.search(spoken):
+        return "IPA"
+    if "[[" in spoken:
+        return "markup"
+    if _wrapped(spoken, "/", "/"):
+        return "slashes"
+    if _wrapped(spoken, "[", "]"):
+        return "brackets"
+    return None
+
+
+def is_phonetic(spoken: str) -> bool:
+    """True if a right-hand side is a phonetic spelling (:func:`phonetic_notation`)."""
+    return phonetic_notation(spoken) is not None
+
+
+def _wrapped(text: str, opening: str, closing: str) -> bool:
+    """True if ``text`` is one ``opening … closing`` pair: ``[sic]``, not ``[ay] bee [see]``."""
+    inside = text[1:-1]
+    return (
+        len(text) >= 2
+        and text.startswith(opening)
+        and text.endswith(closing)
+        and opening not in inside
+        and closing not in inside
+    )
+
+
+def respelling(value: str) -> str:
+    """How a right-hand side is actually spoken: capitalised syllables are lowercased, and
+    apostrophe-like marks eSpeak would read out by name are plain apostrophes
+    (:func:`tomecast.marks.speakable`).
+
+    ``her-MY-oh-nee`` -> ``her-my-oh-nee``, ``ha-WAI-ʼee`` -> ``ha-wai-'ee``. Single capital
+    letters are left alone.
+    """
+    value = speakable(value)
     return _CAPITALS.sub(lambda m: m.group().lower() if m.group().isupper() else m.group(), value)
 
 
@@ -115,7 +198,11 @@ class Pronunciations:
         Where several entries match the same words (say a global ``alice`` and a book's
         ``Alice``), the last one in the list wins, so the book's own list beats the global
         one. A capitalised entry's ALL-CAPS form gives way to an entry written in capitals.
+
+        The text is matched, and comes back, with its apostrophe-like marks as apostrophes
+        (:func:`tomecast.marks.speakable`), the way the left sides are matched.
         """
+        text = speakable(text)
         if self._pattern is None:
             return text
 
@@ -144,7 +231,9 @@ class Pronunciations:
 
 
 def _normalise_key(text: str) -> str:
-    return " ".join(text.split())
+    """A left side or word as it is compared: spacing evened out, and apostrophe-like marks
+    as apostrophes."""
+    return speakable(" ".join(text.split()))
 
 
 def _literal(key: str) -> str:
@@ -152,34 +241,88 @@ def _literal(key: str) -> str:
     return re.escape(key).replace(r"\ ", r"\s+")
 
 
+def _lines(text: str) -> Iterator[tuple[int, Pronunciation | None]]:
+    """Each line of a list that isn't blank or a comment: its number, and its fix (``None``
+    for a line without an arrow and something on each side)."""
+    for number, raw in enumerate(text.splitlines(), start=1):
+        line = _COMMENT.sub("", raw).strip()
+        if line:
+            yield number, _fix_on(line)
+
+
+def _fix_on(line: str) -> Pronunciation | None:
+    """The fix on a line with its comment taken off, or None if it has no arrow with something
+    on each side."""
+    parts = _SEPARATOR.split(line, maxsplit=1)
+    if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
+        return None
+    return Pronunciation(parts[0].strip(), parts[1].strip())
+
+
+_SKIPPED = {
+    "IPA": "looks like IPA, and the voice can't use phonetic symbols",
+    "markup": "is eSpeak phoneme markup, which the voice can't use",
+    "slashes": "is in slashes, the way phonetic spellings are written",
+    "brackets": "is in brackets, the way phonetic spellings are written",
+}
+
+
 def parse(text: str, source: str = "pronunciations") -> tuple[Pronunciations, list[str]]:
     """Read a list from its text. Returns the fixes and a warning for every line skipped."""
     entries: list[Pronunciation] = []
     warnings: list[str] = []
-    for number, raw in enumerate(text.splitlines(), start=1):
-        line = _COMMENT.sub("", raw).strip()
-        if not line:
-            continue
-        parts = _SEPARATOR.split(line, maxsplit=1)
-        if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
+    for number, entry in _lines(text):
+        if entry is None:
             warnings.append(f"{source}, line {number}: expected 'written → say it as'")
             continue
-        written, spoken = parts[0].strip(), parts[1].strip()
-        if len(spoken) > 2 and spoken.startswith("/") and spoken.endswith("/"):
+        notation = phonetic_notation(entry.spoken)
+        if notation is not None:
+            leave_out = (
+                f"leave the {notation} out and " if notation in ("slashes", "brackets") else ""
+            )
             warnings.append(
-                f"{source}, line {number}: exact phonetic spellings in /slashes/ aren't "
-                f"supported (the voice engine can't take them); write a respelling for "
-                f"'{written}' instead, like her-my-oh-nee"
+                f"{source}, line {number}: '{entry.spoken}' {_SKIPPED[notation]}, so the line "
+                f"is skipped; {leave_out}write a respelling for '{entry.written}' instead, "
+                f"the way it sounds in plain letters, like shi-vawn"
             )
             continue
-        entries.append(Pronunciation(written, spoken))
+        entries.append(entry)
     return Pronunciations(tuple(entries)), warnings
+
+
+def phonetic_lines(text: str) -> tuple[Pronunciation, ...]:
+    """The fixes in a list's text that :func:`parse` skips because their right side is a
+    phonetic spelling, in list order. The window replaces one of these when its word is
+    given a respelling, so its warning goes away."""
+    return tuple(
+        entry for _, entry in _lines(text) if entry is not None and is_phonetic(entry.spoken)
+    )
+
+
+def without_phonetic(text: str, word: str) -> str:
+    """``text`` without the lines for ``word`` that :func:`parse` skips as phonetic spellings
+    (matched as :func:`matches` does). Every other line and comment is kept as it is."""
+
+    def phonetic_for_word(line: str) -> bool:
+        entry = _fix_on(_COMMENT.sub("", line.rstrip("\r\n")).strip())
+        return entry is not None and is_phonetic(entry.spoken) and matches(entry.written, word)
+
+    return "".join(line for line in text.splitlines(keepends=True) if not phonetic_for_word(line))
+
+
+def read_list(path: Path) -> str:
+    """A list file's text, without the byte-order mark some editors put at the start.
+
+    Raises:
+        OSError, UnicodeDecodeError: if it can't be read.
+    """
+    return path.read_text(encoding="utf-8-sig")
 
 
 def load(path: Path) -> tuple[Pronunciations, list[str]]:
     """Read a list file. A missing file is an empty list; an unreadable one is a warning."""
     try:
-        text = path.read_text(encoding="utf-8")
+        text = read_list(path)
     except FileNotFoundError:
         return Pronunciations(), []
     except (OSError, UnicodeDecodeError) as error:
@@ -201,7 +344,8 @@ def load_for_book(data_folder: Path, book: Path | None) -> tuple[Pronunciations,
 
 
 def same_written(written: str, other: str) -> bool:
-    """True if the left sides ``written`` and ``other`` are the same, apart from spacing."""
+    """True if the left sides ``written`` and ``other`` are the same, apart from spacing (and
+    apostrophe-like marks, which count as apostrophes)."""
     return _normalise_key(written) == _normalise_key(other)
 
 
@@ -236,7 +380,7 @@ def edit(text: str, written: str, spoken: str | None) -> str:
     newline = "\r\n" if "\r\n" in text else "\n"
     if text and not text.endswith(("\n", "\r")):
         text += newline
-    return f"{text}{_normalise_key(written)} → {spoken}{newline}"
+    return f"{text}{' '.join(written.split())} → {spoken}{newline}"
 
 
 def _left_side(line: str) -> str | None:

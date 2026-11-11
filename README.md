@@ -25,7 +25,7 @@ Then open **Tomecast** from your app launcher, or run `tomecast --help`. Run the
 | Alpine, NixOS, ARM computers | Not supported yet |
 | Windows and Mac | Windows is planned for 1.0. A Mac version isn't planned yet |
 
-The voice uses about 1.8 GB of memory while it works on the CPU, and Tomecast warns you if less than 2 GB is free.
+The voice uses about 1.8 GB of memory while it works on the CPU. `tomecast convert` and `tomecast scan` warn you if less than 2 GB is free; the window doesn't yet.
 
 ## Try it
 
@@ -71,7 +71,7 @@ The window never overwrites a file: it picks a free name ("book (2)").
 | `tomecast scan` | Checks this computer again: retries engine updates that failed here before (after installing a graphics driver, say), and measures how fast it voices on the CPU and the graphics card (`--no-gpu` skips the card) |
 | `tomecast desktop-entry install` | Adds Tomecast to your app launcher, if the installer couldn't (`uninstall` removes it) |
 
-`--format mp3` writes `book/01 - Chapter title.mp3`, `02 - …` and so on, for players and car stereos that don't know `.m4b`. Each file is tagged (album, author, track n/total, chapter title) and carries the cover. MP3 is 64 kbps mono, about 29 MB per hour, the same as the M4B. Like the M4B, it never overwrites without `--force`.
+`--format mp3` writes `book/01 - Chapter title.mp3`, `02 - …` and so on, for players and car stereos that don't know `.m4b`. Each file is tagged (album, author, track n/total, chapter title) and carries the cover. MP3 is 64 kbps mono, about 29 MB per hour, the same as the M4B. Like the M4B, it never overwrites without `--force`, not even something that appears there while the book is being made (another run's book, say): the command stops with an error instead, and keeps the voiced audio, so running it again with another `-o` is quick.
 
 If a conversion stops (you press Ctrl-C, or the computer crashes), run the same command again: it picks up where it left off.
 
@@ -123,7 +123,7 @@ New Zealand → noo zee-lund  # several words are fine
 
 - **Two places.** `~/.local/share/tomecast/pronunciations.txt` applies to every book. A file next to the book, named like the book with `.pronunciations.txt` (`Title.epub` → `Title.pronunciations.txt`), applies to that book only and wins where the two disagree.
 - **Whole words only.** `Ron` doesn't change *Ronald*. A fix written with a capital letter matches that spelling (and its ALL-CAPS form in headings), so `Mark` leaves *mark* alone.
-- **The "say it as" part is a respelling**, written the way an English reader would sound it out, not a phonetic alphabet. The voice engine can't take exact phonetic spellings, so an IPA value like `/ɡəˈlædriəl/` is skipped with a warning. Hyphens make each piece its own word, and capital letters are lowercased when spoken (they only help you read the line), so try each fix with `tomecast preview` and adjust.
+- **The "say it as" part is a respelling**, written the way an English reader would sound it out, not a phonetic alphabet. The voice engine can't take phonetic spellings (it would read the symbols out by name), so a line written in IPA is skipped with a note, and the window won't save one. That means IPA symbols, such as IPA letters (`ɡəˈlædriəl`), stress and length marks (`gal-ˈad-ree-el`) and the Greek letters IPA uses (`θ`), with or without slashes or brackets around them. It also means eSpeak's `[[…]]` markup, and plain letters in slashes or brackets (`[gal-AD-ree-el]`): leave those out. Accented letters, the ʻokina and the apostrophes of transliterated names are fine (`Zoë`, `Hawaiʻi`, `Qurʾān`), and apostrophe look-alikes such as ʼ count as apostrophes on both sides, so a fix for `Siobhan` also covers *Siobhanʼs*. Hyphens make each piece its own word, and capital letters are lowercased when spoken (they only help you read the line), so try each fix with `tomecast preview` and adjust.
 - A line it can't use is skipped with a note naming the line; the rest of the list still works.
 
 ## How it works

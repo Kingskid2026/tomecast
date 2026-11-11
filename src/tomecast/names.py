@@ -5,6 +5,11 @@ usual trouble, so before converting, :func:`find_names` lists the capitalised wo
 appear often and aren't ordinary English, with how many times. The user can then check how
 they sound (``tomecast preview``) and add fixes to a pronunciation list.
 
+Words are found the way the voice and the pronunciation lists see them, with apostrophe-like
+marks as apostrophes (:func:`tomecast.marks.speakable`), so a book that writes the
+possessive "Siobhan's" with U+02BC lists Siobhan once, not twice. Each name is shown as the
+book spells it (its commonest spelling).
+
 "Ordinary English" is a list of about 22,000 words made from public-domain books
 (``src/tomecast/data/common_words.txt``, built by ``scripts/make_wordlist.py``). A word is
 also skipped when the book itself uses it in lowercase ("table"), since then it's not a name.
@@ -21,6 +26,7 @@ from importlib import resources
 
 from tomecast.book import Book
 from tomecast.chunking import ABBREVIATIONS
+from tomecast.marks import speakable
 
 _WORD = re.compile(r"[^\W\d_]+(?:['\u2019][^\W\d_]+)*")
 _SENTENCE_END = ".!?…:"
@@ -67,13 +73,15 @@ def find_names(
     that already have a pronunciation fix. The most frequent come first.
     """
     ordinary = common if common is not None else common_words()
-    skipped = {word.lower() for word in skip}
+    skipped = {speakable(word).lower() for word in skip}
     capitalised: Counter[str] = Counter()
     mid_sentence: Counter[str] = Counter()
     lowercase: set[str] = set()
+    spellings: dict[str, Counter[str]] = {}  # each word as the book writes it
 
     for paragraph in paragraphs:
-        for match in _WORD.finditer(paragraph):
+        spoken = speakable(paragraph)  # as long as the paragraph, so the offsets carry over
+        for match in _WORD.finditer(spoken):
             word = _SUFFIX.sub("", match.group())
             if not word:
                 continue
@@ -83,11 +91,14 @@ def find_names(
             if len(word) < 2 or word.isupper():
                 continue  # "I", "A", and ALL-CAPS headings or acronyms
             capitalised[word] += 1
-            if not _starts_sentence(paragraph, match.start()):
+            spellings.setdefault(word, Counter())[
+                paragraph[match.start() : match.start() + len(word)]
+            ] += 1
+            if not _starts_sentence(spoken, match.start()):
                 mid_sentence[word] += 1
 
     names = [
-        Name(word, count)
+        Name(spellings[word].most_common(1)[0][0], count)
         for word, count in capitalised.items()
         if count >= min_count
         and mid_sentence[word] > 0  # a word only ever seen after a full stop is just a word

@@ -4,7 +4,8 @@ A PDF has no paragraphs or chapters, only characters placed on pages. This reade
 the book from where the characters are:
 
 1. **Characters → segments:** characters drawn one after another on the same baseline, close
-   together. A wide gap (a column gutter) starts a new segment.
+   together. A wide gap (a column gutter) starts a new segment. A ligature glyph (ﬁ, ﬄ) is one
+   character holding all its letters, so it never cuts its word in two.
 2. **Bands:** a short line on its own at the very top or bottom of a page (a running header,
    a footer, a page number) is kept apart, so cleanup can decide whether it's page furniture.
 3. **Columns:** if the page's narrow segments leave a clear vertical gap down the middle, the
@@ -86,6 +87,10 @@ OUTLINE_LEVELS = 2  # bookmark levels used as chapters (chapters, and sections i
 _HYPHEN_CODES = {0x02, 0xFFFE}  # PDFium's marks for a hyphen at the end of a line
 _SKIPPED_CODES = {0x00, 0xFFFF}
 _LIGATURES = range(0xFB00, 0xFB07)
+# Private-use code points mean nothing outside their font, so they're skipped, except the
+# ones old Windows fonts gave the fi and fl ligatures (Microsoft's WGL4 character set listed
+# U+F001 and U+F002 as second codes for them), which PDFs made with those fonts still use.
+_PRIVATE_LIGATURES = {0xF001: "fi", 0xF002: "fl"}
 _MARKER_TEXT = re.compile(r"^(?:[0-9*\u2020\u2021\u00a7\u00b6\u2016#,]+|[a-z])$")
 _NOTE_START = re.compile(
     rf"^\s*(?:{MARKER_START}|(?:\d{{1,3}}|[*\u2020\u2021\u00a7\u00b6]+)[.)]?\s)"
@@ -186,7 +191,14 @@ class _Char:
 
 
 def _page_chars(textpage: Any) -> tuple[list[_Char], int]:
-    """The page's characters in drawing order, and how many were set sideways (skipped)."""
+    """The page's characters in drawing order, and how many were set sideways (skipped).
+
+    A glyph that stands for several characters stays one character with all of them, so a
+    ligature never splits its word. PDFium hands such a glyph (ﬁ, ﬄ, or one its font maps to
+    "fi" or "...") over as one character per code point, each with the whole glyph's box and
+    origin: the "i" of "ﬁ" then seems to start back where the "f" did, an overlap of half an
+    em or more, which would start a new segment, and a space ("f inite").
+    """
     chars: list[_Char] = []
     sideways = 0
     count = textpage.count_chars()
@@ -195,10 +207,13 @@ def _page_chars(textpage: Any) -> tuple[list[_Char], int]:
     origin_x, origin_y = ctypes.c_double(), ctypes.c_double()
     matrix = pdfium_c.FS_MATRIX()
     space = False
+    kept = -1  # PDFium's index of the last character kept
+    place: tuple[float, ...] = ()  # and where its glyph is: origin and box
     for index in range(count):
         code = int(pdfium_c.FPDFText_GetUnicode(textpage, index))
+        private = 0xE000 <= code <= 0xF8FF and code not in _PRIVATE_LIGATURES
         # PDFium's line breaks say nothing about spaces: lines are rebuilt from positions.
-        if code in (0x0D, 0x0A) or code in _SKIPPED_CODES or 0xE000 <= code <= 0xF8FF:
+        if code in (0x0D, 0x0A) or code in _SKIPPED_CODES or private:
             continue
         if code in (0x20, 0x09, 0xA0) or (code < 0x20 and code not in _HYPHEN_CODES):
             space = True
@@ -214,6 +229,12 @@ def _page_chars(textpage: Any) -> tuple[list[_Char], int]:
         if not pdfium_c.FPDFText_GetCharBox(textpage, index, left, right, bottom, top):
             continue
         pdfium_c.FPDFText_GetCharOrigin(textpage, index, origin_x, origin_y)
+        here = (origin_x.value, origin_y.value, left.value, right.value, bottom.value, top.value)
+        if index == kept + 1 and _same_glyph(here, place):
+            chars[-1].text += text  # more of the same glyph: the next letter of a ligature
+            kept = index
+            continue
+        kept, place = index, here
         size = float(pdfium_c.FPDFText_GetFontSize(textpage, index))
         if pdfium_c.FPDFText_GetMatrix(textpage, index, matrix):
             size *= math.sqrt(abs(matrix.a * matrix.d - matrix.b * matrix.c)) or 1.0
@@ -224,12 +245,29 @@ def _page_chars(textpage: Any) -> tuple[list[_Char], int]:
     return chars, sideways
 
 
+def _same_glyph(here: Sequence[float], place: Sequence[float]) -> bool:
+    """Whether two characters share one glyph: the same origin and the same box.
+
+    That is how PDFium gives the pieces of a glyph that stands for several characters (a
+    ligature, an Ö mapped to O and a combining diaeresis). Two glyphs drawn one after another
+    rarely match: most move the pen on by their width, and a mark that doesn't has a box of
+    its own. Some do: zero-width glyphs with the same box, stacked marks, an exact overstrike.
+    Taking those as one character is harmless too, since it keeps every code point once and
+    in order, and only drops the space their overlap would have put between them.
+    """
+    return len(here) == len(place) and all(
+        abs(a - b) < 0.01 for a, b in zip(here, place, strict=True)
+    )
+
+
 def _character(code: int) -> str:
     try:
         text = chr(code)
     except (ValueError, OverflowError):
         return ""
-    if code in _LIGATURES:
+    if code in _PRIVATE_LIGATURES:
+        return _PRIVATE_LIGATURES[code]
+    if code in _LIGATURES:  # ﬀ ﬁ ﬂ ﬃ ﬄ ﬅ ﬆ, if PDFium leaves one whole: its letters
         return unicodedata.normalize("NFKC", text)
     if unicodedata.category(text) in ("Cc", "Cs", "Co", "Cn"):
         return ""
