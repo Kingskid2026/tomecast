@@ -4,8 +4,9 @@
 #   curl -fsSL https://raw.githubusercontent.com/Kingskid2026/tomecast/main/install.sh | sh
 #
 # What this does (no sudo, everything stays in your home folder):
-#   1. Installs uv, the Python tool manager, into ~/.local/bin if you don't have it.
-#      uv adds ~/.local/bin to your PATH in your shell's startup file.
+#   1. Installs uv, the Python tool manager, into ~/.local/bin if you don't have it (or
+#      where you've asked for it: UV_INSTALL_DIR, XDG_BIN_HOME or XDG_DATA_HOME/../bin).
+#      uv adds that folder to your PATH in your shell's startup file.
 #   2. Uses uv to install Tomecast from PyPI. uv downloads a suitable Python if needed.
 #   3. Runs `tomecast --version` to check that it worked, and makes sure the `tomecast`
 #      command will be on your PATH in new terminals.
@@ -37,14 +38,27 @@ download() {
     fi
 }
 
+# Where uv's installer put uv: in the first of these folders that is set (its --help lists
+# them; UV_UNMANAGED_INSTALL and CARGO_DIST_FORCE_INSTALL_DIR are other names for the first).
+installed_uv() {
+    for dir in "${UV_INSTALL_DIR:-}" "${CARGO_DIST_FORCE_INSTALL_DIR:-}" \
+        "${UV_UNMANAGED_INSTALL:-}" "${XDG_BIN_HOME:-}" "${XDG_DATA_HOME:+$XDG_DATA_HOME/../bin}" \
+        "$HOME/.local/bin"; do
+        if [ -n "$dir" ] && [ -x "$dir/uv" ]; then
+            printf '%s\n' "$dir/uv"
+            return 0
+        fi
+    done
+    return 1
+}
+
 if command -v uv >/dev/null 2>&1; then
     UV="uv"
     say "using the uv already on your system ($(uv --version))"
 else
-    say "installing uv $UV_VERSION (the tool Tomecast uses to manage Python) into ~/.local/bin"
+    say "installing uv $UV_VERSION (the tool Tomecast uses to manage Python)"
     download "https://astral.sh/uv/$UV_VERSION/install.sh" | sh
-    UV="$HOME/.local/bin/uv"
-    [ -x "$UV" ] || fail "uv did not install correctly. See https://docs.astral.sh/uv/ for help."
+    UV="$(installed_uv)" || fail "uv did not install correctly. See https://docs.astral.sh/uv/ for help."
 fi
 
 # uv remembers PyPI's package list for a few minutes; these flags ask again for Tomecast only,
