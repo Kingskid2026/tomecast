@@ -321,6 +321,7 @@ class Backend(QObject):
     tryPlayingChanged = Signal()
 
     downloadNoteChanged = Signal()
+    premiumNoteChanged = Signal()
     stageChanged = Signal()
     downloadLabelChanged = Signal()
     chunksDoneChanged = Signal()
@@ -432,6 +433,8 @@ class Backend(QObject):
         self._previewText = ""
         self._previewPlaying = False
         self._downloadNote = ""
+        self._premiumNote = ""
+        self._refresh_premium_note()
         # Names
         self._names: list[dict[str, Any]] = []
         self._nameFixes: dict[str, str] = {}
@@ -561,6 +564,7 @@ class Backend(QObject):
     previewText: str = _field(str, "previewText", previewTextChanged)
     previewPlaying: bool = _field(bool, "previewPlaying", previewPlayingChanged)
     downloadNote: str = _field(str, "downloadNote", downloadNoteChanged)
+    premiumNote: str = _field(str, "premiumNote", premiumNoteChanged)
 
     def _get_preview_available(self) -> bool:
         return self._player is not None
@@ -1148,12 +1152,34 @@ class Backend(QObject):
             self._refresh_download_note()
         self._update("screen", screen)
 
+    def _refresh_premium_note(self) -> None:
+        """The muted line under the premium voices (``""`` while they aren't listed): what
+        choosing one downloads, if anything, that they need the graphics card, and that
+        they're a preview while no spoken-text check is plugged in."""
+        if not self._using_gpu:
+            self._update("premiumNote", "")
+            return
+        parts = ["PREMIUM VOICES"]
+        missing = [
+            asset
+            for asset in self._assets_for(ming.DEFAULT_VOICE, True)
+            if self._needs_download(asset)
+        ]
+        if missing:
+            size = sum(asset.size for asset in missing) / 1e9
+            parts.append(f"{size:.1f} GB DOWNLOAD")
+        parts.append("NEED A GRAPHICS CARD")
+        if ming.UNCHECKED_NOTE:
+            parts.append("PREVIEW")
+        self._update("premiumNote", " · ".join(parts))
+
     def _refresh_download_note(self) -> None:
         """Say what Start will download: nothing when every required file is installed."""
         assets = self._assets_for(self._voice, self._using_gpu)
         missing = [a for a in assets if self._needs_download(a)]
         if not missing:
             self._update("downloadNote", "")
+            self._refresh_premium_note()
             return
         mb = math.ceil(sum(asset.size for asset in missing) / 1_000_000)
         updates = all(a.archive and build_in_use(a, self._data_root) is not None for a in missing)
@@ -1161,6 +1187,7 @@ class Backend(QObject):
         if any(asset.opt_in for asset in missing):
             note = PREMIUM_DOWNLOAD_NOTE
         self._update("downloadNote", note.format(mb=f"{mb:,}"))
+        self._refresh_premium_note()
 
     def _needs_download(self, asset: Asset) -> bool:
         """``needs_download`` without hashing anything: this runs on the GUI thread, and a

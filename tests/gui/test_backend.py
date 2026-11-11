@@ -58,11 +58,13 @@ from tomecast.gui.worker import BookRead, SelfCheckFor, TimedControl, preview_fi
 from tomecast.hardware import GpuDevice, short_name
 from tomecast.manifest import MING_Q8
 from tomecast.names import Name
+from tomecast.readers import read_book
 from tomecast.speed import Speeds
 from tomecast.textprep import TextPrep
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # for epub_factory, pdf_factory
 from epub_factory import NavPoint, Page, build_epub, tiny_png
+from fake_engine import write_fake_server
 from format_factory import book_in_format
 from machine_factory import ON_BATTERY, PLUGGED_IN, pin_machine
 from pdf_factory import SAMPLE_CHAPTERS, build_sample_book, plain
@@ -3080,8 +3082,10 @@ def test_the_download_note_says_when_start_downloads_the_premium_voice(
     _open(qtbot, backend, _short_book(tmp_path))
     backend.goTo("voice")
     assert backend.downloadNote == _note_for(GPU_DOWNLOADS)
-    backend.setVoice("UK_George")  # the engine build and Ming; no eSpeak or Kokoro
-    mb = math.ceil((AUDIOCPP_VULKAN.size + MING_Q8.size) / 1_000_000)
+    # The engine build and Ming, and Kokoro's files for when the card fails (nothing is
+    # installed here, so they're missing too).
+    backend.setVoice("UK_George")
+    mb = math.ceil(sum(a.size for a in (*GPU_DOWNLOADS, MING_Q8)) / 1_000_000)
     assert backend.downloadNote == (
         f"STARTING DOWNLOADS THE PREMIUM VOICE ONCE · {mb:,} MB · NEEDS A GRAPHICS CARD"
     )
@@ -3098,3 +3102,78 @@ def test_a_premium_voice_converts_with_ming_and_says_it_is_a_preview(
     assert backend.screen == "done"
     assert [engine.voice for engine in engines.made] == ["UK_Charlotte"]
     assert ming.UNCHECKED_NOTE in backend.warnings
+
+
+def test_the_premium_note_says_what_they_need_while_they_are_listed(
+    make_backend: MakeBackend,
+) -> None:
+    assert make_backend(gpu=False).premiumNote == ""
+    backend = make_backend(gpu=True)  # nothing to download (the test's files are "installed")
+    assert backend.premiumNote == "PREMIUM VOICES · NEED A GRAPHICS CARD · PREVIEW"
+    backend.setUseGpu(False)
+    assert backend.premiumNote == ""
+
+
+def test_the_premium_note_gives_the_download_size(make_backend: MakeBackend) -> None:
+    backend = make_backend(gpu=True, assets=None)  # nothing installed yet
+    # The engine, Ming, and Kokoro's files for when the card fails: about 2 GB in all here.
+    size = sum(a.size for a in (AUDIOCPP_VULKAN, MING_Q8, ESPEAK_NG, KOKORO_Q8)) / 1e9
+    assert backend.premiumNote == (
+        f"PREMIUM VOICES · {size:.1f} GB DOWNLOAD · NEED A GRAPHICS CARD · PREVIEW"
+    )
+
+
+_ONE_CARD = json.dumps(
+    {"devices": [{"backend": "vulkan", "index": 0, "name": "Vulkan0", "type": "gpu",
+                  "description": "NVIDIA RTX PRO 1000 Blackwell Generation Laptop GPU",
+                  "memory": {"free_bytes": 7_000_000_000, "total_bytes": 8_000_000_000}}]}
+)  # fmt: skip
+
+
+def test_when_the_card_fails_kokoro_finishes_the_book_and_the_window_says_so(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real AutoMing, on the fake engine: Ming runs out of graphics memory on the first
+    piece of chapter 2, and Kokoro's George finishes the book on the card."""
+    monkeypatch.setenv("FAKE_LOG", str(tmp_path / "fake.log"))
+    monkeypatch.setenv("FAKE_DEVICES", _ONE_CARD)
+    monkeypatch.setenv("FAKE_ONLY_MODEL", "ming")
+    server = write_fake_server(tmp_path / "audiocpp_server")
+    made: list[ming.AutoMing] = []
+
+    def engines(root: Path, voice: str, speed: float, use_gpu: bool) -> ming.AutoMing:
+        engine = ming.AutoMing(
+            root, voice=voice, speed=speed, use_gpu=use_gpu, executable=server, startup_timeout=20
+        )
+        made.append(engine)
+        return engine
+
+    book = _short_book(tmp_path)
+    pieces = [c for chunks in plan_chunks(read_book(book), ming.MAX_CHARS) for c in chunks]
+    first_of_two = next(i for i, c in enumerate(pieces) if c.chapter != pieces[0].chapter)
+    monkeypatch.setenv("FAKE_OOM_VULKAN_AFTER", str(first_of_two))
+    backend = make_backend(engines, gpu=True)
+    _open(qtbot, backend, book)
+    backend.setVoice("UK_George")
+    _convert(qtbot, backend)
+
+    assert backend.screen == "done"
+    note = (
+        "The graphics card stopped working, so the rest of this book uses Kokoro's George "
+        "(similar British voice). Chapter 1 is in the premium voice."
+    )
+    assert note in backend.warnings
+    assert backend.errorMessage == ""  # shown in the banner while it was made, then listed
+    (engine,) = made
+    assert engine.switched_to == "bm_george"
+    assert backend.gpuName  # Kokoro carried on on the card, and the window says the card
+    events = [json.loads(line) for line in (tmp_path / "fake.log").read_text().splitlines()]
+    voiced = [e for e in events if e["event"] == "voiced"]
+    models = [e["model"] for e in voiced]
+    assert models == ["ming"] * first_of_two + ["kokoro"] * (len(models) - first_of_two)
+    # Each piece voiced once (the window voices the text as prepared, so count rather than
+    # compare it), and the piece the card refused was voiced again by Kokoro.
+    texts = [e["body"]["input"] for e in voiced]
+    assert len(texts) == len(set(texts)) == sum(1 for c in pieces if c.speakable)
+    (refused,) = [e for e in events if e["event"] == "out of memory"]
+    assert refused["body"]["input"] == texts[first_of_two]

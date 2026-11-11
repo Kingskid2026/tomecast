@@ -55,6 +55,7 @@ class FakeKokoro:
         self.max_chars = 200
         self.sample_rate = 24000
         self.use_gpu = use_gpu
+        self.backend = "vulkan" if use_gpu else "cpu"
         self.warning: str | None = None
         self.fell_back = False
         self.out_of_memory = False
@@ -74,6 +75,7 @@ class FakeKokoro:
         if self.use_gpu and FakeKokoro.gpu_warning:
             self.warning = FakeKokoro.gpu_warning
             self.fell_back = True
+            self.backend = "cpu"
         elif self.use_gpu:
             self.gpu_description = FakeKokoro.gpu_description
         return self
@@ -92,7 +94,7 @@ class FakeKokoro:
         if self.use_gpu and not self.fell_back and FakeKokoro.oom_at == self.calls:
             self.warning = audiocpp.RAN_OUT_OF_MEMORY_NOTE  # and it carries on on the CPU
             self.fell_back = self.out_of_memory = True
-            self.gpu_description = ""
+            self.gpu_description, self.backend = "", "cpu"
         if self.fail_with:
             raise EngineError(self.fail_with)
         if FakeKokoro.fail_after is not None and FakeKokoro.voiced >= FakeKokoro.fail_after:
@@ -117,6 +119,7 @@ def no_real_engine(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(audiocpp, "required_assets", lambda use_gpu: ())
     monkeypatch.setattr(cli, "engine_speed", lambda root, engine, measuring=None: None)
     monkeypatch.setattr(cli, "known_cpu_speed", lambda root, engine: None)
+    monkeypatch.setattr(cli, "known_card_speed", lambda root, engine: None)
     monkeypatch.setattr(cli, "vulkan_possible", lambda: False)
     monkeypatch.setattr(cli, "data_dir", lambda: tmp_path / "data")
     FakeKokoro.fail_with = None

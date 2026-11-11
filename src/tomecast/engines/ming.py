@@ -24,31 +24,68 @@ Facts this module relies on, checked against audio.cpp v0.9.4 (``local/ming-test
   by :func:`~tomecast.convert.audio_problem`. So every chunk goes through a spoken-text
   check (:data:`SpokenCheck`, the hook a speech-recognition check plugs into), and a chunk
   that fails is voiced again in smaller pieces, each checked again.
+
+**If the graphics card fails** (it runs out of memory, the device is lost, or the engine
+build won't run on it, as the book starts or partway), :class:`AutoMing` does what
+:data:`CardPolicy` says, chosen by the user (``--if-card-fails``; the window always uses the
+default):
+
+* ``"kokoro"`` (the default): say so, and voice the rest of the book with the Kokoro voice
+  closest to the premium one by accent and gender (:data:`KOKORO_MATCH`), at the same speed,
+  on the card if Kokoro works there and else on the CPU. The pieces Ming already voiced are
+  kept, and each remaining one is voiced once, by Kokoro;
+* ``"cpu"``: carry on with Ming on the CPU, much slower;
+* ``"stop"``: stop (:class:`CardStopped`), keeping every finished piece, so the same book
+  resumes on a working card.
+
+None of these counts against the engine build: no rollback, no "keeps crashing". An error
+the engine *answers* with (an HTTP error about the text), and the spoken-text check failing,
+aren't the card failing: they fail the piece as before.
 """
 
 from __future__ import annotations
 
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import Literal
 
 from tomecast.audio import concatenate_wavs
-from tomecast.chunking import split_long
+from tomecast.chunking import Chunk, split_long
 from tomecast.downloads import Asset, IsCancelled, VoiceCheck, local_path
+from tomecast.engines import audiocpp
 from tomecast.engines.audiocpp import (
     MIN_SPEED,
+    RAN_OUT_OF_MEMORY_NOTE,
     AutoKokoro,
+    EngineCrashed,
     EngineError,
+    GpuUnavailable,
     KokoroServer,
     engine_asset,
     self_check,
 )
 from tomecast.manifest import AUDIOCPP_MING_FLOW_STEPS, MING_Q8
 
-# Ming's built-in voices. Which one is the default isn't decided yet (issue #11): UK_George
-# is the provisional choice, because upstream labels it "audiobooks" (US_Emma: "narration").
+# Ming's built-in voices. The default is UK_George, which upstream labels "audiobooks"
+# (US_Emma: "narration"); the maintainer chose it (issue #11).
 VOICES = ("UK_George", "US_Emma", "UK_Charlotte", "US_James")
 DEFAULT_VOICE = "UK_George"
+
+# The Kokoro voice that takes over from each premium voice when the graphics card fails: the
+# same accent and gender, and then Kokoro's best-rated voice of that kind (the first of its
+# group in the window's voice list). (Kokoro voice, its name, its accent.)
+KOKORO_MATCH: dict[str, tuple[str, str, str]] = {
+    "UK_George": ("bm_george", "George", "British"),  # British male: the same name, too
+    "UK_Charlotte": ("bf_emma", "Emma", "British"),  # British female
+    "US_Emma": ("af_heart", "Heart", "American"),  # American female (Kokoro's default)
+    "US_James": ("am_michael", "Michael", "American"),  # American male
+}
+
+# What to do when the graphics card fails under the premium voice (see the module's docs).
+CardPolicy = Literal["kokoro", "cpu", "stop"]
+CARD_POLICIES: tuple[CardPolicy, ...] = ("kokoro", "cpu", "stop")
+DEFAULT_CARD_POLICY: CardPolicy = "kokoro"
 # Primary language subtags Ming speaks. The request names one of them.
 LANGUAGES = frozenset({"en", "zh", "de", "es", "fr", "ko", "ja"})
 
@@ -77,6 +114,77 @@ UNCHECKED_NOTE = (
     "The premium voice is a preview: it sometimes leaves out a few words, and Tomecast doesn't "
     "check it for that yet."
 )
+
+
+CPU_NOTE = (
+    "The graphics card stopped working, so Tomecast carried on with the premium voice on the "
+    "CPU, which is much slower: the time left is measured again from here."
+)
+STOPPED_NOTE = "The graphics card stopped working, so Tomecast stopped."
+
+
+class WordsLeftOut(EngineError):
+    """The spoken-text check still heard words missing after re-splitting: the piece fails
+    (it isn't the graphics card failing)."""
+
+
+class CardStopped(Exception):
+    """The graphics card failed under the premium voice and the user chose ``"stop"``. Not a
+    :class:`RuntimeError`, so a conversion doesn't retry the piece: it stops at once, keeping
+    the pieces already made, and it never counts against the engine build."""
+
+
+def switch_note(premium: str, *, chapters_done: int | None = 0, partway: bool = False) -> str:
+    """The sentence for the user when Kokoro takes over from the premium voice ``premium``:
+    which Kokoro voice, and which chapters are in the premium voice. ``chapters_done`` is how
+    many of the audiobook's chapters were finished before the switch (``None``: not known, so
+    nothing is said about them), ``partway`` whether it came in the middle of the next one.
+    Before anything was voiced, it says so instead."""
+    _kokoro, name, accent = KOKORO_MATCH[premium]
+    voice = f"Kokoro's {name} (similar {accent} voice)"
+    if chapters_done == 0 and not partway:
+        return (
+            f"The graphics card didn't work, so this book uses {voice} instead of the premium "
+            "voice."
+        )
+    said = f"The graphics card stopped working, so the rest of this book uses {voice}."
+    if chapters_done is None:
+        return said
+    if chapters_done == 0:
+        return f"{said} The start of chapter 1 is in the premium voice."
+    whole = "Chapter 1" if chapters_done == 1 else f"Chapters 1\u2013{chapters_done}"
+    if partway:
+        start = f"the start of chapter {chapters_done + 1}"
+        return f"{said} {whole} and {start} are in the premium voice."
+    return f"{said} {whole} {'is' if chapters_done == 1 else 'are'} in the premium voice."
+
+
+class BookPosition:
+    """Which chapter a conversion is in, for :func:`switch_note`: given the pieces it will go
+    through, in order, and told after each one how many are done (as progress reports say),
+    it knows where the piece being voiced now is. Chapters are counted as the audiobook has
+    them: those with something to say, in order."""
+
+    def __init__(self, chunks: Sequence[Chunk]) -> None:
+        self._chapter_of: list[int] = []  # each piece's chapter, as the audiobook counts them
+        self._first: set[int] = set()  # the pieces that start a chapter
+        previous: int | None = None
+        for index, chunk in enumerate(chunks):
+            if chunk.chapter != previous:
+                self._first.add(index)
+                previous = chunk.chapter
+            self._chapter_of.append(len(self._first) - 1)
+        self.done = 0
+
+    def update(self, chunks_done: int) -> None:
+        self.done = chunks_done
+
+    def where(self) -> tuple[int, bool]:
+        """(chapters finished before the piece being voiced now, whether that piece is
+        partway into its chapter)."""
+        if self.done >= len(self._chapter_of):
+            return len(self._first), False
+        return self._chapter_of[self.done], self.done not in self._first
 
 
 def is_ming_voice(voice: str) -> bool:
@@ -121,7 +229,6 @@ class MingServer(KokoroServer):
     """
 
     MODEL_ID = MODEL_ID
-    default_voice = DEFAULT_VOICE  # what the speed test voices with
 
     def __init__(
         self,
@@ -141,8 +248,17 @@ class MingServer(KokoroServer):
             raise EngineError(f"the premium voice doesn't speak {language!r}")
         super().__init__(root, speed=_checked_speed(speed), **kwargs)  # type: ignore[arg-type]
         self.voice = voice  # after Kokoro's set-up, which only knows Kokoro's voices
+        self.premium_voice = voice  # kept when Kokoro takes over (AutoMing)
         self.language = language
         self.verify = verify
+        # Set once Kokoro has taken over from the premium voice (the graphics card failed):
+        # from then on this server runs Kokoro, with this voice, as KokoroServer does.
+        self.switched_to: str | None = None
+
+    @property
+    def default_voice(self) -> str:
+        """What the speed test voices with: this engine's own default."""
+        return DEFAULT_VOICE if self.switched_to is None else audiocpp.DEFAULT_VOICE
 
     @property
     def speed(self) -> float:
@@ -165,23 +281,33 @@ class MingServer(KokoroServer):
 
     @property
     def label(self) -> str:
+        """How the narrator is credited: both voices once Kokoro has taken over."""
+        if self.switched_to is not None:
+            return f"Ming ({self.premium_voice}) and Kokoro ({self.switched_to})"
         return f"Ming ({self.voice})"
 
     @property
     def max_chars(self) -> int:
-        return MAX_CHARS
+        return MAX_CHARS  # Kokoro's cap too, so a takeover never changes how text is split
 
     @property
     def sample_rate(self) -> int:
-        return SAMPLE_RATE
+        """44.1 kHz; Kokoro's 24 kHz once it has taken over (the packager makes them one)."""
+        return SAMPLE_RATE if self.switched_to is None else audiocpp.SAMPLE_RATE
 
     @property
     def builds(self) -> dict[str, Path]:
-        """The engine build this runs, by slot. Ming uses no eSpeak."""
+        """The engine build this runs, by slot. Ming uses no eSpeak; Kokoro does."""
+        if self.switched_to is not None:
+            return super().builds
         return {self._build.slot: self.executable.parent}
 
     def synthesize(self, text: str, output: Path) -> None:
-        """Voice ``text`` into ``output`` (44.1 kHz mono 16-bit WAV), checked by ``verify``."""
+        """Voice ``text`` into ``output`` (44.1 kHz mono 16-bit WAV), checked by ``verify``.
+        Once Kokoro has taken over, Kokoro voices it (24 kHz), unchecked: it doesn't skip."""
+        if self.switched_to is not None:
+            super().synthesize(text, output)
+            return
         self._synthesize_checked(text, output, depth=0)
 
     def _synthesize_checked(self, text: str, output: Path, *, depth: int) -> None:
@@ -194,7 +320,7 @@ class MingServer(KokoroServer):
         # The same text skips the same words again, so a retry has to change the text: voice
         # it in smaller pieces, each checked, and join them.
         if depth >= MAX_SPLIT_DEPTH or len(text) < MIN_SPLIT_CHARS:
-            raise EngineError(f"the premium voice left out words ({problem}): {text[:80]!r}")
+            raise WordsLeftOut(f"the premium voice left out words ({problem}): {text[:80]!r}")
         parts = split_long(text, max(1, len(text) // 2))
         with tempfile.TemporaryDirectory(dir=output.parent, prefix=".checked-") as folder:
             wavs = []
@@ -205,6 +331,8 @@ class MingServer(KokoroServer):
             concatenate_wavs(wavs, output, gap_seconds=0.05)
 
     def _request_body(self, text: str) -> dict[str, object]:
+        if self.switched_to is not None:
+            return super()._request_body(text)
         return {
             "model": MODEL_ID,
             "input": text,
@@ -219,6 +347,8 @@ class MingServer(KokoroServer):
 
     def _server_config(self, port: int) -> dict[str, object]:
         config = super()._server_config(port)
+        if self.switched_to is not None:
+            return config
         config["models"] = [
             {
                 "id": MODEL_ID,
@@ -232,22 +362,131 @@ class MingServer(KokoroServer):
 
     def _environment(self, private_dir: Path) -> dict[str, str]:
         environment = super()._environment(private_dir)
+        if self.switched_to is not None:
+            return environment
         environment.pop("AUDIOCPP_ESPEAK_LIBRARY", None)
         environment.pop("AUDIOCPP_ESPEAK_DATA", None)
         return {**environment, **flow_settings()}
 
 
 class AutoMing(MingServer, AutoKokoro):
-    """Ming that picks its own hardware exactly as :class:`AutoKokoro` does: the best graphics
-    card, else the CPU backend of the same build (with :attr:`warning` set), and whatever
-    else AutoKokoro learns (running out of graphics memory, #49) comes with it."""
+    """Ming that picks its own hardware as :class:`AutoKokoro` does (the best graphics card),
+    and does what ``if_card_fails`` says if the card fails, as it starts or partway: Kokoro
+    takes over (the default), Ming carries on on the CPU, or it stops (see the module's docs).
 
-    def __init__(self, root: Path, *, use_gpu: bool = True, **kwargs: object) -> None:
+    ``where`` tells it which chapter the book is in (:meth:`BookPosition.where`), so the note
+    can say which chapters are in the premium voice. After a takeover or a move to the CPU,
+    :attr:`warning` says what happened, :attr:`fell_back` is True (the run proves nothing
+    about the build) and so is :attr:`out_of_memory` (whatever failed afterwards is never
+    blamed on the build, as after #49), and :attr:`switched_to` is the Kokoro voice in use.
+    """
+
+    def __init__(
+        self,
+        root: Path,
+        *,
+        use_gpu: bool = True,
+        if_card_fails: CardPolicy = DEFAULT_CARD_POLICY,
+        **kwargs: object,
+    ) -> None:
         super().__init__(root, use_gpu=use_gpu, **kwargs)  # type: ignore[arg-type]
+        self.if_card_fails: CardPolicy = if_card_fails
+        self.where: Callable[[], tuple[int, bool]] | None = None
+        self._takeover_failed: EngineError | None = None
 
     def __enter__(self) -> AutoMing:
         self.start()
         return self
+
+    def start(self) -> None:
+        if self._process is not None:
+            return
+        if self.switched_to is not None:
+            self._start_kokoro()  # a later start of the same book's engine: still Kokoro
+            return
+        super().start()
+
+    def synthesize(self, text: str, output: Path) -> None:
+        if self.switched_to is not None or self.backend != "vulkan":
+            if self._takeover_failed is not None:
+                raise self._takeover_failed
+            super().synthesize(text, output)
+            return
+        try:
+            super().synthesize(text, output)
+            return
+        except _CardFailed as failure:  # out of memory (see _carry_on_on_cpu)
+            reason = str(failure)
+        except (GpuUnavailable, EngineCrashed) as error:  # the engine died or hung on the card
+            reason = str(error)
+        self._card_failed(reason, at_start=False)
+        self.synthesize(text, output)  # the same piece again, once, on what runs now
+
+    def _use_cpu(self, note: str) -> None:
+        """As the book starts, the card didn't work (AutoKokoro would use the CPU)."""
+        if self.switched_to is not None or self.if_card_fails == "cpu":
+            super()._use_cpu(note)
+            return
+        self._card_failed(note, at_start=True)
+
+    def _carry_on_on_cpu(self) -> None:
+        """Partway, the card ran out of memory (AutoKokoro would carry on on the CPU)."""
+        if self.switched_to is not None or self.if_card_fails == "cpu":
+            super()._carry_on_on_cpu()
+            return
+        raise _CardFailed(RAN_OUT_OF_MEMORY_NOTE)
+
+    def _card_failed(self, reason: str, *, at_start: bool) -> None:
+        if self.if_card_fails == "stop":
+            self._stop_process()
+            raise CardStopped(STOPPED_NOTE)
+        if self.if_card_fails == "cpu":
+            self._ming_on_cpu()
+            return
+        if at_start:  # nothing voiced yet in this run
+            note = switch_note(self.premium_voice)
+        elif self.where is None:  # partway, but where in the book isn't known
+            note = switch_note(self.premium_voice, chapters_done=None)
+        else:
+            done, partway = self.where()
+            note = switch_note(self.premium_voice, chapters_done=done, partway=partway)
+        self.switched_to = KOKORO_MATCH[self.premium_voice][0]
+        self.voice = self.switched_to
+        self.MODEL_ID = KokoroServer.MODEL_ID
+        self.close()  # Ming's server and its temporary files: one model at a time
+        try:
+            self._start_kokoro()
+        except EngineError as error:
+            self._takeover_failed = EngineError(
+                f"the graphics card stopped working, and Kokoro couldn't take over: {error}"
+            )
+            raise self._takeover_failed from error
+        finally:
+            self.warning, self.fell_back, self.out_of_memory = note, True, True
+
+    def _start_kokoro(self) -> None:
+        """Kokoro, wherever Kokoro runs: the card if it works, else the CPU (AutoKokoro)."""
+        warning = self.warning
+        self.backend, self.device = ("vulkan" if self.use_gpu else "cpu"), None
+        self._consecutive_restarts = 0
+        AutoKokoro.start(self)
+        if warning is not None:
+            self.warning = warning
+        self.fell_back = self.out_of_memory = True
+
+    def _ming_on_cpu(self) -> None:
+        """Carry on with Ming on the CPU backend of the same build ("cpu")."""
+        self._stop_process()
+        self.backend, self.device = "cpu", None
+        self.device_label, self.gpu_description = "CPU", ""
+        self._consecutive_restarts = 0
+        self._launch()
+        self.warning, self.fell_back, self.out_of_memory = CPU_NOTE, True, True
+
+
+class _CardFailed(GpuUnavailable):
+    """The card ran out of memory partway under the premium voice, and the user's choice
+    isn't to carry on with it on the CPU (raised inside :class:`AutoMing` only)."""
 
 
 def ming_check(root: Path, use_gpu: bool, cancelled: IsCancelled | None = None) -> VoiceCheck:

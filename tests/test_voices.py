@@ -78,7 +78,12 @@ def test_a_language_neither_speaks_says_so() -> None:
 
 def test_each_voice_needs_its_own_files() -> None:
     assert voices.required_assets("af_heart", True) == audiocpp.required_assets(True)
-    assert voices.required_assets("UK_George", True) == (AUDIOCPP_VULKAN, MING_Q8)
+    # Kokoro's files too, so Kokoro can take over if the card fails without downloading.
+    assert voices.required_assets("UK_George", True) == (
+        AUDIOCPP_VULKAN, MING_Q8, ESPEAK_NG, KOKORO_Q8,
+    )  # fmt: skip
+    without = voices.required_assets("UK_George", True, with_kokoro=False)
+    assert without == (AUDIOCPP_VULKAN, MING_Q8)
 
 
 def test_the_premium_download_says_its_size_and_that_it_needs_a_card() -> None:
