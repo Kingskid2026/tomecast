@@ -1,7 +1,10 @@
+import re
+import time
 from itertools import pairwise
 
 import pytest
 
+from tomecast import textprep_en
 from tomecast.book import Chapter
 from tomecast.chunking import split_sentences
 from tomecast.pronunciations import Pronunciation, Pronunciations
@@ -272,11 +275,16 @@ ORDINAL_DATES = [
     ("Tuesday the 21st of May", "Tuesday the twenty-first of May"),
     ("on the 21st, the 22nd of May.", "on the twenty-first, the twenty-second of May."),
     ("He left. The 21 May was warm.", "He left. The twenty-first of May was warm."),
-    # With "of" written, the writer's own words are kept and no "the" is added.
+    # With "of" written, the date gets its "the" too, unless a determiner is already there.
     ("Every 4th of July we met.", "Every fourth of July we met."),
-    ("that fateful 21st of May", "that fateful twenty-first of May"),
+    ("On 21st of May he left.", "On the twenty-first of May he left."),
+    ("He was born on 21st of May 1850.", "He was born on the twenty-first of May, eighteen fifty."),
+    ("closed from 24th of December until 2nd of January",
+     "closed from the twenty-fourth of December until the second of January"),
+    ("Monday, 21st of May.", "Monday, the twenty-first of May."),
+    ("By 4th of July the war was over.", "By the fourth of July the war was over."),
     # A paragraph starting with an ordinal.
-    ("21st of May was warm.", "twenty-first of May was warm."),
+    ("21st of May was warm.", "the twenty-first of May was warm."),
     ("21st May was warm.", "the twenty-first of May was warm."),
     ("1st of all, listen.", "first of all, listen."),
 ]  # fmt: skip
@@ -358,49 +366,44 @@ def test_days_listed_before_a_month_are_all_ordinals(written: str, spoken: str) 
     _no_word_doubled_or_lost(written, prepared)
 
 
-# A number that starts a sentence after another one is said with a capital letter: the
-# chunker only ends a sentence before a word that doesn't start in lowercase. The sentence
-# count stays what it is for the text as written.
+def _without_sentence_starts(text: str) -> str:
+    """``say(text)`` with sentence starts left unmarked: main's behaviour for them."""
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(textprep_en, "_mark_sentence_starts", lambda text: text)
+        return say(text)
+
+
+# A number that starts a sentence after a clear sentence end ("!", "?", or a period after an
+# ordinary lowercase word) is said with a capital letter: the chunker only ends a sentence
+# before a word that doesn't start in lowercase. The sentence count stays what it is for the
+# text as written.
 SENTENCE_STARTS = [
     ("He left. 21st May was warm.", "He left. The twenty-first of May was warm."),
-    ("He left. 21st of May was warm.", "He left. Twenty-first of May was warm."),
+    ("He left. 21st of May was warm.", "He left. The twenty-first of May was warm."),
     ("He left. The 21st of May was warm.", "He left. The twenty-first of May was warm."),
+    ("He left. 2 and 3 May were warm.", "He left. The second and third of May were warm."),
     ("Stop! 1st of all, listen.", "Stop! First of all, listen."),
     ("Why? 21st-century life.", "Why? Twenty-first-century life."),
+    ("Stop!! 5 men came.", "Stop!! Five men came."),
+    ("Who?! 5 men came.", "Who?! Five men came."),
     ('He left. "21st May," she said.', 'He left. "The twenty-first of May," she said.'),
+    ('"I left." 5 men came.', '"I left." Five men came.'),
+    ("(He left.) 5 men came.", "(He left.) Five men came."),
+    ("He left.\n5 men came.", "He left.\nFive men came."),
     ("He left. 5 men came.", "He left. Five men came."),
-    ("He came in. 5 men followed.", "He came in. Five men followed."),
-    ("It was 1865. 1866 was worse.",
-     "It was one thousand eight hundred sixty-five. One thousand eight hundred sixty-six was "
-     "worse."),
-    ("On the 3rd. 5 men came.", "On the third. Five men came."),
-    ("Gone. $5 was lost.", "Gone. Five dollars was lost."),
-    ("Done. 50% of it.", "Done. Fifty percent of it."),
-    ("Fine. 1/2 of it.", "Fine. One half of it."),
+    ("The bird began to fly. 5 more followed.", "The bird began to fly. Five more followed."),
+    ("The day was long. 5 men left.", "The day was long. Five men left."),
+    ("It was over. $5 was lost.", "It was over. Five dollars was lost."),
+    ("It was done. 50% of it.", "It was done. Fifty percent of it."),
+    ("It was fine. 1/2 of it.", "It was fine. One half of it."),
     ("He left. 1960s music played.", "He left. Nineteen sixties music played."),
+    ("He left. \u201970s music played.", "He left. Seventies music played."),
     ("It ended. 5-7 men came.", "It ended. Five to seven men came."),
-    ("Done. 3:45 p.m. came.", "Done. Three forty-five pee em came."),
+    ("It was done. 3:45 p.m. came.", "It was done. Three forty-five pee em came."),
     ("He left. -5 degrees.", "He left. Minus five degrees."),
-    ("He left. ~5 men came.", "He left. ~Five men came."),
     ("He left. \u22125 degrees.", "He left. Minus five degrees."),
+    ("He left. ~5 men came.", "He left. ~Five men came."),
     ("He left. No. 5 was next.", "He left. Number five was next."),
-    # After a spelled-out a.m., p.m., B.C. or A.D., whichever rule says the number.
-    ("He left at 3 a.m. 5 men came.", "He left at three ay em. Five men came."),
-    ("He left at 11:05 AM. 5 men came.", "He left at eleven oh five ay em. Five men came."),
-    ("He woke at 6 a.m. 20 minutes later he left.",
-     "He woke at six ay em. Twenty minutes later he left."),
-    ("He left at 3 p.m. 5 men came.", "He left at three pee em. Five men came."),
-    ("He left at 3 p.m. $5 was lost.", "He left at three pee em. Five dollars was lost."),
-    ("He came at 3 p.m. 1960s music played.",
-     "He came at three pee em. Nineteen sixties music played."),
-    ("He left at 3 p.m. 21 May was the day.",
-     "He left at three pee em. The twenty-first of May was the day."),
-    ("It was 3 a.m. 3:45 p.m. was later.",
-     "It was three ay em. Three forty-five pee em was later."),
-    ("It fell in 44 B.C. 15 years later he died.",
-     "It fell in forty-four bee see. Fifteen years later he died."),
-    ("It fell in 476 A.D. 5 men saw it.",
-     "It fell in four hundred seventy-six ay dee. Five men saw it."),
 ]  # fmt: skip
 
 
@@ -412,73 +415,160 @@ def test_a_number_starting_a_sentence_keeps_the_sentence_apart(written: str, spo
     _no_word_doubled_or_lost(written, prepared)
 
 
-@pytest.mark.parametrize(
-    ("written", "spoken"),
-    [
-        (
-            "He left. A.D. 476 was the year.",
-            "He left. Ay dee four hundred seventy-six was the year.",
-        ),
-        ("He met Maj. Smith. 5 men came.", "He met Major Smith. Five men came."),
-    ],
-)
-def test_a_spelled_out_abbreviation_keeps_the_sentences_apart(written: str, spoken: str) -> None:
-    # As written, the chunker also splits after "A.D." and "Maj."; once they are words, it
-    # rightly doesn't, so these have one sentence fewer than the written text.
-    prepared = say(written)
-    assert prepared == spoken
+def test_a_spelled_out_abbreviation_starting_a_sentence_keeps_it_apart() -> None:
+    # As written, the chunker also splits after "A.D."; once it is words, it rightly doesn't.
+    prepared = say("He left. A.D. 476 was the year.")
+    assert prepared == "He left. Ay dee four hundred seventy-six was the year."
     assert len(split_sentences(prepared)) == 2
 
 
-# Where a period, ellipsis or "!" may not end the sentence, the number stays lowercase, so
-# the sentence stays whole: never more sentences than before these rules. (From the review
-# of #67: each of these was split mid-clause by an earlier version.)
-NOT_SENTENCE_STARTS = [
-    ("On Fri. 5 May 1865 he left for London.",
-     "On Fri. the fifth of May, eighteen sixty-five he left for London.", 1),
-    ("Tues. 21st May. Rain all day.", "Tues. the twenty-first of May. Rain all day.", 2),
-    ("The U.S. $5 billion plan failed.", "The U.S. five billion dollars plan failed.", 1),
-    ("The U.S. 1st Army and the U.S. 3rd Army met.",
-     "The U.S. first Army and the U.S. third Army met.", 1),
-    ("It weighed 5 lbs. 3 oz. at birth.", "It weighed five lbs. three oz. at birth.", 1),
-    ("It weighed 12 lb. 6 oz. and cost 10s. 6d. in all.",
-     "It weighed twelve lb. six oz. and cost tens. six d. in all.", 1),
-    ("The trip took 3 hrs. 20 min. by rail.", "The trip took three hrs. twenty min. by rail.", 1),
-    ("He lived in Washington, D.C. 5 years.", "He lived in Washington, D.C. five years.", 1),
-    ("Born ca. 1850 in Washington, D.C. 3 miles away.",
-     "Born circa eighteen fifty in Washington, D.C. three miles away.", 1),
-    ("It was B.C. 50% of the time.", "It was bee see fifty percent of the time.", 1),
-    ("It was B.C. 3 years ago.", "It was bee see three years ago.", 1),
-    ("In A.D. 476 Rome fell.", "In ay dee four hundred seventy-six Rome fell.", 1),
-    # A sentence's opening phrase: "At 3 a.m., 5 men came."
-    ("At 3 a.m. 5 men came.", "At three ay em five men came.", 1),
-    ("At 3 p.m. $5 was lost.", "At three pee em five dollars was lost.", 1),
-    ("By 1200 B.C. 5 cities had fallen.",
-     "By twelve hundred bee see five cities had fallen.", 1),
-    ("He left. In 476 A.D. 500 followed.",
-     "He left. In four hundred seventy-six ay dee five hundred followed.", 2),
-    ("William I (r. 1066-87) and Bede (d. 735).",
-     "William I (r. ten sixty-six to eighty-seven) and Bede (d. seven hundred thirty-five).", 1),
-    ("See sec. 5 and art. 12 of the treaty.", "See sec. five and art. twelve of the treaty.", 1),
-    ("He counted... 3... 2... 1... and jumped.",
-     "He counted... three... two... one... and jumped.", 1),
-    ('"Stop!" 5 men cried.', '"Stop!" five men cried.', 1),
-    ("Chapter One ........ 1", "Chapter One ........ one", 1),
-    ("Mr. 5 came", "Mister five came", 1),
-    ("J. 5 men", "J. five men", 1),
-    ("e.g. 21 May", "for example the twenty-first of May", 1),
-    ("4 July 1776", "the fourth of July, seventeen seventy-six", 1),  # the paragraph's start
-]  # fmt: skip
+# Every input from both reviews of #67, with main's sentence count. None of them has a clear
+# sentence end before its number, so nothing is capitalised and the count stays main's.
+MAINS_SENTENCES = [
+    ("On Fri. 5 May 1865 he left for London.", 1),
+    ("Tues. 21st May. Rain all day.", 2),
+    ("The U.S. $5 billion plan failed.", 1),
+    ("The U.S. 1st Army and the U.S. 3rd Army met.", 1),
+    ("It weighed 5 lbs. 3 oz. at birth.", 1),
+    ("It weighed 12 lb. 6 oz. and cost 10s. 6d. in all.", 1),
+    ("The trip took 3 hrs. 20 min. by rail.", 1),
+    ("He lived in Washington, D.C. 5 years.", 1),
+    ("Born ca. 1850 in Washington, D.C. 3 miles away.", 1),
+    ("It was B.C. 50% of the time.", 1),
+    ("It was B.C. 3 years ago.", 1),
+    ("William I (r. 1066-87) and Bede (d. 735) and Smith (b. 1850, d. 1900).", 1),
+    ("See sec. 5 and art. 12 of the treaty.", 1),
+    ("He counted... 3... 2... 1... and jumped.", 1),
+    ('"Stop!" 5 men cried.', 1),
+    ("Abel, 12. 15. Baker, 3. 9.", 2),
+    ("Chapter One ........ 1", 1),
+    ("He met Maj. Smith. 5 men came.", 1),
+    ("At 3 a.m. 5 men came.", 1),
+    ("At 3 p.m. $5 was lost.", 1),
+    ("He woke at 6 a.m. 20 minutes later he left.", 1),
+    ("It fell in 44 B.C. 15 years later he died.", 1),
+    ("It fell in 44 B.C. 5 men saw it.", 1),
+    ("It fell in 476 A.D. 5 men saw it.", 1),
+    ("At 3 a.m. 3:45 p.m. was later.", 1),
+    ("He came at 3 p.m. 1960s music played.", 1),
+    ("He left at 3 p.m. 5 men came.", 1),
+    ("at 10 a.m. 300 soldiers marched.", 1),
+    ("It was 3 p.m. 5 minutes later he left.", 1),
+    ("At 5 p.m. 21 May was warm.", 1),
+    ("He came at 3 p.m. 5 men followed.", 1),
+    ("He came at 10 a.m. 5 men followed.", 1),
+    ("He came at 3 p.m. $5 was owed.", 1),
+    ("It ended at 3 p.m. 1865 was over.", 1),
+    ("He left at 11:05 AM. 5 men came.", 1),
+    ("Then at 3 a.m. 5 men came.", 1),
+    ("And in 44 B.C. 15 legions marched.", 1),
+    ("On Monday at 3 a.m. 5 men came.", 1),
+    ("Trains left at 9 a.m. 1 p.m. and 5 p.m. daily.", 1),
+    ("But by 3 p.m. 20 had died.", 1),
+    ("Shortly after 3 a.m. 2 shots rang out.", 1),
+    ("That night at 11 p.m. 3 men arrived.", 1),
+    ("From 9 a.m. to 5 p.m. 300 people visited.", 1),
+    ("Between 9 a.m. and 5 p.m. 300 people visited.", 1),
+    ("From 1200 B.C. to 800 B.C. 5 cities fell.", 1),
+    ("But at 3 a.m. 5 men came.", 1),
+    ("He said at 3 a.m. 5 men came.", 1),
+    ("Between 9 a.m. 12 people arrived.", 1),
+    ("He wrote in 44 B.C. 15 letters.", 1),
+    ("On the 4th of July at 9 p.m. 10,000 fireworks lit the sky.", 1),
+    ("Then at 3 p.m. 5 men came.", 1),
+    ("On Tuesday at 3 p.m. 20 men came.", 1),
+    ("Each day at 8 a.m. 20 buses leave.", 1),
+    ("At exactly 3 p.m. 20 people arrived.", 1),
+    ("Between 2 and 3 p.m. 40 men arrived.", 1),
+    ("In the year 476 A.D. 5 kings ruled.", 1),
+    ("The meeting ran from 9 a.m. until 5 p.m. 12 people spoke.", 1),
+    ("At Marathon in 490 B.C. 10,000 Athenians defeated the Persians.", 1),
+    ("Shortly before 9 p.m. 300 guests had arrived.", 1),
+    ("Around 3 p.m. 5 men came.", 1),
+    ("After 44 B.C. 5 cities fell.", 1),
+    ("At about 3 p.m. 5 men came.", 1),
+    ("At 11 AM. 5 men came.", 1),
+    ("As Paul says in Rom. 8:28 all things work together.", 1),
+    ("Compare Matt. 5 and Isa. 53 for the same thought.", 1),
+    ("See Ps. 23 and Ex. 3 for the divine name.", 1),
+    ("Read Bk. 3 of the Iliad and Sect. 4 of the Ethics.", 1),
+    ("See vv. 3-5 and ll. 10-12 of the poem.", 1),
+    ("The 2nd Bn. 300 strong held the ridge.", 1),
+    ("He served in the Govt. 5 years.", 1),
+    ("In Pt. 2 the plot thickens.", 1),
+    ("Beethoven's Sym. 5 opens with four notes.", 1),
+    ("See Eq. 4 and Prop. 7 below.", 1),
+    ("See Heb. 11:1 for faith.", 1),
+    ("See 1 Cor. 13 on love.", 1),
+    ("Cf. Luke 2. 14 shows it.", 1),
+    ("Turn to Gen. 1 and Rev. 21:4.", 1),
+    ("The ship lay at lat. 51 N, long. 3 W.", 1),
+    ("It cost Rs. 5 in all.", 1),
+    ("He sold 3 qrs. 5 lbs. of wheat.", 1),
+    ("It rose 3 deg. 5 min. in an hour.", 1),
+    ("Bread, cheese, &c. 5 baskets in all.", 1),
+    ("See ch. iii. 5 for this.", 1),
+    ("Part II. 3 Men in a Boat", 1),
+]
 
 
-@pytest.mark.parametrize(("written", "spoken", "sentences"), NOT_SENTENCE_STARTS)
-def test_a_number_that_may_not_start_a_sentence_stays_lowercase(
-    written: str, spoken: str, sentences: int
-) -> None:
+@pytest.mark.parametrize(("written", "sentences"), MAINS_SENTENCES)
+def test_no_sentence_is_split_where_main_kept_it_whole(written: str, sentences: int) -> None:
     prepared = say(written)
-    assert prepared == spoken
+    assert prepared == _without_sentence_starts(written)
     assert len(split_sentences(prepared)) == sentences
     _no_word_doubled_or_lost(written, prepared)
+
+
+@pytest.mark.parametrize(
+    "word",
+    [
+        # Not ordinary words: too short, no vowel, capitalised, or a lowercase Roman numeral.
+        "in", "go", "vv", "ll", "ff", "lbs", "hrs", "yds", "yrs", "pts", "qrs", "cwt", "mph", "sqq",
+        "Rom", "Matt", "Fri", "Smith", "Gone", "U.S", "p.m", "a.m", "iii", "xiv", "mix",
+        # The chunker's abbreviations.
+        "etc", "approx", "vol", "fig", "dept", "est", "gen", "rev", "prof", "sept", "oct",
+        # Lowercase abbreviations that look like words.
+        "art", "arts", "sec", "secs", "sect", "sects", "para", "paras", "cap", "caps", "ver",
+        "vers", "ref", "refs", "fol", "fols", "ibid", "cit", "loc", "seq", "ser", "suppl",
+        "supp", "app", "illus", "esp", "incl", "misc", "viz", "circ", "abt", "inst", "ult",
+        "prox", "orig", "repr", "trans", "lit", "abbr", "adj", "adv", "pron", "fem", "masc",
+        "neut", "plur", "obs", "def", "min", "mins", "gal", "gals", "doz", "deg", "degs",
+        "lat", "bce",
+    ],
+)  # fmt: skip
+def test_a_period_after_an_abbreviation_is_not_a_clear_sentence_end(word: str) -> None:
+    written = f"See {word}. 5 of them."
+    assert say(written) == _without_sentence_starts(written)
+    assert say(written).endswith(" five of them.")
+
+
+@pytest.mark.parametrize(
+    "written",
+    [
+        "The ship lay at lat. 51 N, long. 3 W.",  # "long." after "lat." is longitude
+        "He counted... 3... 2... 1... and jumped.",  # an ellipsis
+        "He waited\u2026 5 men came.",
+        "Chapter One ........ 1",  # a dot leader
+        '"Stop!" 5 men cried.',  # "!" or "?" before a closing quote
+        '"Why?" 5 men asked.',
+        "He said hello.5 men came.",  # no space after the period
+        "He left. it was 5 men.",  # a sentence written in lowercase stays that way
+    ],
+)
+def test_a_number_after_an_unclear_end_stays_lowercase(written: str) -> None:
+    assert say(written) == _without_sentence_starts(written)
+
+
+@pytest.mark.parametrize(
+    ("written", "spoken"),
+    [
+        ("the 2-3-4 May", "the two to three-the fourth of May"),  # as on main
+        ("2 and 3-4 May", "two and three-the fourth of May"),  # as on main
+    ],
+)
+def test_a_range_is_two_days(written: str, spoken: str) -> None:
+    assert say(written) == spoken
 
 
 def test_a_paragraph_already_holding_the_marker_character_is_left_alone() -> None:
@@ -486,6 +576,91 @@ def test_a_paragraph_already_holding_the_marker_character_is_left_alone() -> Non
     # paragraph that has one of its own is prepared without marks and keeps it.
     assert say("He left. 5 men\ue000 came.") == "He left. five men\ue000 came."
     assert "\ue000" not in say("He left. 5 men came.")
+
+
+@pytest.mark.parametrize(
+    ("written", "spoken"),
+    [
+        ("He wrote it down on 21 May. \u1f8d\u03b4\u03b7\u03c2 was the word he used at 5 p.m.",
+         "He wrote it down on the twenty-first of May. \u1f8d\u03b4\u03b7\u03c2 was the word "
+         "he used at five pee em."),
+        ("He wrote it down. \u01c5emal came at 5.", "He wrote it down. \u01c5emal came at five."),
+    ],
+)  # fmt: skip
+def test_only_letters_the_rules_wrote_are_capitalised(written: str, spoken: str) -> None:
+    # A titlecase letter (Greek with a subscript iota, "Dz") is the book's own: it isn't
+    # changed, so the paragraph isn't thrown back to its written form.
+    assert TextPrep.for_language("en").body(written) == spoken
+
+
+# Sentence ends and starts that come up in books, for the property test below.
+_ENDS = [
+    "He left.", "It was 1865.", "At 3 p.m.", "He left at 3 p.m.", "in 44 B.C.", "On Fri.",
+    "The U.S.", "Mr.", "J.", "e.g.", "Stop!", '"Stop!"', "Why?", "He counted...", "12 lb.",
+    "See sec.", "Born ca.", "(d.", "Main St.", "etc.", "He met Maj.", "on the 3rd.", "Fig.",
+    "As Paul says in Rom.", "See vv.", "The day was long.", "at lat. 51, long.", "see ch. iii.",
+    "It was done.", "(He left.)", '"I left."', "",
+]  # fmt: skip
+_STARTS = [
+    "5 men came.", "21 May was warm.", "21st of May was warm.", "the 21st of May came.",
+    "The 21 May came.", "$5 was lost.", "50% left.", "-5 degrees.", "1960s music.", "1/2 of it.",
+    "3:45 p.m. came.", "No. 5 was next.", "A.D. 476 came.", "2 and 3 May came.",
+    "3-4 May came.", "that 21 May came.", "every 4 July came.", "at last 4 July came.",
+    '"21st May," she said.', "(5 men) came.", "Smith came.", "it was fine.",
+    "1st of all, listen.", "~5 men came.", "\u00bd of it.", "8:28 all things.",
+]  # fmt: skip
+_CLEAR_END = re.compile(
+    r"(?:(?:^|\s)[\"'(\[\u201c\u2018]*[a-z]*[aeiouy][a-z]*\.[\"')\]\u201d\u2019]*|[!?])$"
+)
+
+
+def _sentence_ends(text: str) -> tuple[str, set[int]]:
+    """The text as the chunker sees it, and where each sentence but the last ends in it."""
+    sentences = split_sentences(text)
+    ends, position = set(), 0
+    for sentence in sentences[:-1]:
+        position += len(sentence) + 1
+        ends.add(position - 1)
+    return " ".join(sentences), ends
+
+
+def _corpus() -> list[str]:
+    written = [w for w, _ in ORDINAL_DATES + SENTENCE_STARTS] + [w for w, _ in MAINS_SENTENCES]
+    written += SAMPLE_PARAGRAPHS
+    written += [f"{end} {start}".strip() for end in _ENDS for start in _STARTS]
+    return written
+
+
+def test_sentence_starts_only_change_case_and_only_split_after_a_clear_end() -> None:
+    """Over a corpus of sentences, marking sentence starts changes nothing but the case of
+    letters the rules wrote, and splits a sentence only right after a clear sentence end."""
+    for written in _corpus():
+        prepared, reference = say(written), _without_sentence_starts(written)
+        assert prepared.lower() == reference.lower(), written
+        text, ends = _sentence_ends(prepared)
+        _, reference_ends = _sentence_ends(reference)
+        for end in ends - reference_ends:
+            assert _CLEAR_END.search(text[:end]), (written, text[:end])
+        assert words_lost(written, prepared, english.consumed_words) == [], written
+        assert " the the " not in f" {prepared.lower()} ", written
+
+
+@pytest.mark.parametrize(
+    "paragraph",
+    [
+        "Index: " + ", ".join(str(n % 30 + 1) for n in range(10_000)),
+        "Index: " + "-".join(str(n % 30 + 1) for n in range(10_000)),
+        "Index: " + " and ".join(str(n % 30 + 1) for n in range(10_000)),
+        "Scores: " + ", ".join(f"{n % 5}-{n % 3}" for n in range(10_000)),
+        "Wait" + "." * 50_000 + "then 5 men came.",  # marks with no space after them
+        ("He left. 5 men came on 21 May. " * 5_000),
+    ],
+    ids=["commas", "hyphens", "ands", "scores", "dots", "sentences"],
+)
+def test_a_long_paragraph_is_prepared_in_time_that_grows_with_its_length(paragraph: str) -> None:
+    started = time.perf_counter()
+    TextPrep.for_language("en").body(paragraph)
+    assert time.perf_counter() - started < 5  # linear: well under a second; quadratic: minutes
 
 
 @pytest.mark.parametrize(

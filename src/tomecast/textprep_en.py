@@ -171,7 +171,7 @@ def _match_case(original: str, spoken: str) -> str:
 def _after_is_capital(text: str, end: int) -> bool:
     """True if the next word after ``end`` starts with a capital letter."""
     rest = text[end:].lstrip()
-    rest = rest.lstrip(_MARK + _OPENERS)
+    rest = rest.lstrip(_OPENERS)
     return bool(rest) and rest[0].isupper()
 
 
@@ -185,8 +185,7 @@ def _sentence_end_period(text: str, end: int) -> str:
     """``"."`` if an abbreviation whose own period ended at ``end`` also ends a sentence.
 
     "He left at 3 p.m." must keep its full stop once "p.m." is spelled out, or the chunker
-    would run this sentence into the next one. So must "at 3 p.m. 5 men came", where the next
-    sentence starts with a number (it was marked as a sentence start before the rules ran).
+    would run this sentence into the next one.
     """
     index = end
     while index < len(text) and text[index] in _CLOSERS:
@@ -195,9 +194,7 @@ def _sentence_end_period(text: str, end: int) -> str:
         return "."
     if not text[index].isspace():
         return ""
-    while index < len(text) and (text[index].isspace() or text[index] in _OPENERS + _MARK):
-        if text[index] == _MARK:
-            return "."
+    while index < len(text) and (text[index].isspace() or text[index] in _OPENERS):
         index += 1
     if index >= len(text):
         return "."
@@ -222,12 +219,13 @@ _MONTH_FIRST = re.compile(
 _MONTH_YEAR = re.compile(
     rf"\b(?P<month>{_MONTH_FULL}|(?:{_MONTH_SHORT})\b\.?)\s+(?P<year>\d{{4}})\b"
 )
-# Days listed before the last one: "2nd, 3rd and 4th May", "2 or 3 May", "3-4 May".
+# Days listed before the last one: "2nd, 3rd and 4th May", "2 or 3 May", "3-4 May". At most
+# six, so a long run of small numbers (an index, a table) costs the same at every number.
 _LISTED_DAY = r"\d{1,2}(?:st|nd|rd|th)?"
 _DAY_SEPARATOR = r"\s*,\s*(?:(?:and|or|&)\s+)?|\s+(?:and|or|&)\s+|\s?[-\u2013]\s?"
 _DAY_FIRST = re.compile(
-    rf"{_NOT_AFTER}(?P<days>(?:{_LISTED_DAY}(?:{_DAY_SEPARATOR}))*)"
-    rf"(?P<day>\d{{1,2}})(?P<suffix>st|nd|rd|th)?(?P<of>\s+of)?\s+"
+    rf"{_NOT_AFTER}(?P<days>(?:{_LISTED_DAY}(?:{_DAY_SEPARATOR})){{0,6}})"
+    rf"(?P<day>\d{{1,2}})(?P<suffix>st|nd|rd|th)?(?:\s+of)?\s+"
     rf"(?P<month>{_MONTH_FULL}|(?:{_MONTH_SHORT})\.)(?:,?\s+(?P<year>\d{{4}})\b(?![,.]\d))?"
 )
 _DAY_LIST_ITEM = re.compile(r"(\d{1,2}(?:st|nd|rd|th)?)")
@@ -316,10 +314,9 @@ def _dates(text: str) -> str:
             kept, listed, start = match["days"], "", match.start("day")
         month = MONTHS[_month_number(match["month"]) - 1]
         spoken = f"{listed}{ordinal(day)} of {month}"
-        # "21 May" is said "the twenty-first of May", but "the 21 May" already has its "the".
-        # "The 21st of May" is written the way it's said, so only the number changes:
-        # "every 4th of July" and "that fateful 21st of May" get no "the" of their own.
-        if not match["of"] and not _has_determiner(match.string, start):
+        # "21 May" and "21st of May" are said "the twenty-first of May", but "the 21 May"
+        # and "every 4th of July" already have their article.
+        if not _has_determiner(match.string, start):
             spoken = "the " + spoken
         return kept + spoken + (f", {_year_text(match['year'])}" if match["year"] else "")
 
@@ -820,42 +817,35 @@ def _numbers(text: str) -> str:
 # The chunker only ends a sentence before a word that doesn't start in lowercase, so "He
 # left. 5 men came." must become "He left. Five men came.", not "...left. five men came.",
 # or the two sentences run together. Sentence starts are found once, on the text as written,
-# and marked; after all the rules have run, the first letter after each mark is capitalised.
-# That keeps it independent of the order of the rules, and of the periods they spell out.
+# and marked; after all the rules have run, a lowercase letter right after a mark (always
+# one the rules wrote: "five", "minus", "number", "the") is made a capital.
 #
-# Only a clear sentence end counts. Where it isn't clear ("On Fri. 5 May", "the U.S. $5
-# billion", "12 lb. 6 oz.", "He counted... 3... 2...", '"Stop!" 5 men cried'), the number
-# stays lowercase, so the sentence stays whole, as it always did.
+# Only a clear sentence end counts: "!" or "?", or a period after an ordinary lowercase word.
+# Anything else ("Rom. 8:28", "On Fri. 5 May", "the U.S. $5 billion", "vv. 3-5", "at 3 a.m.
+# 5 men", "He counted... 3", '"Stop!" 5 men cried') keeps the number in lowercase, so the
+# sentence stays whole, as it always was.
 
-_SENTENCE_END = re.compile(rf"(?P<marks>[.!?\u2026]+)(?P<closers>[{re.escape(_CLOSERS)}]*)\s+")
+# A run of marks is matched from its first mark only, so a long run costs the same as a short.
+_SENTENCE_END = re.compile(
+    rf"(?<![.!?\u2026])(?P<marks>[.!?\u2026]+)(?P<closers>[{re.escape(_CLOSERS)}]*)\s+"
+)
 # Signs that may come before the number a sentence starts with: "-5", "$5", "~5", "'70s".
 _SIGNS = "-\u2212+~\u00b1\u2248$£€¥#§\u2019"
-# Periods that don't end a sentence, besides chunking.ABBREVIATIONS and single letters.
+# Lowercase abbreviations that look like ordinary words (besides chunking.ABBREVIATIONS):
+# references, units and grammar terms.
 _NOT_SENTENCE_ENDS = frozenset(
     (
-        "art arts sec secs para paras cap caps op cit ibid loc esp incl misc fl ff seq ser pl "
-        "lit trans repr orig abt inst ult prox viz ca circ messrs mme mlle bros esq"
+        "art arts sec secs sect sects para paras cap caps ver vers ref refs fol fols ibid cit "
+        "loc seq ser suppl supp app illus esp incl misc viz circ abt inst ult prox orig repr "
+        "trans lit abbr adj adv pron fem masc neut plur obs def min mins gal gals doz deg degs "
+        "lat bce"
     ).split()
-) | {key.lower() for key in (*_TITLES, *_STREETS, *_SUFFIXES)}
-_WEEKDAYS = frozenset("Mon Tue Tues Wed Thu Thur Thurs Fri Sat Sun".split())
-# Units, which only count after a number ("12 lb. 6 oz."): "He came in. 5 men..." ends.
-_UNITS = frozenset(
-    "lb lbs oz in ft yd yds mi hr hrs min mins sec secs pt pts qt qts gal gals cwt doz kg cm "
-    "mm km ml sq cu mph".split()
 )
-# "He left at 3 p.m." and "It fell in 44 B.C." end a sentence; "A.D. 476" and "B.C. 50%"
-# don't, and neither does a sentence's opening phrase: "At 3 a.m. 5 men came." and "In 476
-# A.D. 500 followed." are one sentence each.
-_ERA_OR_MERIDIEM = r"\d\s?(?:[ap]\.?\s?m|[AP]\.?\s?M|B\.?C(?:\.?E)?|A\.?D|C\.?E)$"
-_ERA_OR_MERIDIEM_AFTER_NUMBER = re.compile(_ERA_OR_MERIDIEM)
-_OPENING_PHRASE = re.compile(
-    rf"(?:^|[.!?\u2026][{re.escape(_CLOSERS)}]*\s)\s*[{re.escape(_OPENERS)}]*"
-    r"(?i:at|in|by|from|until|till|after|before|around|about|since|on|during|circa|ca?\.)"
-    rf"\s+(?i:about\s+|around\s+)?[\d:.,]*{_ERA_OR_MERIDIEM}"
-)
-_PLAIN_NUMBER_WORD = re.compile(r"[\d,]+(?:st|nd|rd|th)?%?")
-_NUMBER_WORD = re.compile(r"[\d,.]+")
-_MARKED = re.compile(rf"{_MARK}([^\w\s{_MARK}]*)([^\W\d_]?)")
+# At least three lowercase letters with a vowel ("y" counts after the first letter): "left",
+# "fly", "gym". Not "Rom", "vv", "lbs", "yds".
+_ORDINARY_WORD = re.compile(r"(?=[a-z]{3})(?:[a-z]*[aeiou][a-z]*|[a-z]+y[a-z]*)")
+_LOWERCASE_ROMAN = re.compile(ROMAN_PATTERN.lower())  # "iii.", "xiv."
+_MARKED = re.compile(rf"{_MARK}([^\w\s{_MARK}]*)([a-z]?)")
 
 
 def _clearly_ends_sentence(text: str, match: re.Match[str]) -> bool:
@@ -866,29 +856,13 @@ def _clearly_ends_sentence(text: str, match: re.Match[str]) -> bool:
         return not match["closers"]  # '"Stop!" 5 men cried.' is one sentence
     if marks != ".":
         return False  # an ellipsis or a dot leader often doesn't end the sentence
-    window = max(0, match.start() - 40)
-    before = text[window : match.start()]
-    if _ERA_OR_MERIDIEM_AFTER_NUMBER.search(before):
-        return _OPENING_PHRASE.search(text, window, match.start()) is None
-    words = before.split()
-    if not words:
+    before = text[max(0, match.start() - 40) : match.start()].split()
+    word = before[-1].strip(_OPENERS + _CLOSERS) if before else ""
+    if not _ORDINARY_WORD.fullmatch(word):
         return False
-    word = words[-1].strip(_OPENERS + _CLOSERS)
-    previous = words[-2].strip(_OPENERS) if len(words) > 1 else ""
-    if not word:
+    if word in ABBREVIATIONS or word in _NOT_SENTENCE_ENDS or _LOWERCASE_ROMAN.fullmatch(word):
         return False
-    if any(c.isdigit() for c in word):
-        return _PLAIN_NUMBER_WORD.fullmatch(word) is not None  # "in 1865." but not "10s."
-    if "." in word or len(word) == 1:
-        return False  # "U.S.", "e.g.", initials, and "b." / "d." / "r." in life dates
-    lower = word.lower()
-    if lower in ABBREVIATIONS or lower in _NOT_SENTENCE_ENDS:
-        return False
-    if word[0].isupper() and word.capitalize() in _WEEKDAYS:
-        return False
-    if lower in _UNITS and _NUMBER_WORD.fullmatch(previous):
-        return False
-    return word[-1].isalpha()
+    return not (word == "long" and "lat." in before)  # "lat. 51 N, long. 0 W"
 
 
 def _mark_sentence_starts(text: str) -> str:
@@ -911,7 +885,8 @@ def _mark_sentence_starts(text: str) -> str:
 
 
 def _capitalise_sentence_starts(text: str) -> str:
-    """Capitalise the first letter after each :data:`_MARK`, and take the marks out."""
+    """Capitalise a lowercase letter right after each :data:`_MARK` (past any signs), and
+    take the marks out. Only ``a``-``z`` change, so the book's own letters never do."""
     return _MARKED.sub(lambda match: match[1] + match[2].upper(), text)
 
 
