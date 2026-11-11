@@ -57,6 +57,50 @@ jobs:
       - run: uv sync --locked
       - run: uv run pytest
 
+  windows:
+    # Groundwork for the Windows version (#39): shows what already works on Windows without
+    # failing CI while the port is unfinished. Every check runs even if an earlier one fails.
+    # tests/conftest.py lists the tests that can't load on Windows yet, and why.
+    name: Windows (port in progress)
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      # Keep LF line endings, as on Linux: some tests compare files byte for byte.
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - id: sync
+        run: uv sync --locked
+      - name: ruff check
+        if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+        run: uv run ruff check
+      - name: ruff format --check
+        if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+        run: uv run ruff format --check
+      - name: mypy (checks the Windows branches of tomecast.oslayer)
+        if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+        run: uv run mypy
+      - name: pytest
+        if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+        run: uv run pytest
+      - name: Lint install.ps1
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          $found = Invoke-ScriptAnalyzer -Path install.ps1 -Severity Warning, Error
+          $found | Format-Table -AutoSize | Out-String -Width 200
+          if ($found) { exit 1 }
+      - name: Run install.ps1 against this checkout
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        env:
+          TOMECAST_PACKAGE: ${{ github.workspace }}
+        run: |
+          ./install.ps1
+          & "$(uv tool dir --bin)\tomecast.exe" --version
+
   install:
     # Proves the one-line installer works on a clean copy of each distro.
     name: Install on ${{ matrix.image }}
