@@ -155,12 +155,10 @@ The full design, including why each model and quantization was chosen, is in [do
 | **0.1.0** | Desktop window, EPUB to M4B with chapters, the graphics card through the installed driver, speeds 0.5× to 3×, one-line install | Released |
 | **0.1.1** | DOCX, FB2, TXT and HTML books, plus installer and reliability fixes | Released |
 | **0.1.2** | MP3 output (one file per chapter); numbers, dates and abbreviations read properly; your own pronunciation lists, `tomecast names` and `tomecast preview`; PDF books with page numbers, headers and footnotes cleaned up | Released |
-| **0.2.0** | The voice engine on more distros (Ubuntu 22.04 and 24.04, Debian 12 and 13, Fedora 43) through Tomecast's own audio.cpp build; the Names step in the window; the final app icon; safe engine updates with a self-check, rollback and a speed test with time estimates; fewer threads on battery or low memory; `tomecast doctor` and `tomecast scan` | Next |
-| **0.2.x** | The premium Ming voice, for computers with a graphics card | Being tested |
+| **0.2.0** | The voice engine on more distros (Ubuntu 22.04 and 24.04, Debian 12 and 13, Fedora 43) through Tomecast's own audio.cpp build; the Names step in the window; the final app icon; safe engine updates with a self-check, rollback and a speed test with time estimates; fewer threads on battery or low memory; `tomecast doctor` and `tomecast scan`; carrying on on the CPU when the graphics card runs out of memory or stops working; PDF ligatures and IPA-free pronunciation lists | Released |
+| **0.2.x** | The premium Ming voice, for computers with a graphics card | Next |
 | **0.3.0** | Optional AI add-ons for messy books: PDF page layout, scanned PDFs (OCR), tricky cleanup calls | Planned |
 | **1.0.0** | Public launch (demo, docs, install page) and a Windows version | Planned |
-
-<!-- TODO(release): when 0.2.0 is published, change its status to "Released" (the PyPI page shows this README as it is at release time, so the release PR is a good place). If Ming ships in 0.2.0 itself, fold the 0.2.x row into 0.2.0. -->
 
 **What's coming, in order:**
 
