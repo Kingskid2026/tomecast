@@ -2114,9 +2114,17 @@ def test_a_respelling_the_list_cant_hold_is_explained_and_not_saved(
 ) -> None:
     backend = make_backend()
     _open(qtbot, backend, _names_book(tmp_path))
-    for ipa in ("/zɔrp/", "zɔrp", "[zɔrp]", "[[z'O@p]]", "ˈzawrp"):
-        backend.setNameFix("Zorp", ipa)
-        assert backend.errorMessage == fixes_module.PHONETIC, ipa
+    for say, message in (
+        ("/zɔrp/", fixes_module.PHONETIC),
+        ("zɔrp", fixes_module.PHONETIC),
+        ("[zɔrp]", fixes_module.PHONETIC),
+        ("ˈzawrp", fixes_module.PHONETIC),
+        ("[[z'O@p]]", fixes_module.MARKUP),
+        ("[zawrp]", fixes_module.NOTATIONS["brackets"]),
+        ("/zawrp/", fixes_module.NOTATIONS["slashes"]),
+    ):
+        backend.setNameFix("Zorp", say)
+        assert backend.errorMessage == message, say
         assert backend.nameFixes == {}
         assert not _book_list(tmp_path).exists()
     backend.setNameFix("Zorp", "zawrp")  # a good one clears the banner the bad one put up

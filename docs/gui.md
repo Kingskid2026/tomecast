@@ -139,7 +139,7 @@ The Names step (design.md, "Screens") comes after Voice for books where the name
 
 | Slot | Does |
 |---|---|
-| `setNameFix(word, say)` | save how to say a listed name. An empty (or blank) `say` removes its fix. A fix that exists is changed in the list that has it (keeping its left side, arrow, spacing and comment); a new one goes at the end of the book's list. Nothing is written if it's the same as before. A respelling the list can't hold (a phonetic spelling: IPA symbols or stress marks, or anything in /slashes/ or [brackets]; or a "#" that would start a comment) is refused with a sentence in the banner |
+| `setNameFix(word, say)` | save how to say a listed name. An empty (or blank) `say` removes its fix. A fix that exists is changed in the list that has it (keeping its left side, arrow, spacing and comment); a new one goes at the end of the book's list. Nothing is written if it's the same as before. A respelling the list can't hold is refused with a sentence in the banner that says what to do: a phonetic spelling (IPA symbols, including stress and length marks; eSpeak's `[[…]]` markup anywhere in it; or plain letters wrapped in /slashes/ or [brackets]), or a "#" that would start a comment. A name with no fix because its list line is IPA gets the respelling on that line, in whichever list has it |
 | `removeFix(scope, word)` | remove the fix for `word` from the book's list (`"book"`) or the global one (`"all"`) |
 | `toggleFixScope(scope, word)` | move the fix to the other list (the THIS BOOK / EVERY BOOK pill): it is written to the other file first, then removed from this one |
 | `playName(word)` | voice `word` with the fixes, in the chosen voice and speed, and play it; again to stop |

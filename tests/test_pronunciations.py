@@ -8,6 +8,8 @@ from tomecast.pronunciations import (
     Pronunciations,
     is_phonetic,
     parse,
+    phonetic_lines,
+    phonetic_notation,
     respelling,
 )
 
@@ -65,36 +67,89 @@ def test_exact_phonetic_spellings_are_rejected_with_an_explanation() -> None:
 
 
 # eSpeak reads these out symbol by symbol: Siobhan written in plain IPA was heard as
-# "Esch small capi stress V open all lengthened N".
-PHONETIC = [
+# "Esch small capi stress V open all lengthened N". Each value's only phonetic symbol is the
+# one its id names, so each range of the rule is pinned by its own case.
+IPA = [
     pytest.param("ʃɪˈvɔːn", id="plain IPA"),
     pytest.param("/ʃɪˈvɔːn/", id="IPA in slashes"),
     pytest.param("[ʃɪˈvɔːn]", id="IPA in brackets, as Wikipedia writes it"),
     pytest.param("[ ʃɪˈvɔːn ]", id="brackets with spaces"),
-    pytest.param("[[S@v'O:n]]", id="eSpeak phoneme markup"),
-    pytest.param("[shiv-AWN]", id="plain letters in brackets"),
-    pytest.param("shiv-[[A:n]]", id="eSpeak markup inside a respelling"),
+    pytest.param("shiv-awn (ʃɪˈvɔːn)", id="IPA after a respelling"),
+    pytest.param("ɡal", id="IPA g, not the letter g"),
+    pytest.param("ʃiv-awn", id="one IPA letter"),
     pytest.param("shiv-ˈawn", id="primary stress mark only"),
     pytest.param("ˌshiv-awn", id="secondary stress mark only"),
     pytest.param("shiv-awːn", id="length mark only"),
     pytest.param("shiv-awˑn", id="half-length mark only"),
-    pytest.param("shiv-awn (ʃɪˈvɔːn)", id="IPA after a respelling"),
     pytest.param("tʰom", id="aspiration mark"),
-    pytest.param("t͡ʃa", id="tie bar"),
-    pytest.param("dɹˈɪftᵻd", id="phonetic extensions, as eSpeak writes them"),
-    pytest.param("ɡal", id="IPA g, not the letter g"),
+    pytest.param("kaˀta", id="glottal stop modifier"),
+    pytest.param("kaˁta", id="reversed glottal stop modifier"),
+    pytest.param("ka˞ta", id="rhotic hook"),
+    pytest.param("tˠa", id="velarised"),
+    pytest.param("maˤ", id="pharyngealised"),
+    pytest.param("ma˥", id="tone letter"),
+    pytest.param("t͡sa", id="tie bar above"),
+    pytest.param("t͜sa", id="tie bar below"),
+    pytest.param("drift-ᵻd", id="phonetic extensions, as eSpeak writes them"),
+    pytest.param("kiθ", id="theta"),
+    pytest.param("βa-ka", id="beta"),
+    pytest.param("χa-ka", id="chi"),
 ]
 
 
-@pytest.mark.parametrize("say", PHONETIC)
-def test_phonetic_spellings_are_skipped_with_advice(say: str) -> None:
-    assert is_phonetic(say)
+@pytest.mark.parametrize("say", IPA)
+def test_ipa_is_skipped_with_advice(say: str) -> None:
+    assert phonetic_notation(say) == "IPA"
     found, warnings = parse(f"Siobhan → {say}\nHermione → her-my-oh-nee\n", "x.txt")
     assert found.entries == (Pronunciation("Hermione", "her-my-oh-nee"),)
-    assert len(warnings) == 1
-    assert warnings[0].startswith(f"x.txt, line 1: '{say}' looks like IPA")
-    assert "respelling for 'Siobhan'" in warnings[0]
-    assert "plain letters, like shiv-AWN" in warnings[0]
+    assert warnings == [
+        f"x.txt, line 1: '{say}' looks like IPA, and the voice can't use phonetic symbols, "
+        "so the line is skipped; write a respelling for 'Siobhan' instead, the way it sounds "
+        "in plain letters, like shiv-AWN"
+    ]
+
+
+@pytest.mark.parametrize("say", ["[[S@v'O:n]]", "shiv-[[A:n]]"])
+def test_espeak_markup_is_skipped_with_advice(say: str) -> None:
+    assert phonetic_notation(say) == "markup"
+    found, warnings = parse(f"Siobhan → {say}\n", "x.txt")
+    assert len(found) == 0
+    assert warnings == [
+        f"x.txt, line 1: '{say}' is eSpeak phoneme markup, which the voice can't use, so the "
+        "line is skipped; write a respelling for 'Siobhan' instead, the way it sounds in plain "
+        "letters, like shiv-AWN"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("say", "notation"),
+    [
+        ("/shiv-awn/", "slashes"),
+        ("/SH IH V AO N/", "slashes"),  # ARPAbet: plain letters, but not a respelling
+        ("//", "slashes"),
+        ("[shiv-AWN]", "brackets"),
+        ("[sic]", "brackets"),
+        ("[]", "brackets"),
+    ],
+)
+def test_plain_letters_in_slashes_or_brackets_say_what_to_leave_out(
+    say: str, notation: str
+) -> None:
+    assert phonetic_notation(say) == notation
+    found, warnings = parse(f"Siobhan → {say}\n", "x.txt")
+    assert len(found) == 0
+    assert warnings == [
+        f"x.txt, line 1: '{say}' is in {notation}, the way phonetic spellings are written, so "
+        f"the line is skipped; leave the {notation} out and write a respelling for 'Siobhan' "
+        "instead, the way it sounds in plain letters, like shiv-AWN"
+    ]
+
+
+def test_spaces_around_a_value_dont_hide_its_slashes_or_brackets() -> None:
+    assert phonetic_notation("  /shiv-awn/ ") == "slashes"
+    assert phonetic_notation("\t[shiv-AWN]  ") == "brackets"
+    assert phonetic_notation(" [[S@v'O:n]] ") == "markup"
+    assert phonetic_notation("  shiv-AWN  ") is None
 
 
 RESPELLINGS = [
@@ -103,7 +158,7 @@ RESPELLINGS = [
     pytest.param("her-MY-oh-nee", id="capitals in the middle"),
     pytest.param("Hawaiʻi", id="okina U+02BB"),
     pytest.param("ha-WAI-ʻee", id="okina in a respelling"),
-    pytest.param("Hawaiʼi", id="modifier apostrophe U+02BC"),
+    pytest.param("Hawaiʼi", id="modifier apostrophe U+02BC, said as an apostrophe"),
     pytest.param("Hawai'i", id="plain apostrophe"),
     pytest.param("Hawai‘i", id="left quotation mark as okina"),
     pytest.param("Hawai’i", id="right quotation mark as apostrophe"),
@@ -115,7 +170,10 @@ RESPELLINGS = [
     pytest.param("Ilʹich", id="prime from transliterated Russian"),
     pytest.param("ay slash bee", id="the word slash"),
     pytest.param("/", id="a lone slash"),
+    pytest.param("a/b/c", id="slashes inside a respelling"),
     pytest.param("ay [bee] see", id="brackets inside a respelling"),
+    pytest.param("[ay] bee [see]", id="two bracketed pieces, not one pair"),
+    pytest.param("/ay/ bee /see/", id="two slashed pieces, not one pair"),
     pytest.param("C#-ish", id="a hash inside a word"),
 ]
 
@@ -126,6 +184,14 @@ def test_respellings_and_the_letters_names_use_are_kept(say: str) -> None:
     found, warnings = parse(f"Siobhan → {say}\n")
     assert warnings == []
     assert found.entries == (Pronunciation("Siobhan", say),)
+
+
+def test_the_skipped_phonetic_lines_can_be_found() -> None:
+    text = "# mine\nSiobhan → ʃɪˈvɔːn  # wiki\nZorp → zawrp\nno arrow\nsiobhan → /shiv-awn/\n"
+    assert phonetic_lines(text) == (
+        Pronunciation("Siobhan", "ʃɪˈvɔːn"),
+        Pronunciation("siobhan", "/shiv-awn/"),
+    )
 
 
 def test_only_the_say_it_as_side_is_checked() -> None:

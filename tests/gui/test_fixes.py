@@ -10,7 +10,15 @@ from pathlib import Path
 import pytest
 
 from tomecast import pronunciations
-from tomecast.gui.fixes import PHONETIC, BadFix, Fix, FixLists, FixNotSaved, ListFile
+from tomecast.gui.fixes import (
+    MARKUP,
+    PHONETIC,
+    BadFix,
+    Fix,
+    FixLists,
+    FixNotSaved,
+    ListFile,
+)
 
 BOOK_LIST = """\
 # Alice: checked by ear
@@ -114,9 +122,13 @@ def test_an_unchanged_fix_is_not_written_again(folders: tuple[Path, Path]) -> No
         ("/ˈɡrɪfən/", PHONETIC),
         ("ˈdaɪnə", PHONETIC),  # plain IPA
         ("[ˈdaɪnə]", PHONETIC),  # as Wikipedia writes it
-        ("[[d'aIn@]]", PHONETIC),  # eSpeak's phoneme markup
         ("DIE-nˈuh", PHONETIC),  # a stress mark is enough
         ("die-nuː", PHONETIC),  # and so is a length mark
+        ("DIE-nuθ", PHONETIC),  # and a Greek letter IPA uses
+        ("[[d'aIn@]]", MARKUP),  # eSpeak's phoneme markup
+        ("die-[[n@]]", MARKUP),
+        ("/DIE-nuh/", "Leave out the slashes: type just the way the word sounds"),
+        ("[DIE-nuh]", "Leave out the brackets: type just the way the word sounds"),
         ("griff #on", "Leave out the “#”"),
         ("#griff", "Leave out the “#”"),
     ],
@@ -132,7 +144,10 @@ def test_a_fix_the_list_cant_hold_is_refused(
     assert lists.fix_for("Dinah") is None
 
 
-@pytest.mark.parametrize("say", ["ha-WAI-ʻee", "Hawaiʼi", "Hawai'i", "DEE-nah", "Dína", "Ðina"])
+@pytest.mark.parametrize(
+    "say",
+    ["ha-WAI-ʻee", "Hawaiʼi", "Hawai'i", "Ilʹich", "DEE-nah", "Dína", "Ðina", "[die] nuh [ah]"],
+)
 def test_names_marks_and_accents_are_saved(folders: tuple[Path, Path], say: str) -> None:
     book, data = folders
     lists = _lists(book, data)
@@ -153,6 +168,44 @@ def test_an_ipa_line_already_in_a_list_is_skipped_and_a_new_fix_replaces_it(
     lists.set_for_name("Dinah", "DIE-nuh")
     assert _book_text(book) == f"{BOOK_LIST}Dinah → DIE-nuh   # from Wikipedia\n"
     assert lists.fix_for("Dinah") == Fix("Dinah", "DIE-nuh", "book")
+
+
+def test_an_ipa_line_in_the_global_list_is_replaced_there(folders: tuple[Path, Path]) -> None:
+    """Saved in the book's list instead, the global line would stay, and so would its note on
+    every conversion of every book."""
+    book, data = folders
+    pronunciations.global_list_path(data).write_text(
+        f"{GLOBAL_LIST}Dinah → ˈdaɪnə  # wiki\n", encoding="utf-8"
+    )
+    lists = _lists(book, data)
+    assert lists.fix_for("Dinah") is None
+    lists.set_for_name("Dinah", "DIE-nuh")
+    assert _global_text(data) == f"{GLOBAL_LIST}Dinah → DIE-nuh  # wiki\n"
+    assert _book_text(book) == BOOK_LIST
+    assert lists.fix_for("Dinah") == Fix("Dinah", "DIE-nuh", "all")
+    assert pronunciations.load_for_book(data, book)[1] == []  # the note is gone
+
+
+def test_an_ipa_line_matching_in_another_case_is_replaced(folders: tuple[Path, Path]) -> None:
+    book, data = folders
+    path = pronunciations.book_list_path(book)
+    path.write_text(f"{BOOK_LIST}dinah → [ˈdaɪnə]\n", encoding="utf-8")
+    lists = _lists(book, data)
+    lists.set_for_name("Dinah", "DIE-nuh")
+    assert _book_text(book) == f"{BOOK_LIST}dinah → DIE-nuh\n"  # its own left side kept
+    assert lists.fix_for("Dinah") == Fix("dinah", "DIE-nuh", "book")
+    assert pronunciations.load_for_book(data, book)[1] == []
+
+
+def test_the_books_ipa_line_is_replaced_before_the_global_one(folders: tuple[Path, Path]) -> None:
+    book, data = folders
+    pronunciations.global_list_path(data).write_text("Dinah → ˈdaɪnə\n", encoding="utf-8")
+    path = pronunciations.book_list_path(book)
+    path.write_text(f"{BOOK_LIST}Dinah → /ˈdiːnə/\n", encoding="utf-8")
+    lists = _lists(book, data)
+    lists.set_for_name("Dinah", "DEE-nuh")
+    assert _book_text(book) == f"{BOOK_LIST}Dinah → DEE-nuh\n"
+    assert _global_text(data) == "Dinah → ˈdaɪnə\n"  # another book's business
 
 
 def test_a_list_with_a_byte_order_mark_shows_and_keeps_its_first_fix(tmp_path: Path) -> None:

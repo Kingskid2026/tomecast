@@ -22,9 +22,11 @@ because the pronouncer (eSpeak NG) would spell out a word in capitals letter by 
 
 Phonetic spellings are not supported: audio.cpp's server can't take phonemes (checked in
 v0.9.4; see docs/architecture.md, section 10), and eSpeak reads IPA symbols out by name
-("small capital I", "stress"). :func:`is_phonetic` says what counts as one (IPA in
-``/slashes/`` or ``[brackets]``, eSpeak's ``[[phoneme]]`` markup, or any IPA symbol at all).
-Such a line is skipped with a warning, and the window refuses to save one.
+("small capital I", "stress"). :func:`phonetic_notation` says what counts as one: IPA
+symbols (the IPA letters, stress and length marks, and the others listed at ``_IPA``),
+eSpeak's ``[[phoneme]]`` markup, or a value wrapped in ``/slashes/`` or ``[brackets]`` the
+way phonetic spellings are written. Such a line is skipped with a warning, and the window
+refuses to save one.
 
 A list may start with a UTF-8 byte-order mark (some editors write one): it is ignored.
 
@@ -39,8 +41,10 @@ import os
 import re
 import secrets
 import shutil
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 from tomecast.marks import speakable
 
@@ -56,6 +60,7 @@ _CAPITALS = re.compile(r"[A-Za-z]{2,}")
 # (eSpeak would read those marks out by name too, so tomecast.marks makes them apostrophes.)
 _IPA = re.compile(
     "["
+    "\u03b2\u03b8\u03c7"  # β θ χ: the Greek letters IPA uses, read out as "beta", "theta"
     "\u0250-\u02af"  # IPA Extensions: ɐ ɑ ə ɛ ɡ ɪ ɔ ʃ ʊ ʌ ʒ ʔ ...
     "\u02b0-\u02b8"  # raised letters for aspiration, palatalisation and so on: ʰ ʲ ʷ
     "\u02c0\u02c1"  # ˀ ˁ
@@ -88,21 +93,51 @@ def book_list_path(book: Path) -> Path:
     return book.with_suffix(BOOK_FILE_SUFFIX)
 
 
-def is_phonetic(spoken: str) -> bool:
-    """True if a right-hand side is written in phonetic symbols rather than as a respelling.
+Notation = Literal["IPA", "markup", "slashes", "brackets"]
 
-    That is IPA between slashes (``/ʃɪˈvɔːn/``) or square brackets (``[ʃɪˈvɔːn]``, the way
-    Wikipedia writes it), eSpeak's ``[[phoneme]]`` markup, or any IPA symbol, stress or
-    length mark (``ʃɪˈvɔːn``, ``shiv-ˈawn``). The voice can't use any of them: it would read
-    the symbols and brackets out. Accented letters (é, ñ, ø, ł, ð) and the marks names use,
-    such as the ʻokina in *Hawaiʻi*, are fine.
+
+def phonetic_notation(spoken: str) -> Notation | None:
+    """What makes a right-hand side a phonetic spelling rather than a respelling, or ``None``
+    for a respelling. The voice can't use any of these: it would read them out.
+
+    * ``"IPA"``: IPA symbols (the letters ``ə ɪ ʃ ɔ``..., ``β θ χ``, stress and length marks
+      ``ˈ ˌ ː ˑ``, raised letters ``ʰ ʲ ʷ``, tone letters, tie bars and the Phonetic
+      Extensions such as ``ᵻ``): ``ʃɪˈvɔːn``, ``shiv-ˈawn``, ``/ʃɪˈvɔːn/``, ``[ʃɪˈvɔːn]``.
+    * ``"markup"``: eSpeak's ``[[phoneme]]`` markup, anywhere in the value.
+    * ``"slashes"`` or ``"brackets"``: plain letters wrapped in one pair of slashes or
+      square brackets (``/shiv-awn/``, ``[shiv-AWN]``), the way phonetic spellings are
+      written. Slashes or brackets inside a respelling (``a/b``, ``ay [bee] see``,
+      ``[ay] bee [see]``) are fine.
+
+    Accented letters (é, ñ, ø, ł, ð) and the marks names use, such as the ʻokina in
+    *Hawaiʻi*, are fine.
     """
     spoken = spoken.strip()
+    if _IPA.search(spoken):
+        return "IPA"
+    if "[[" in spoken:
+        return "markup"
+    if _wrapped(spoken, "/", "/"):
+        return "slashes"
+    if _wrapped(spoken, "[", "]"):
+        return "brackets"
+    return None
+
+
+def is_phonetic(spoken: str) -> bool:
+    """True if a right-hand side is a phonetic spelling (:func:`phonetic_notation`)."""
+    return phonetic_notation(spoken) is not None
+
+
+def _wrapped(text: str, opening: str, closing: str) -> bool:
+    """True if ``text`` is one ``opening … closing`` pair: ``[sic]``, not ``[ay] bee [see]``."""
+    inside = text[1:-1]
     return (
-        (len(spoken) > 2 and spoken.startswith("/") and spoken.endswith("/"))
-        or (spoken.startswith("[") and spoken.endswith("]"))
-        or "[[" in spoken
-        or _IPA.search(spoken) is not None
+        len(text) >= 2
+        and text.startswith(opening)
+        and text.endswith(closing)
+        and opening not in inside
+        and closing not in inside
     )
 
 
@@ -197,28 +232,58 @@ def _literal(key: str) -> str:
     return re.escape(key).replace(r"\ ", r"\s+")
 
 
-def parse(text: str, source: str = "pronunciations") -> tuple[Pronunciations, list[str]]:
-    """Read a list from its text. Returns the fixes and a warning for every line skipped."""
-    entries: list[Pronunciation] = []
-    warnings: list[str] = []
+def _lines(text: str) -> Iterator[tuple[int, Pronunciation | None]]:
+    """Each line of a list that isn't blank or a comment: its number, and its fix (``None``
+    for a line without an arrow and something on each side)."""
     for number, raw in enumerate(text.splitlines(), start=1):
         line = _COMMENT.sub("", raw).strip()
         if not line:
             continue
         parts = _SEPARATOR.split(line, maxsplit=1)
         if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
+            yield number, None
+        else:
+            yield number, Pronunciation(parts[0].strip(), parts[1].strip())
+
+
+_SKIPPED = {
+    "IPA": "looks like IPA, and the voice can't use phonetic symbols",
+    "markup": "is eSpeak phoneme markup, which the voice can't use",
+    "slashes": "is in slashes, the way phonetic spellings are written",
+    "brackets": "is in brackets, the way phonetic spellings are written",
+}
+
+
+def parse(text: str, source: str = "pronunciations") -> tuple[Pronunciations, list[str]]:
+    """Read a list from its text. Returns the fixes and a warning for every line skipped."""
+    entries: list[Pronunciation] = []
+    warnings: list[str] = []
+    for number, entry in _lines(text):
+        if entry is None:
             warnings.append(f"{source}, line {number}: expected 'written → say it as'")
             continue
-        written, spoken = parts[0].strip(), parts[1].strip()
-        if is_phonetic(spoken):
+        notation = phonetic_notation(entry.spoken)
+        if notation is not None:
+            leave_out = (
+                f"leave the {notation} out and " if notation in ("slashes", "brackets") else ""
+            )
             warnings.append(
-                f"{source}, line {number}: '{spoken}' looks like IPA, and the voice can't use "
-                f"phonetic symbols, so the line is skipped; write a respelling for "
-                f"'{written}' instead, the way it sounds in plain letters, like shiv-AWN"
+                f"{source}, line {number}: '{entry.spoken}' {_SKIPPED[notation]}, so the line "
+                f"is skipped; {leave_out}write a respelling for '{entry.written}' instead, "
+                f"the way it sounds in plain letters, like shiv-AWN"
             )
             continue
-        entries.append(Pronunciation(written, spoken))
+        entries.append(entry)
     return Pronunciations(tuple(entries)), warnings
+
+
+def phonetic_lines(text: str) -> tuple[Pronunciation, ...]:
+    """The fixes in a list's text that :func:`parse` skips because their right side is a
+    phonetic spelling, in list order. The window replaces one of these when its word is
+    given a respelling, so its warning goes away."""
+    return tuple(
+        entry for _, entry in _lines(text) if entry is not None and is_phonetic(entry.spoken)
+    )
 
 
 def read_list(path: Path) -> str:
