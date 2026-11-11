@@ -634,7 +634,7 @@ def _scan(args: argparse.Namespace) -> int:
     print(f"This computer: {_machine_summary(machine)}.")
     if note := memory_note(machine):
         print(f"Note: {note}")
-    forget_failures(root)
+    forget_failures(root, on_wait=_waiting_for_install)
     forget_speeds(root)
     _prepare(use_gpu, root, assume_yes=args.yes, take_over=True)
     print("Measuring how fast this computer voices (a few seconds each)…")
@@ -882,7 +882,9 @@ def _prepare(use_gpu: bool, root: Path, *, assume_yes: bool, take_over: bool = F
         print(f"Total: {_megabytes(total)}, saved in {root}")
         if assume_yes:
             return True
-        if not sys.stdin.isatty():
+        # Only asked where the question can be seen: with the output going to a file, it
+        # would end up in the file, and the command would seem to hang.
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
             if updates:
                 print(
                     "Note: Tomecast will keep using the version it has; run again with --yes "
@@ -890,7 +892,12 @@ def _prepare(use_gpu: bool, root: Path, *, assume_yes: bool, take_over: bool = F
                 )
                 return False
             raise CliError("downloads are needed; run again with --yes to allow them")
-        if input("Download now? [y/N] ").strip().lower() in {"y", "yes"}:
+        try:
+            answer = input("Download now? [y/N] ")
+        except EOFError:  # Ctrl-D: no
+            print()
+            answer = ""
+        if answer.strip().lower() in {"y", "yes"}:
             return True
         if updates:
             print("Tomecast will keep using the version it has.")
@@ -908,6 +915,7 @@ def _prepare(use_gpu: bool, root: Path, *, assume_yes: bool, take_over: bool = F
             on_download=_download_printer,
             on_check=checking,
             take_over=take_over,
+            on_wait=_waiting_for_install,
         )
     except DownloadError as error:
         raise CliError(str(error)) from error
@@ -916,13 +924,21 @@ def _prepare(use_gpu: bool, root: Path, *, assume_yes: bool, take_over: bool = F
     return prepared
 
 
+def _waiting_for_install() -> None:
+    print("Waiting for another Tomecast to finish installing…", flush=True)
+
+
 def _download_printer(asset: Asset, number: int, count: int) -> ProgressCallback:
     stream: TextIO = sys.stderr
     finished = False
+    shown = -1
 
     def show(done: int, total: int) -> None:
-        nonlocal finished
+        nonlocal finished, shown
         percent = 100 * done // total if total else 100
+        if percent == shown:
+            return  # progress comes in small pieces; the line changes once per percent
+        shown = percent
         stream.write(f"\r  Downloading {asset.name}: {percent}% of {_megabytes(total)}")
         if done >= total and not finished:
             finished = True

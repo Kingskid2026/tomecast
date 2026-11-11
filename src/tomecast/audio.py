@@ -32,17 +32,31 @@ def wav_info(path: Path) -> WavInfo:
         return WavInfo(wav.getframerate(), wav.getnchannels(), wav.getsampwidth(), wav.getnframes())
 
 
-def peak_level(path: Path) -> float:
-    """The loudest RMS level of any 50 ms window, from 0.0 (silence) to 1.0 (full scale).
+@dataclass(frozen=True, slots=True)
+class WavData:
+    """What a WAV file's audio holds, read to its end."""
 
-    Only 16-bit PCM is supported. The file is streamed, so long files are fine.
-    """
+    # Whole frames that are really there: fewer than the header says if the file was cut
+    # short (a power cut can leave a file whose header was written but not all its data).
+    frames: int
+    peak: float  # see peak_level
+
+
+def read_wav(path: Path) -> WavData:
+    """Read all of a 16-bit PCM WAV's audio: how many frames are there, and how loud it is.
+    Raises ``wave.Error``, ``EOFError`` or ``OSError`` if it can't be read, and
+    ``ValueError`` if it isn't 16-bit. The file is streamed, so long files are fine."""
     with wave.open(str(path), "rb") as wav:
         if wav.getsampwidth() != 2:
             raise ValueError(f"{path.name}: expected 16-bit audio")
+        frame_size = 2 * wav.getnchannels()
         window = max(1, wav.getframerate() // 20) * wav.getnchannels()
         loudest = 0.0
+        found = 0
         while frames := wav.readframes(_FRAMES_PER_READ):
+            # Only the last read of a file that was cut short can end part-way through a frame.
+            frames = frames[: len(frames) - len(frames) % frame_size]
+            found += len(frames) // frame_size
             samples = array.array("h", frames)
             if sys.byteorder == "big":
                 samples.byteswap()  # WAV data is little-endian
@@ -50,7 +64,15 @@ def peak_level(path: Path) -> float:
                 part = samples[start : start + window]
                 rms = math.sqrt(sum(s * s for s in part) / len(part))
                 loudest = max(loudest, rms / 32768)
-        return loudest
+        return WavData(found, loudest)
+
+
+def peak_level(path: Path) -> float:
+    """The loudest RMS level of any 50 ms window, from 0.0 (silence) to 1.0 (full scale).
+
+    Only 16-bit PCM is supported. The file is streamed, so long files are fine.
+    """
+    return read_wav(path).peak
 
 
 def write_silence(path: Path, seconds: float, sample_rate: int) -> None:
