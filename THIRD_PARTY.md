@@ -16,7 +16,7 @@ This list reflects the current design ([docs/architecture.md](docs/architecture.
 | Model | Used for | License | Source |
 |---|---|---|---|
 | Docling Heron | PDF page layout | Apache 2.0 | [docling-project/docling-layout-heron](https://huggingface.co/docling-project/docling-layout-heron) |
-| PaddleOCR-VL-1.6 | Scanned PDF pages | Apache 2.0 | [PaddlePaddle/PaddleOCR-VL-1.6-GGUF](https://huggingface.co/PaddlePaddle/PaddleOCR-VL-1.6-GGUF) |
+| PaddleOCR-VL-1.6 (0.9B: an ERNIE-4.5-based 0.3B language part and a SigLIP-style vision part) | Scanned PDF pages | Apache 2.0 (the repository's `LICENSE` file) | [PaddlePaddle/PaddleOCR-VL-1.6](https://huggingface.co/PaddlePaddle/PaddleOCR-VL-1.6) (`model.safetensors`, revision `132c45f`, SHA-256 `85a479d5...`), converted to GGUF with llama.cpp's own converter: the language part quantized to Q4_K_M and Q8_0, the vision part kept at BF16. The official GGUF is [PaddlePaddle/PaddleOCR-VL-1.6-GGUF](https://huggingface.co/PaddlePaddle/PaddleOCR-VL-1.6-GGUF) (BF16 only) |
 | LFM3-1.7B | Spotting front/back matter and chapter starts | LFM Open License v1.0 (free for personal use and for organizations under US$10M annual revenue) | [LiquidAI/LFM3-1.7B-GGUF](https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF) |
 | MiniCPM5-2B | Backup for LFM3 | Apache 2.0 | [openbmb/MiniCPM5-2B](https://huggingface.co/OpenBMB/MiniCPM5-2B) |
 
