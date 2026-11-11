@@ -21,6 +21,8 @@ from tomecast.convert import (
     convert_book,
     plan_chunks,
 )
+from tomecast.textprep import TextPrep
+from tomecast.textprep_en import EnglishRules
 
 SAMPLE_RATE = 24000
 CHARS_PER_SECOND = 15.0
@@ -299,6 +301,47 @@ def test_changed_text_is_voiced_again_on_resume(tmp_path: Path) -> None:
     convert_book(edited, engine, tmp_path / "b2.m4b", workdir=workdir)
 
     assert engine.texts == ["It was a bright day."]  # the title was reused, the new text wasn't
+
+
+class _TextPrepBeforeTheFix:
+    """English text prep as it was before #67: "the the twenty-first", "He left. five"."""
+
+    language = "en"
+    consumed_words = EnglishRules.consumed_words
+
+    def heading(self, text: str) -> str:
+        return EnglishRules().heading(text)
+
+    def body(self, text: str) -> str:
+        spoken = EnglishRules().body(text)
+        return spoken.replace("the twenty-first", "the the twenty-first").replace(
+            ". Five", ". five"
+        )
+
+
+def test_a_book_started_with_older_text_prep_resumes(tmp_path: Path) -> None:
+    # Text prep isn't part of the work folder's key, and a chunk's audio file is named by
+    # its ID and a hash of its text: after a text prep change, a resumed book voices again
+    # only the chunks whose text changed (here a sentence also split in two), and reuses
+    # the rest.
+    book = Book(
+        "B", ("A",), "en",
+        (Chapter("One", ("It rained on the 21st of May.", "He left. 5 men came.", "All quiet.")),),
+    )  # fmt: skip
+    workdir = tmp_path / "work"
+    before = FakeEngine()
+    convert_book(
+        book, before, tmp_path / "b.m4b", workdir=workdir, prep=TextPrep(_TextPrepBeforeTheFix())
+    )
+    assert before.texts == [
+        "One", "It rained on the the twenty-first of May.", "He left. five men came.", "All quiet.",
+    ]  # fmt: skip
+
+    after = FakeEngine()
+    result = convert_book(book, after, tmp_path / "b2.m4b", workdir=workdir)
+
+    assert after.texts == ["It rained on the twenty-first of May.", "He left.", "Five men came."]
+    assert result.reused_chunks == 2  # the title and "All quiet."
 
 
 def test_a_damaged_cover_is_dropped_with_a_warning(tmp_path: Path) -> None:

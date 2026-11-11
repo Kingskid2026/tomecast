@@ -233,6 +233,12 @@ def test_dates(written: str, spoken: str) -> None:
     assert say(written) == spoken
 
 
+def _no_word_doubled_or_lost(written: str, prepared: str) -> None:
+    words = prepared.lower().split()
+    assert [w for w, after in pairwise(words) if w == after] == []
+    assert words_lost(written, prepared, english.consumed_words) == []
+
+
 # Each of these once came out with a word doubled ("the the twenty-first of May") or added.
 ORDINAL_DATES = [
     ("the 21st of May", "the twenty-first of May"),
@@ -247,8 +253,7 @@ ORDINAL_DATES = [
     ("He came on the 1st.", "He came on the first."),
     ("the 2nd and 3rd", "the second and third"),
     ("the 2nd and 3rd of May", "the second and third of May"),
-    ("the 2nd and 3rd May", "the second and third of May"),
-    ("the 2nd, 3rd and 4th May", "the second, third and fourth of May"),
+    ("The 2nd and 3rd of May were warm.", "The second and third of May were warm."),
     ("from the 1st to the 3rd of May", "from the first to the third of May"),
     ("the 22nd of June, 1815", "the twenty-second of June, eighteen fifteen"),
     (
@@ -266,10 +271,10 @@ ORDINAL_DATES = [
     ("the\n21st of May", "the\ntwenty-first of May"),
     ("Tuesday the 21st of May", "Tuesday the twenty-first of May"),
     ("on the 21st, the 22nd of May.", "on the twenty-first, the twenty-second of May."),
+    ("He left. The 21 May was warm.", "He left. The twenty-first of May was warm."),
     # With "of" written, the writer's own words are kept and no "the" is added.
     ("Every 4th of July we met.", "Every fourth of July we met."),
     ("that fateful 21st of May", "that fateful twenty-first of May"),
-    ("every 4 July", "every fourth of July"),
     # A paragraph starting with an ordinal.
     ("21st of May was warm.", "twenty-first of May was warm."),
     ("21st May was warm.", "the twenty-first of May was warm."),
@@ -281,13 +286,81 @@ ORDINAL_DATES = [
 def test_ordinal_dates_say_every_word_once(written: str, spoken: str) -> None:
     prepared = TextPrep.for_language("en").body(written)
     assert prepared == spoken
-    words = prepared.lower().split()
-    assert [w for w, after in pairwise(words) if w == after] == []
-    assert words_lost(written, prepared, english.consumed_words) == []
+    _no_word_doubled_or_lost(written, prepared)
 
 
-# A number that starts a sentence mid-paragraph is said with a capital letter: the chunker
-# only ends a sentence before a word that doesn't start in lowercase.
+# Words that can only be a determiner right before a date: "21 May" gets no "the" of its own.
+@pytest.mark.parametrize(
+    "word",
+    ["the", "every", "each", "this", "next", "last", "same", "my", "your", "his", "our",
+     "their", "its", "This", "EVERY"],
+)  # fmt: skip
+def test_a_determiner_is_the_dates_article(word: str) -> None:
+    written = f"We met {word} 4 July."
+    prepared = TextPrep.for_language("en").body(written)
+    assert prepared == f"We met {word} fourth of July."
+    _no_word_doubled_or_lost(written, prepared)
+
+
+# Words that are often something else before a date: it gets its "the", as on main.
+@pytest.mark.parametrize(
+    ("written", "spoken"),
+    [
+        ("He said that 21 May was fine.", "He said that the twenty-first of May was fine."),
+        ("We hoped that 4 July 1776 would be remembered.",
+         "We hoped that the fourth of July, seventeen seventy-six would be remembered."),
+        ("Is it true that 3rd May is a holiday?",
+         "Is it true that the third of May is a holiday?"),
+        ("I told her 21 May was fine.", "I told her the twenty-first of May was fine."),
+        ("They met her 3rd May 1815 in Paris.",
+         "They met her the third of May, eighteen fifteen in Paris."),
+        ("At last 4 July came.", "At last the fourth of July came."),
+        ("At long last 4 July came.", "At long last the fourth of July came."),
+        ("any 4 July", "any the fourth of July"),
+        ("bathe 4 July", "bathe the fourth of July"),  # "the" inside a word doesn't count
+    ],
+)  # fmt: skip
+def test_a_word_that_may_not_be_a_determiner_keeps_the_dates_article(
+    written: str, spoken: str
+) -> None:
+    prepared = TextPrep.for_language("en").body(written)
+    assert prepared == spoken
+    _no_word_doubled_or_lost(written, prepared)
+
+
+@pytest.mark.parametrize(
+    ("written", "spoken"),
+    [
+        ("the 2nd and 3rd May", "the second and third of May"),
+        ("the 2nd, 3rd and 4th May", "the second, third and fourth of May"),
+        ("the 2nd, 3rd May", "the second, third of May"),
+        ("the 2nd or 3rd May", "the second or third of May"),
+        ("the 2 and 3 May", "the second and third of May"),
+        ("2, 3 and 4 May", "the second, third and fourth of May"),
+        ("the 3 & 4 May", "the third and fourth of May"),
+        ("the 3-4 May", "the third to fourth of May"),
+        ("the 3rd-4th May", "the third to fourth of May"),
+        ("3\u20134 May 1815", "the third to fourth of May, eighteen fifteen"),
+        ("from the 3rd to 4th May", "from the third to the fourth of May"),
+        ("It was over. 2 and 3 May were warm.",
+         "It was over. The second and third of May were warm."),
+        # Not lists of days: only the last number is part of the date, as on main.
+        ("of the 12, 4 May have gone", "of the twelve, the fourth of May have gone"),
+        ("the 2nd, 3 May", "the second, the third of May"),
+        ("1, 2nd and 3rd May", "one, second and the third of May"),
+        ("the 4-3 May", "the four-the third of May"),
+        ("pages 40-41 May", "pages forty to forty-one May"),
+    ],
+)  # fmt: skip
+def test_days_listed_before_a_month_are_all_ordinals(written: str, spoken: str) -> None:
+    prepared = TextPrep.for_language("en").body(written)
+    assert prepared == spoken
+    _no_word_doubled_or_lost(written, prepared)
+
+
+# A number that starts a sentence after another one is said with a capital letter: the
+# chunker only ends a sentence before a word that doesn't start in lowercase. The sentence
+# count stays what it is for the text as written.
 SENTENCE_STARTS = [
     ("He left. 21st May was warm.", "He left. The twenty-first of May was warm."),
     ("He left. 21st of May was warm.", "He left. Twenty-first of May was warm."),
@@ -295,15 +368,38 @@ SENTENCE_STARTS = [
     ("Stop! 1st of all, listen.", "Stop! First of all, listen."),
     ("Why? 21st-century life.", "Why? Twenty-first-century life."),
     ('He left. "21st May," she said.', 'He left. "The twenty-first of May," she said.'),
-    ("at 3 p.m. 21st May was warm.", "at three pee em. The twenty-first of May was warm."),
     ("He left. 5 men came.", "He left. Five men came."),
-    ("He left... 3 men came.", "He left... Three men came."),
+    ("He came in. 5 men followed.", "He came in. Five men followed."),
+    ("It was 1865. 1866 was worse.",
+     "It was one thousand eight hundred sixty-five. One thousand eight hundred sixty-six was "
+     "worse."),
+    ("On the 3rd. 5 men came.", "On the third. Five men came."),
     ("Gone. $5 was lost.", "Gone. Five dollars was lost."),
     ("Done. 50% of it.", "Done. Fifty percent of it."),
     ("Fine. 1/2 of it.", "Fine. One half of it."),
     ("He left. 1960s music played.", "He left. Nineteen sixties music played."),
     ("It ended. 5-7 men came.", "It ended. Five to seven men came."),
     ("Done. 3:45 p.m. came.", "Done. Three forty-five pee em came."),
+    ("He left. -5 degrees.", "He left. Minus five degrees."),
+    ("He left. \u22125 degrees.", "He left. Minus five degrees."),
+    ("He left. No. 5 was next.", "He left. Number five was next."),
+    # After a spelled-out a.m., p.m., B.C. or A.D., whichever rule says the number.
+    ("He left at 3 a.m. 5 men came.", "He left at three ay em. Five men came."),
+    ("He left at 11:05 AM. 5 men came.", "He left at eleven oh five ay em. Five men came."),
+    ("He woke at 6 a.m. 20 minutes later he left.",
+     "He woke at six ay em. Twenty minutes later he left."),
+    ("He left at 3 p.m. 5 men came.", "He left at three pee em. Five men came."),
+    ("He left at 3 p.m. $5 was lost.", "He left at three pee em. Five dollars was lost."),
+    ("He came at 3 p.m. 1960s music played.",
+     "He came at three pee em. Nineteen sixties music played."),
+    ("He left at 3 p.m. 21 May was the day.",
+     "He left at three pee em. The twenty-first of May was the day."),
+    ("It was 3 a.m. 3:45 p.m. was later.",
+     "It was three ay em. Three forty-five pee em was later."),
+    ("It fell in 44 B.C. 15 years later he died.",
+     "It fell in forty-four bee see. Fifteen years later he died."),
+    ("It fell in 476 A.D. 5 men saw it.",
+     "It fell in four hundred seventy-six ay dee. Five men saw it."),
 ]  # fmt: skip
 
 
@@ -312,19 +408,83 @@ def test_a_number_starting_a_sentence_keeps_the_sentence_apart(written: str, spo
     prepared = say(written)
     assert prepared == spoken
     assert len(split_sentences(prepared)) == len(split_sentences(written))
+    _no_word_doubled_or_lost(written, prepared)
 
 
 @pytest.mark.parametrize(
     ("written", "spoken"),
     [
-        ("Mr. 5 came", "Mister five came"),  # an abbreviation's period doesn't end a sentence
-        ("J. 5 men", "J. five men"),  # nor does an initial's
-        ("e.g. 21 May", "for example the twenty-first of May"),
-        ("4 July 1776", "the fourth of July, seventeen seventy-six"),  # the paragraph's start
+        (
+            "He left. A.D. 476 was the year.",
+            "He left. Ay dee four hundred seventy-six was the year.",
+        ),
+        ("He met Maj. Smith. 5 men came.", "He met Major Smith. Five men came."),
     ],
 )
-def test_a_number_not_starting_a_sentence_stays_lowercase(written: str, spoken: str) -> None:
-    assert say(written) == spoken
+def test_a_spelled_out_abbreviation_keeps_the_sentences_apart(written: str, spoken: str) -> None:
+    # As written, the chunker also splits after "A.D." and "Maj."; once they are words, it
+    # rightly doesn't, so these have one sentence fewer than the written text.
+    prepared = say(written)
+    assert prepared == spoken
+    assert len(split_sentences(prepared)) == 2
+
+
+# Where a period, ellipsis or "!" may not end the sentence, the number stays lowercase, so
+# the sentence stays whole: never more sentences than before these rules. (From the review
+# of #67: each of these was split mid-clause by an earlier version.)
+NOT_SENTENCE_STARTS = [
+    ("On Fri. 5 May 1865 he left for London.",
+     "On Fri. the fifth of May, eighteen sixty-five he left for London.", 1),
+    ("Tues. 21st May. Rain all day.", "Tues. the twenty-first of May. Rain all day.", 2),
+    ("The U.S. $5 billion plan failed.", "The U.S. five billion dollars plan failed.", 1),
+    ("The U.S. 1st Army and the U.S. 3rd Army met.",
+     "The U.S. first Army and the U.S. third Army met.", 1),
+    ("It weighed 5 lbs. 3 oz. at birth.", "It weighed five lbs. three oz. at birth.", 1),
+    ("It weighed 12 lb. 6 oz. and cost 10s. 6d. in all.",
+     "It weighed twelve lb. six oz. and cost tens. six d. in all.", 1),
+    ("The trip took 3 hrs. 20 min. by rail.", "The trip took three hrs. twenty min. by rail.", 1),
+    ("He lived in Washington, D.C. 5 years.", "He lived in Washington, D.C. five years.", 1),
+    ("Born ca. 1850 in Washington, D.C. 3 miles away.",
+     "Born circa eighteen fifty in Washington, D.C. three miles away.", 1),
+    ("It was B.C. 50% of the time.", "It was bee see fifty percent of the time.", 1),
+    ("It was B.C. 3 years ago.", "It was bee see three years ago.", 1),
+    ("In A.D. 476 Rome fell.", "In ay dee four hundred seventy-six Rome fell.", 1),
+    # A sentence's opening phrase: "At 3 a.m., 5 men came."
+    ("At 3 a.m. 5 men came.", "At three ay em five men came.", 1),
+    ("At 3 p.m. $5 was lost.", "At three pee em five dollars was lost.", 1),
+    ("By 1200 B.C. 5 cities had fallen.",
+     "By twelve hundred bee see five cities had fallen.", 1),
+    ("He left. In 476 A.D. 500 followed.",
+     "He left. In four hundred seventy-six ay dee five hundred followed.", 2),
+    ("William I (r. 1066-87) and Bede (d. 735).",
+     "William I (r. ten sixty-six to eighty-seven) and Bede (d. seven hundred thirty-five).", 1),
+    ("See sec. 5 and art. 12 of the treaty.", "See sec. five and art. twelve of the treaty.", 1),
+    ("He counted... 3... 2... 1... and jumped.",
+     "He counted... three... two... one... and jumped.", 1),
+    ('"Stop!" 5 men cried.', '"Stop!" five men cried.', 1),
+    ("Chapter One ........ 1", "Chapter One ........ one", 1),
+    ("Mr. 5 came", "Mister five came", 1),
+    ("J. 5 men", "J. five men", 1),
+    ("e.g. 21 May", "for example the twenty-first of May", 1),
+    ("4 July 1776", "the fourth of July, seventeen seventy-six", 1),  # the paragraph's start
+]  # fmt: skip
+
+
+@pytest.mark.parametrize(("written", "spoken", "sentences"), NOT_SENTENCE_STARTS)
+def test_a_number_that_may_not_start_a_sentence_stays_lowercase(
+    written: str, spoken: str, sentences: int
+) -> None:
+    prepared = say(written)
+    assert prepared == spoken
+    assert len(split_sentences(prepared)) == sentences
+    _no_word_doubled_or_lost(written, prepared)
+
+
+def test_a_paragraph_already_holding_the_marker_character_is_left_alone() -> None:
+    # Sentence starts are marked with a private-use character while the rules run. A
+    # paragraph that has one of its own is prepared without marks and keeps it.
+    assert say("He left. 5 men\ue000 came.") == "He left. five men\ue000 came."
+    assert "\ue000" not in say("He left. 5 men came.")
 
 
 @pytest.mark.parametrize(

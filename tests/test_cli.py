@@ -796,11 +796,15 @@ def test_convert_cleanup_options(tmp_path: Path, capsys: pytest.CaptureFixture[s
     assert "Left out: footnote markers (1)." in out
     assert "Converting “A Story”: 3 chapters" in out
     assert " ".join(FakeKokoro.texts) == (
-        # Kept page numbers and headers are spoken like any text, numbers as words (with a
-        # capital after a dot leader, where the chunker starts a new sentence).
-        "Contents Chapter One ........ One Chapter Two ........ Two Afterword ........ Three "
+        # Kept page numbers and headers are spoken like any text, numbers as words.
+        "Contents Chapter One ........ one Chapter Two ........ two Afterword ........ three "
         "A STORY Chapter One It began. It went on. one A STORY As stories do. Chapter Two "
         "It ended without a two A STORY period three"
+    )
+    # A dot leader may not end a sentence, so a page number after one stays lowercase and
+    # the contents page stays one sentence: it isn't split before each page number.
+    assert FakeKokoro.texts[1] == (
+        "Chapter One ........ one Chapter Two ........ two Afterword ........ three"
     )
 
 
