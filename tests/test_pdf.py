@@ -7,9 +7,11 @@ of the Magi", 1905), so each test knows exactly where every line, header and foo
 from __future__ import annotations
 
 import struct
+import unicodedata
 import zlib
 from pathlib import Path
 
+import pypdfium2 as pdfium
 import pytest
 from pdf_factory import (
     LEADING,
@@ -18,6 +20,7 @@ from pdf_factory import (
     SAMPLE_AUTHOR,
     SAMPLE_CHAPTERS,
     SAMPLE_TITLE,
+    TYPESET_FONTS,
     Bookmark,
     PageBuilder,
     PdfPage,
@@ -30,7 +33,7 @@ from tomecast.book import MARKER_END, MARKER_START, Band, Book, Role
 from tomecast.chunking import split_sentences
 from tomecast.cleanup import CleanupOptions, CleanupResult, Matter, clean
 from tomecast.readers import FORMATS, SUFFIXES, InvalidEbookError, read_book
-from tomecast.readers.pdf import read_pdf
+from tomecast.readers.pdf import _character, _page_chars, read_pdf
 
 # --- The known pages ---------------------------------------------------------------------------
 
@@ -488,6 +491,67 @@ def test_every_sentence_of_the_body_survives_cleanup(tmp_path: Path) -> None:
         "page-numbers", "footnote-markers", "footnotes", "captions", Matter.FRONT,
         Matter.CONTENTS,
     }  # fmt: skip
+
+
+# --- Ligatures ---------------------------------------------------------------------------------
+
+# A paragraph set with ligature glyphs (ﬀ ﬁ ﬂ ﬃ ﬄ), as a typeset book has them: inside words,
+# at their start and end, next to real spaces, and at the start and end of a line.
+LIGATURE_LINES = (
+    "A \ufb01nite \ufb01gure, the \ufb02ow of an o\ufb03ce and an a\ufb04uent",
+    "sta\ufb00: of \ufb01nite di\ufb00erence, if \ufb01fty bu\ufb00 \ufb01elds are o\ufb00",
+    "\ufb02at.",
+)
+LIGATURE_TEXT = (
+    "A finite figure, the flow of an office and an affluent staff: of finite difference, "
+    "if fifty buff fields are off flat."
+)
+
+
+def _ligature_pdf(path: Path, font: str) -> Path:
+    page = PageBuilder()
+    page.paragraph(LIGATURE_LINES, font=font)
+    return build_pdf(path, [page.page])
+
+
+@pytest.mark.parametrize("font", TYPESET_FONTS)
+def test_words_with_ligatures_read_whole(tmp_path: Path, font: str) -> None:
+    """PDFium hands a ligature glyph over as one character per letter, each with the whole
+    glyph's box; that overlap must not cut the word ("f inite"). The spaces around the
+    ligatures stay, and every letter is read once."""
+    book = read_pdf(_ligature_pdf(tmp_path / "ligatures.pdf", font))
+
+    assert book.chapters[0].paragraphs == (LIGATURE_TEXT,)
+
+
+def test_a_ligature_glyph_is_one_character_with_all_its_letters(tmp_path: Path) -> None:
+    document = pdfium.PdfDocument(_ligature_pdf(tmp_path / "ligatures.pdf", "typeset"))
+    page = document[0]
+    textpage = page.get_textpage()
+    try:
+        chars, _ = _page_chars(textpage)
+    finally:
+        textpage.close()
+        page.close()
+        document.close()
+
+    texts = [char.text for char in chars]
+    # Every letter once, in order: none lost, none doubled.
+    assert "".join(texts) == "".join(LIGATURE_TEXT.split())
+    assert [text for text in texts if len(text) > 1] == [
+        unicodedata.normalize("NFKC", character)
+        for line in LIGATURE_LINES
+        for character in line
+        if "\ufb00" <= character <= "\ufb06"
+    ]
+
+
+def test_ligature_characters_become_their_letters_and_nothing_else_is_normalised() -> None:
+    assert [_character(code) for code in range(0xFB00, 0xFB07)] == [
+        "ff", "fi", "fl", "ffi", "ffl", "st", "st",
+    ]  # fmt: skip
+    for text in ("²", "½", "ſ", "Ⅳ", "™", "Ａ", "é"):
+        assert _character(ord(text)) == text
 
 
 # --- Metadata, cover and errors ----------------------------------------------------------------
