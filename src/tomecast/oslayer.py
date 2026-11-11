@@ -8,9 +8,9 @@ library.
 
 * :class:`FileLock`: an exclusive lock on a lock file (``flock`` on POSIX, ``msvcrt.locking``
   on Windows), for the work-folder and install locks.
-* :func:`child_options` and :func:`adopt_child`: stop a child process (the voice engine) if
-  Tomecast itself dies (``PR_SET_PDEATHSIG`` on Linux, a Job Object that kills its processes
-  when closed on Windows).
+* :func:`start_tied`: start a child process (the voice engine) that stops if Tomecast itself
+  dies (``PR_SET_PDEATHSIG`` on Linux, a Job Object that kills its processes when closed on
+  Windows).
 * :func:`data_dir` and :func:`config_dir`: where Tomecast keeps its files (XDG on Linux,
   ``%LOCALAPPDATA%`` on Windows).
 * :func:`stop_signals` and :func:`on_signals`: the signals that ask Tomecast to stop tidily.
@@ -29,10 +29,10 @@ import signal
 import subprocess
 import sys
 import threading
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from pathlib import Path, PurePath
 from types import FrameType
-from typing import Any, TypedDict
+from typing import Any
 
 if sys.platform == "win32":
     import msvcrt
@@ -45,6 +45,8 @@ IS_WINDOWS = sys.platform == "win32"
 
 # --- Folders --------------------------------------------------------------------------------
 
+HomeFolder = Callable[[], PurePath]
+
 
 def data_dir() -> Path:
     """Tomecast's data folder (engines, models, work folders, ``installed.json``).
@@ -53,8 +55,8 @@ def data_dir() -> Path:
     ``%LOCALAPPDATA%\\Tomecast``, or ``~\\AppData\\Local\\Tomecast`` if that isn't set.
     """
     if sys.platform == "win32":
-        return Path(local_app_data(os.environ, Path.home())) / "Tomecast"
-    return Path(xdg_data_home(os.environ, Path.home())) / "tomecast"
+        return Path(local_app_data(os.environ, Path.home, Path)) / "Tomecast"
+    return Path(xdg_data_home(os.environ, Path.home, Path)) / "tomecast"
 
 
 def config_dir() -> Path:
@@ -66,35 +68,47 @@ def config_dir() -> Path:
     it's told to use an INI file; which one Tomecast uses there is still to be decided (#39).
     """
     if sys.platform == "win32":
-        return Path(local_app_data(os.environ, Path.home())) / "Tomecast" / "config"
-    return Path(xdg_config_home(os.environ, Path.home())) / "Tomecast"
+        return Path(local_app_data(os.environ, Path.home, Path)) / "Tomecast" / "config"
+    return Path(xdg_config_home(os.environ, Path.home, Path)) / "Tomecast"
 
 
-def xdg_data_home(environ: Mapping[str, str], home: PurePath) -> PurePath:
-    """``$XDG_DATA_HOME``, or ``~/.local/share``.
+# The home folder is only looked up when it's needed: Path.home() raises if HOME is unset and
+# the user has no passwd entry (a container run with an arbitrary uid), and a set
+# XDG_DATA_HOME has always been enough for Tomecast to run there.
+
+
+def xdg_data_home(
+    environ: Mapping[str, str], home: HomeFolder, path: type[PurePath] = Path
+) -> PurePath:
+    """``$XDG_DATA_HOME``, or ``~/.local/share`` (``home()`` is only called then).
 
     Any non-empty value is used, even a relative one: that's what Tomecast has always done
     for its data folder, and changing it would move someone's downloads.
     """
     configured = environ.get("XDG_DATA_HOME")
-    return type(home)(configured) if configured else home / ".local" / "share"
+    return path(configured) if configured else home() / ".local" / "share"
 
 
-def xdg_config_home(environ: Mapping[str, str], home: PurePath) -> PurePath:
+def xdg_config_home(
+    environ: Mapping[str, str], home: HomeFolder, path: type[PurePath] = Path
+) -> PurePath:
     """``$XDG_CONFIG_HOME`` if it's an absolute path (as the XDG spec and Qt require), or
-    ``~/.config``."""
+    ``~/.config`` (``home()`` is only called then)."""
     configured = environ.get("XDG_CONFIG_HOME")
-    if configured and type(home)(configured).is_absolute():
-        return type(home)(configured)
-    return home / ".config"
+    if configured and path(configured).is_absolute():
+        return path(configured)
+    return home() / ".config"
 
 
-def local_app_data(environ: Mapping[str, str], home: PurePath) -> PurePath:
-    """``%LOCALAPPDATA%`` if it's an absolute path, or ``~\\AppData\\Local``."""
+def local_app_data(
+    environ: Mapping[str, str], home: HomeFolder, path: type[PurePath] = Path
+) -> PurePath:
+    """``%LOCALAPPDATA%`` if it's an absolute path, or ``~\\AppData\\Local`` (``home()`` is
+    only called then)."""
     configured = environ.get("LOCALAPPDATA")
-    if configured and type(home)(configured).is_absolute():
-        return type(home)(configured)
-    return home / "AppData" / "Local"
+    if configured and path(configured).is_absolute():
+        return path(configured)
+    return home() / "AppData" / "Local"
 
 
 # --- File locks -----------------------------------------------------------------------------
@@ -104,11 +118,13 @@ class FileLock:
     """An exclusive lock on a lock file, taken without waiting.
 
     The file is created if it's missing and never truncated. The lock lasts until
-    :meth:`release`; if the process dies, the system lets go of it. Two locks on the same
-    file conflict even within one process (``flock`` locks belong to the open file, and
-    Windows' byte-range locks to the handle), so a second window, thread or terminal can't
-    take a lock the first one holds. On POSIX this is the same ``flock`` Tomecast has always
-    used, so it also conflicts with an older Tomecast's lock on the same file.
+    :meth:`release`, or until the ``FileLock`` is garbage-collected (as a dropped file object
+    would be), or until the process dies. Release it in a ``finally`` all the same: that's
+    the only way to be sure when it's freed. Two locks on the same file conflict even within
+    one process (``flock`` locks belong to the open file, and Windows' byte-range locks to
+    the handle), so a second window, thread or terminal can't take a lock the first one
+    holds. On POSIX this is the same ``flock`` Tomecast has always used, so it also conflicts
+    with an older Tomecast's lock on the same file.
     """
 
     def __init__(self, path: Path) -> None:
@@ -151,6 +167,12 @@ class FileLock:
         finally:
             os.close(fd)
 
+    def __del__(self) -> None:
+        # A lock dropped while held (say, an exception between acquire() and the caller's
+        # `try`) is let go, instead of being held until the process exits.
+        with contextlib.suppress(Exception):
+            self.release()
+
 
 if sys.platform == "win32":
 
@@ -186,57 +208,50 @@ else:
 # --- Child processes that stop with Tomecast --------------------------------------------------
 
 
-class ChildOptions(TypedDict):
-    """Keyword arguments for :class:`subprocess.Popen` that tie a child's life to Tomecast's.
+def start_tied(args: Sequence[str], **popen_kwargs: Any) -> subprocess.Popen[Any]:
+    """``subprocess.Popen(args, **popen_kwargs)``, for a child that must stop if Tomecast
+    dies (crash, ``kill -9``, Task Manager), so a voice engine is never left running alone.
 
-    Use them with :func:`adopt_child` right after the child starts:
-
-        process = subprocess.Popen(command, **child_options())
-        adopt_child(process)
-    """
-
-    preexec_fn: Callable[[], object] | None
-    creationflags: int
-
-
-def child_options() -> ChildOptions:
-    """Popen options that stop the child if Tomecast dies (crash, ``kill -9``, power-off of
-    the terminal), so a voice engine is never left running on its own.
-
-    Linux: a ``preexec_fn`` that sets ``PR_SET_PDEATHSIG`` to SIGTERM. Linux sends it when
-    the *thread* that started the child exits, so start long-lived children from a thread
-    that lives as long as they should. ``prctl`` is looked up here, in the parent: loading a
+    Linux: a ``preexec_fn`` sets ``PR_SET_PDEATHSIG`` to SIGTERM. Linux sends it when the
+    *thread* that started the child exits, so start long-lived children from a thread that
+    lives as long as they should. ``prctl`` is looked up here, in the parent: loading a
     library in the forked child could deadlock if Tomecast has threads.
 
-    Windows: no console window for the child (``CREATE_NO_WINDOW``, so none flashes up when
-    the window starts the engine). The tie itself is made by :func:`adopt_child`.
+    Windows: the child starts suspended and with no console window (``CREATE_SUSPENDED |
+    CREATE_NO_WINDOW``), is put in a Job Object that kills every process in it when its last
+    handle closes, and only then runs. Tomecast holds that handle until it exits, however it
+    exits, so the child (and anything it starts) never runs outside the job and can't outlive
+    Tomecast.
 
-    Other POSIX systems: nothing (they have no parent-death signal).
+    Other POSIX systems: a plain ``Popen`` (they have no parent-death signal).
+
+    Raises:
+        ValueError: if ``popen_kwargs`` sets ``preexec_fn`` (this function sets its own).
+        OSError: if the child can't be started or, on Windows, tied to Tomecast. A child
+            that started but couldn't be tied is killed first, never left running.
     """
+    if "preexec_fn" in popen_kwargs:
+        raise ValueError("start_tied() sets preexec_fn itself")
     if sys.platform == "win32":
-        return {"preexec_fn": None, "creationflags": subprocess.CREATE_NO_WINDOW}
+        flags = popen_kwargs.pop("creationflags", 0)
+        flags |= _CREATE_SUSPENDED | subprocess.CREATE_NO_WINDOW
+        process = subprocess.Popen(args, creationflags=flags, **popen_kwargs)
+        try:
+            _assign_to_job(process.pid)
+            _resume(process.pid)
+        except BaseException:
+            process.kill()
+            process.wait()
+            raise
+        return process
     if sys.platform == "linux":
         prctl = _linux_prctl()
 
         def stop_with_parent() -> None:  # runs in the child, after fork: only calls prctl
             prctl(_PR_SET_PDEATHSIG, signal.SIGTERM)
 
-        return {"preexec_fn": stop_with_parent, "creationflags": 0}
-    return {"preexec_fn": None, "creationflags": 0}
-
-
-def adopt_child(process: subprocess.Popen[Any]) -> None:
-    """Finish tying ``process`` (started with :func:`child_options`) to Tomecast's life.
-
-    Windows: puts it in a Job Object that kills every process in it when its last handle
-    closes. Tomecast holds that handle until it exits, however it exits, so the child
-    can't outlive it. POSIX: nothing more to do.
-
-    Raises:
-        OSError: on Windows, if the child is still running but couldn't be put in the job.
-    """
-    if sys.platform == "win32":
-        _assign_to_job(process)
+        return subprocess.Popen(args, preexec_fn=stop_with_parent, **popen_kwargs)
+    return subprocess.Popen(args, **popen_kwargs)
 
 
 _PR_SET_PDEATHSIG = 1
@@ -247,8 +262,8 @@ def _linux_prctl() -> Any:
     return ctypes.CDLL(None, use_errno=True).prctl
 
 
-# The Job Object structures (winnt.h), defined on every platform so their layout can be
-# tested anywhere. Sizes on 64-bit Windows: 64, 48 and 144 bytes.
+# The Windows structures (winnt.h, tlhelp32.h), defined on every platform so their layout can
+# be tested anywhere. Sizes on 64-bit Windows: 64, 48, 144 and 28 bytes.
 class JobObjectBasicLimitInformation(ctypes.Structure):
     _fields_ = (
         ("PerProcessUserTimeLimit", ctypes.c_int64),  # LARGE_INTEGER
@@ -285,38 +300,58 @@ class JobObjectExtendedLimitInformation(ctypes.Structure):
     )
 
 
+class ThreadEntry32(ctypes.Structure):
+    _fields_ = (
+        ("dwSize", ctypes.c_uint32),
+        ("cntUsage", ctypes.c_uint32),
+        ("th32ThreadID", ctypes.c_uint32),
+        ("th32OwnerProcessID", ctypes.c_uint32),
+        ("tpBasePri", ctypes.c_int32),  # LONG
+        ("tpDeltaPri", ctypes.c_int32),
+        ("dwFlags", ctypes.c_uint32),
+    )
+
+
 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
 _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9  # JOBOBJECTINFOCLASS
+_CREATE_SUSPENDED = 0x00000004  # not in the subprocess module
 _PROCESS_TERMINATE = 0x0001
 _PROCESS_SET_QUOTA = 0x0100
+_THREAD_SUSPEND_RESUME = 0x0002
+_TH32CS_SNAPTHREAD = 0x00000004
+_INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+_RESUME_FAILED = 0xFFFFFFFF  # ResumeThread's (DWORD)-1
 
 _job_lock = threading.Lock()
 _job_handle: int | None = None  # never closed: Windows closes it when Tomecast exits
 
 if sys.platform == "win32":
 
+    @functools.cache
     def _kernel32() -> ctypes.WinDLL:
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.CreateJobObjectW.argtypes = (ctypes.c_void_p, wintypes.LPCWSTR)
-        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
-        kernel32.SetInformationJobObject.argtypes = (
-            wintypes.HANDLE,
-            ctypes.c_int,
-            ctypes.c_void_p,
-            wintypes.DWORD,
-        )
-        kernel32.SetInformationJobObject.restype = wintypes.BOOL
-        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
-        kernel32.OpenProcess.restype = wintypes.HANDLE
-        kernel32.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
-        kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
-        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
-        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle, dword, boolean = wintypes.HANDLE, wintypes.DWORD, wintypes.BOOL
+        prototypes: dict[str, tuple[Any, tuple[Any, ...]]] = {
+            "CreateJobObjectW": (handle, (ctypes.c_void_p, wintypes.LPCWSTR)),
+            "SetInformationJobObject": (boolean, (handle, ctypes.c_int, ctypes.c_void_p, dword)),
+            "OpenProcess": (handle, (dword, boolean, dword)),
+            "AssignProcessToJobObject": (boolean, (handle, handle)),
+            "CreateToolhelp32Snapshot": (handle, (dword, dword)),
+            "Thread32First": (boolean, (handle, ctypes.c_void_p)),
+            "Thread32Next": (boolean, (handle, ctypes.c_void_p)),
+            "OpenThread": (handle, (dword, boolean, dword)),
+            "ResumeThread": (dword, (handle,)),
+            "CloseHandle": (boolean, (handle,)),
+        }
+        for name, (restype, argtypes) in prototypes.items():
+            function = getattr(kernel32, name)
+            function.restype, function.argtypes = restype, argtypes
         return kernel32
 
-    def _kill_on_close_job(kernel32: ctypes.WinDLL) -> int:
+    def _kill_on_close_job() -> int:
         """This process's job for its children, made the first time it's needed."""
         global _job_handle
+        kernel32 = _kernel32()
         with _job_lock:
             if _job_handle is None:
                 job = kernel32.CreateJobObjectW(None, None)
@@ -336,23 +371,48 @@ if sys.platform == "win32":
                 _job_handle = int(job)
             return _job_handle
 
-    def _assign_to_job(process: subprocess.Popen[Any]) -> None:
+    def _assign_to_job(pid: int) -> None:
         kernel32 = _kernel32()
-        job = _kill_on_close_job(kernel32)
+        job = _kill_on_close_job()
         # Popen keeps its own handle open, so the PID can't be reused while we do this.
-        handle = kernel32.OpenProcess(_PROCESS_SET_QUOTA | _PROCESS_TERMINATE, False, process.pid)
-        if not handle:
-            error = ctypes.get_last_error()
-            if process.poll() is not None:
-                return  # it has already exited: nothing to stop
-            raise ctypes.WinError(error)
+        process = kernel32.OpenProcess(_PROCESS_SET_QUOTA | _PROCESS_TERMINATE, False, pid)
+        if not process:
+            raise ctypes.WinError(ctypes.get_last_error())
         try:
-            if not kernel32.AssignProcessToJobObject(job, handle):
-                error = ctypes.get_last_error()
-                if process.poll() is None:
-                    raise ctypes.WinError(error)
+            if not kernel32.AssignProcessToJobObject(job, process):
+                raise ctypes.WinError(ctypes.get_last_error())
         finally:
-            kernel32.CloseHandle(handle)
+            kernel32.CloseHandle(process)
+
+    def _resume(pid: int) -> None:
+        """Let a process started with ``CREATE_SUSPENDED`` run: resume its (one) thread.
+        Popen closes the thread handle CreateProcess returns, so the thread is found by
+        listing the system's threads."""
+        kernel32 = _kernel32()
+        snapshot = kernel32.CreateToolhelp32Snapshot(_TH32CS_SNAPTHREAD, 0)
+        if snapshot is None or snapshot == _INVALID_HANDLE_VALUE:
+            raise ctypes.WinError(ctypes.get_last_error())
+        resumed = 0
+        try:
+            entry = ThreadEntry32()
+            entry.dwSize = ctypes.sizeof(entry)
+            found = kernel32.Thread32First(snapshot, ctypes.byref(entry))
+            while found:
+                if entry.th32OwnerProcessID == pid:
+                    thread = kernel32.OpenThread(_THREAD_SUSPEND_RESUME, False, entry.th32ThreadID)
+                    if not thread:
+                        raise ctypes.WinError(ctypes.get_last_error())
+                    try:
+                        if kernel32.ResumeThread(thread) == _RESUME_FAILED:
+                            raise ctypes.WinError(ctypes.get_last_error())
+                    finally:
+                        kernel32.CloseHandle(thread)
+                    resumed += 1
+                found = kernel32.Thread32Next(snapshot, ctypes.byref(entry))
+        finally:
+            kernel32.CloseHandle(snapshot)
+        if not resumed:
+            raise OSError(f"couldn't find process {pid}'s thread to start it")
 
 
 # --- Stop signals ---------------------------------------------------------------------------

@@ -1,4 +1,5 @@
 import ctypes
+import gc
 import importlib
 import os
 import signal
@@ -6,7 +7,7 @@ import subprocess
 import sys
 import textwrap
 import time
-from pathlib import Path, PurePosixPath, PureWindowsPath
+from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 from types import FrameType
 
 import pytest
@@ -55,27 +56,58 @@ def test_windows_folders_are_under_local_app_data(
 
 def test_xdg_data_home_keeps_any_value_it_is_given() -> None:
     home = PurePosixPath("/home/reader")
-    assert oslayer.xdg_data_home({}, home) == home / ".local" / "share"
-    assert oslayer.xdg_data_home({"XDG_DATA_HOME": ""}, home) == home / ".local" / "share"
-    assert oslayer.xdg_data_home({"XDG_DATA_HOME": "/data"}, home) == PurePosixPath("/data")
+
+    def data(environ: dict[str, str]) -> PurePath:
+        return oslayer.xdg_data_home(environ, lambda: home, PurePosixPath)
+
+    assert data({}) == home / ".local" / "share"
+    assert data({"XDG_DATA_HOME": ""}) == home / ".local" / "share"
+    assert data({"XDG_DATA_HOME": "/data"}) == PurePosixPath("/data")
     # Relative values have always been used as they are; changing that would move downloads.
-    assert oslayer.xdg_data_home({"XDG_DATA_HOME": "rel"}, home) == PurePosixPath("rel")
+    assert data({"XDG_DATA_HOME": "rel"}) == PurePosixPath("rel")
 
 
 def test_xdg_config_home_ignores_relative_values() -> None:
     home = PurePosixPath("/home/reader")
-    assert oslayer.xdg_config_home({}, home) == home / ".config"
-    assert oslayer.xdg_config_home({"XDG_CONFIG_HOME": "/cfg"}, home) == PurePosixPath("/cfg")
-    assert oslayer.xdg_config_home({"XDG_CONFIG_HOME": "cfg"}, home) == home / ".config"
+
+    def config(environ: dict[str, str]) -> PurePath:
+        return oslayer.xdg_config_home(environ, lambda: home, PurePosixPath)
+
+    assert config({}) == home / ".config"
+    assert config({"XDG_CONFIG_HOME": "/cfg"}) == PurePosixPath("/cfg")
+    assert config({"XDG_CONFIG_HOME": "cfg"}) == home / ".config"
 
 
 def test_local_app_data_falls_back_to_the_profile_folder() -> None:
     home = PureWindowsPath(r"C:\Users\Reader")
     local = PureWindowsPath(r"D:\Profiles\Reader\AppData\Local")
-    assert oslayer.local_app_data({"LOCALAPPDATA": str(local)}, home) == local
-    assert oslayer.local_app_data({}, home) == home / "AppData" / "Local"
-    assert oslayer.local_app_data({"LOCALAPPDATA": ""}, home) == home / "AppData" / "Local"
-    assert oslayer.local_app_data({"LOCALAPPDATA": "Local"}, home) == home / "AppData" / "Local"
+
+    def app_data(environ: dict[str, str]) -> PurePath:
+        return oslayer.local_app_data(environ, lambda: home, PureWindowsPath)
+
+    assert app_data({"LOCALAPPDATA": str(local)}) == local
+    assert app_data({}) == home / "AppData" / "Local"
+    assert app_data({"LOCALAPPDATA": ""}) == home / "AppData" / "Local"
+    assert app_data({"LOCALAPPDATA": "Local"}) == home / "AppData" / "Local"
+
+
+def test_the_folders_need_no_home_folder_when_the_variables_are_set(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Path.home() raises with HOME unset and no passwd entry (a container run with an
+    arbitrary uid); a set XDG_DATA_HOME has always been enough."""
+
+    def no_home() -> Path:
+        raise RuntimeError("Could not determine home directory.")
+
+    monkeypatch.setattr(Path, "home", no_home)
+    for name in ("XDG_DATA_HOME", "XDG_CONFIG_HOME", "LOCALAPPDATA"):
+        monkeypatch.setenv(name, str(tmp_path))
+    assert oslayer.data_dir().parent == tmp_path
+    assert tmp_path in oslayer.config_dir().parents
+    monkeypatch.delenv("LOCALAPPDATA" if sys.platform == "win32" else "XDG_DATA_HOME")
+    with pytest.raises(RuntimeError, match="home directory"):
+        oslayer.data_dir()  # the fallback does need it
 
 
 # --- File locks -----------------------------------------------------------------------------
@@ -114,6 +146,16 @@ def test_the_lock_file_is_created_and_never_truncated(tmp_path: Path) -> None:
     assert path.read_bytes() == b"left by someone"
 
 
+def test_a_lock_dropped_while_held_is_let_go(tmp_path: Path) -> None:
+    dropped = FileLock(tmp_path / ".lock")
+    assert dropped.acquire()
+    del dropped  # never released, as after an exception before the caller's `try`
+    gc.collect()
+    lock = FileLock(tmp_path / ".lock")
+    assert lock.acquire()
+    lock.release()
+
+
 def test_a_missing_folder_is_an_error(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
         FileLock(tmp_path / "missing" / ".lock").acquire()
@@ -150,8 +192,9 @@ _HOLDER = textwrap.dedent(
     """
 )
 
-# Tomecast: starts the holder the way the engine would be started, then dies without
-# stopping it.
+# Tomecast: starts the holder the way the engine is started, then dies without stopping it.
+# The holder gets no stdout or stderr from it: if it inherited the test's pipes, a holder
+# that outlived Tomecast would keep subprocess.run() waiting for the end of the output.
 _PARENT = textwrap.dedent(
     """
     import os, subprocess, sys, time
@@ -159,10 +202,12 @@ _PARENT = textwrap.dedent(
     from tomecast import oslayer
 
     path = Path(sys.argv[1])
-    child = subprocess.Popen(
-        [sys.executable, "-c", sys.argv[2], str(path)], **oslayer.child_options()
+    child = oslayer.start_tied(
+        [sys.executable, "-c", sys.argv[2], str(path)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
-    oslayer.adopt_child(child)
     deadline = time.monotonic() + 30
     while not Path(str(path) + ".ready").exists():
         if child.poll() is not None or time.monotonic() > deadline:
@@ -204,32 +249,35 @@ def test_a_child_stops_when_tomecast_dies(tmp_path: Path) -> None:
     lock.release()
 
 
-def test_child_options_suit_this_system() -> None:
-    options = oslayer.child_options()
-    if sys.platform == "win32":
-        assert options["preexec_fn"] is None
-        assert options["creationflags"] & subprocess.CREATE_NO_WINDOW
-    elif sys.platform == "linux":
-        assert callable(options["preexec_fn"])
-        assert options["creationflags"] == 0
-    # The options are accepted as they are.
-    process = subprocess.Popen([sys.executable, "-c", "pass"], **options)
-    oslayer.adopt_child(process)
-    assert process.wait(timeout=30) == 0
+def test_start_tied_runs_the_child_with_the_given_options() -> None:
+    process = oslayer.start_tied(
+        [sys.executable, "-c", "import sys; print(sys.stdin.read().upper())"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+    )
+    output, _ = process.communicate(b"spoken", timeout=30)
+    assert process.returncode == 0
+    assert output.strip() == b"SPOKEN"  # it ran (on Windows: it was resumed)
 
 
-def test_adopting_a_child_that_already_exited_is_fine() -> None:
-    process = subprocess.Popen([sys.executable, "-c", "pass"], **oslayer.child_options())
-    process.wait(timeout=30)
-    oslayer.adopt_child(process)
+def test_start_tied_sets_preexec_fn_itself() -> None:
+    with pytest.raises(ValueError, match="preexec_fn"):
+        oslayer.start_tied([sys.executable, "-c", "pass"], preexec_fn=lambda: None)
+
+
+def test_a_child_that_cant_start_is_an_error(tmp_path: Path) -> None:
+    with pytest.raises(OSError):
+        oslayer.start_tied([str(tmp_path / "no-such-program")])
 
 
 @pytest.mark.skipif(ctypes.sizeof(ctypes.c_void_p) != 8, reason="64-bit layout")
-def test_job_object_structures_match_windows_x64() -> None:
+def test_windows_structures_match_windows_x64() -> None:
     assert ctypes.sizeof(oslayer.JobObjectBasicLimitInformation) == 64
     assert ctypes.sizeof(oslayer.IoCounters) == 48
     assert ctypes.sizeof(oslayer.JobObjectExtendedLimitInformation) == 144
     assert oslayer.JobObjectBasicLimitInformation.LimitFlags.offset == 16
+    assert ctypes.sizeof(oslayer.ThreadEntry32) == 28
+    assert oslayer.ThreadEntry32.th32OwnerProcessID.offset == 12
 
 
 # --- Stop signals ---------------------------------------------------------------------------
