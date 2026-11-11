@@ -8,6 +8,7 @@ nothing here needs a graphics card.
 """
 
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,7 @@ from tomecast.engines import audiocpp
 from tomecast.engines.audiocpp import (
     CPU_FALLBACK_NOTE,
     DEVICE_LOST_NOTE,
+    RAN_OUT_OF_MEMORY_NOTE,
     AutoKokoro,
     GpuDeviceLost,
     GpuOutOfMemory,
@@ -217,6 +219,78 @@ def test_an_engine_that_dies_with_the_card_isnt_restarted_on_it_or_counted(
         plain.synthesize("First.", tmp_path / "1.wav")
         with pytest.raises(GpuDeviceLost, match="was lost"):
             plain.synthesize("Second.", tmp_path / "2.wav")
+
+
+@pytest.mark.parametrize(
+    ("saying", "flag", "note"),
+    [
+        (LOST_CRASH, "device_lost", DEVICE_LOST_NOTE),
+        (
+            "terminate called after throwing an instance of 'vk::OutOfDeviceMemoryError'\n"
+            "  what():  vk::Device::allocateMemory: ErrorOutOfDeviceMemory",
+            "out_of_memory",
+            RAN_OUT_OF_MEMORY_NOTE,
+        ),
+    ],
+)
+def test_the_card_giving_out_on_the_retry_after_a_crash_restart_is_seen(
+    tmp_path: Path, fake_server: Path, monkeypatch: pytest.MonkeyPatch, saying: str, flag: str,
+    note: str,
+) -> None:  # fmt: skip
+    # Two faults (#53 review): the engine dies mid-request without a word, is restarted on the
+    # card, and then dies again, this time saying the card was lost (or ran out of memory).
+    # That's read from the restarted engine's own log: not a crash, so never "didn't recover".
+    monkeypatch.setenv("FAKE_DIE_AFTER", "0")
+    monkeypatch.setenv("FAKE_DIE_STARTS", "2")
+    monkeypatch.setenv("FAKE_DIE_SAYING_LATER", saying)
+    with _auto(tmp_path, fake_server) as engine:
+        engine.synthesize("Hello there.", tmp_path / "out.wav")
+        assert getattr(engine, flag) is True
+        assert engine.warning == note
+        assert engine._consecutive_restarts == 0
+    assert _backends_started(tmp_path) == ["vulkan", "vulkan", "cpu"]
+    assert _voiced(tmp_path) == [("Hello there.", "cpu")]  # the piece that failed, once
+
+
+def test_a_plain_engine_reports_the_card_lost_on_the_retry_with_the_right_log(
+    tmp_path: Path, fake_server: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FAKE_DIE_AFTER", "0")
+    monkeypatch.setenv("FAKE_DIE_STARTS", "2")
+    monkeypatch.setenv("FAKE_DIE_SAYING_LATER", LOST_CRASH)
+    server = KokoroServer(tmp_path / "data", executable=fake_server, backend="vulkan", device=0)
+    with server, pytest.raises(GpuDeviceLost, match="DeviceLostError"):  # the restarted log
+        server.synthesize("Hello there.", tmp_path / "out.wav")
+
+
+def test_a_card_lost_while_the_engine_starts_is_seen_without_waiting_it_out(
+    tmp_path: Path, fake_server: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FAKE_LOST_VULKAN_START", "1")
+    monkeypatch.setenv("FAKE_LOST_HANG", "1")  # it says so, then never serves
+    engine = AutoKokoro(tmp_path / "data", executable=fake_server, startup_timeout=120)
+    started = time.monotonic()
+    with engine:
+        assert (engine.backend, engine.device_lost) == ("cpu", True)
+    assert time.monotonic() - started < 15  # as soon as it said so, not after 120 s
+
+
+def test_a_lost_card_quoting_an_earlier_phoneme_limit_doesnt_split_the_piece(
+    tmp_path: Path, fake_server: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Only the engine's own reply says a piece has too many phonemes; a log quoted in a lost
+    # card's error must not make the piece be voiced in fragments (#53 review).
+    monkeypatch.setenv("FAKE_DIE_AFTER", "1")
+    monkeypatch.setenv("FAKE_DIE_STARTS", "1")
+    monkeypatch.setenv(
+        "FAKE_DIE_SAYING", f"Kokoro phoneme string exceeds 510 symbols (510)\n{LOST_CRASH}"
+    )
+    text = "The quick brown fox jumps over the lazy dog today."
+    with _auto(tmp_path, fake_server) as engine:
+        engine.synthesize("First.", tmp_path / "1.wav")
+        engine.synthesize(text, tmp_path / "2.wav")
+        assert engine.device_lost
+    assert _voiced(tmp_path) == [("First.", "vulkan"), (text, "cpu")]  # whole, not in parts
 
 
 def test_a_card_lost_as_the_engine_starts_moves_to_the_cpu_blamelessly(

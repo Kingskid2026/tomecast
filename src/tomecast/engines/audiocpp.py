@@ -174,14 +174,15 @@ _PHONEME_LIMIT_MESSAGE = "exceeds 510"
 # weights or a compute graph. (The binary's other Kokoro replies are all "failed to allocate
 # Kokoro ... tensors" or "... graph".) The log written during the request is the surer sign.
 #
-# The word must come soon after "failed to allocate" (within five words: Ming's "failed to
-# allocate ming3_tts.ar.weights backend weight buffer" is the longest seen), so a path later on
-# the line, such as .../memory/..., can't make it count.
+# The word must be a word of its own (not part of a path such as .../memory/...), and come
+# within eight words of "failed to allocate", so one far along the line can't make it count.
+# Of the binary's 466 "failed to allocate" messages (tests/data/audiocpp-allocation-failures.txt),
+# the furthest is five words on ("failed to allocate Kokoro tail shared LSTM block tensors").
 _OUT_OF_MEMORY = re.compile(
     r"ErrorOutOfDeviceMemory|VK_ERROR_OUT_OF_DEVICE_MEMORY"
     r"|device memory allocation of size \d+ failed"
-    r"|failed to allocate(?:\s+\S+){0,4}?\s+(?:\S*[./:])?"
-    r"(?:buffers?|memory|tensors?|weights?|graph)\b",
+    r"|failed to allocate(?:\s+\S+){0,8}?\s+[(\"'\[]?"
+    r"(?:buffers?|memory|tensors?|weights?|graph)\b(?![/\\])",
     re.IGNORECASE,
 )
 # The computer's own memory, which the CPU would need just the same: a CPU buffer, or
@@ -253,6 +254,12 @@ class GpuDeviceLost(GpuUnavailable):
     the engine build for it: the same build carries on on its CPU backend
     (:class:`AutoKokoro`). A self-check still fails a build the card is lost with while the
     build in use works there."""
+
+
+class _PhonemeLimit(EngineError):
+    """The engine's reply said the text had more than 510 phonemes for one request. Only its
+    reply counts: an error that quotes the log (a crash, the card lost) may mention an earlier
+    request's limit, and must not split this piece."""
 
 
 class _ConnectionLost(EngineError):
@@ -525,8 +532,8 @@ class KokoroServer:
             raise EngineError("the voice engine isn't running")
         try:
             data = self._request_with_recovery(text)
-        except EngineError as error:
-            if _PHONEME_LIMIT_MESSAGE not in str(error) or len(text) < 2:
+        except _PhonemeLimit:
+            if len(text) < 2:
                 raise
             # Too many sounds for one request (long numbers, mostly): split it and join.
             self._synthesize_in_parts(text, output)
@@ -560,18 +567,8 @@ class KokoroServer:
             # Stopped on purpose (Cancel, or closing the window): not a crash, so neither a
             # restart nor "keeps crashing", which could be blamed on the build.
             self._stop_if_asked()
+            self._raise_if_the_card_gave_out(error)
             log = _tail(self._log_path)
-            said = self._log_since(self._log_offset)  # it has stopped: every line is whole
-            if self.backend == "vulkan" and out_of_graphics_memory(said):
-                raise GpuOutOfMemory(
-                    f"the graphics card ran out of memory and the voice engine stopped. Its log:"
-                    f"\n{log}"
-                ) from error
-            if self.backend == "vulkan" and graphics_card_lost(said):
-                raise GpuDeviceLost(
-                    f"the graphics card was lost (reset by its driver) and the voice engine "
-                    f"stopped. Its log:\n{log}"
-                ) from error
             if self._consecutive_restarts >= _MAX_RESTARTS:
                 raise EngineError(f"the voice engine keeps crashing. Its log:\n{log}") from error
             self._consecutive_restarts += 1
@@ -587,11 +584,36 @@ class KokoroServer:
             try:
                 data = self._request(text)
             except _ConnectionLost as retry_error:
+                # The restarted engine stopped too: perhaps because the card ran out of memory
+                # or was lost this time, which its own part of the log says.
+                if self._process is not None and _has_exited(self._process):
+                    self._stop_if_asked()
+                    self._raise_if_the_card_gave_out(retry_error)
                 raise EngineError(
-                    f"the voice engine crashed and didn't recover. Its log:\n{log}"
+                    f"the voice engine crashed and didn't recover. Its log:\n"
+                    f"{_tail(self._log_path)}"
                 ) from retry_error
         self._consecutive_restarts = 0
         return data
+
+    def _raise_if_the_card_gave_out(self, error: Exception) -> None:
+        """The running engine stopped: if its own part of the log says the graphics card ran
+        out of memory or was lost, raise that (it isn't a crash, so it's never restarted on
+        the card or counted towards "keeps crashing"). It has stopped, so every line is
+        whole."""
+        if self.backend != "vulkan":
+            return
+        said = self._log_since(self._log_offset)
+        if out_of_graphics_memory(said):
+            raise GpuOutOfMemory(
+                f"the graphics card ran out of memory and the voice engine stopped. Its log:"
+                f"\n{_tail(self._log_path)}"
+            ) from error
+        if graphics_card_lost(said):
+            raise GpuDeviceLost(
+                f"the graphics card was lost (reset by its driver) and the voice engine "
+                f"stopped. Its log:\n{_tail(self._log_path)}"
+            ) from error
 
     @property
     def _log_path(self) -> Path:
@@ -681,23 +703,30 @@ class KokoroServer:
                         "backend, not the graphics card"
                     )
                 return
-            if self.backend == "vulkan" and out_of_graphics_memory(
-                _whole_lines(self._log_since(log_start))
-            ):
-                # It said so and is still going (stuck, or about to exit): don't wait for the
-                # whole start-up time. Only whole lines count: it may be writing the last one.
+            said = _whole_lines(self._log_since(log_start)) if self.backend == "vulkan" else ""
+            # It said so and is still going (stuck, or about to exit): don't wait for the
+            # whole start-up time. Only whole lines count: it may be writing the last one.
+            if out_of_graphics_memory(said):
                 raise GpuOutOfMemory(
                     f"the graphics card ran out of memory while the voice engine started:\n"
                     f"{_tail(self._log_path)}"
                 )
+            if graphics_card_lost(said):
+                raise GpuDeviceLost(
+                    f"the graphics card was lost while the voice engine started:\n"
+                    f"{_tail(self._log_path)}"
+                )
             time.sleep(0.2)
         problem = f"the voice engine didn't start within {self._startup_timeout:.0f}s"
-        if self.backend == "vulkan" and out_of_graphics_memory(
-            _whole_lines(self._log_since(log_start))
-        ):
+        said = _whole_lines(self._log_since(log_start)) if self.backend == "vulkan" else ""
+        if out_of_graphics_memory(said):
             # Still loading, or stuck, after the card ran out of memory (it said so).
             raise GpuOutOfMemory(
                 f"the graphics card ran out of memory and {problem}:\n{_tail(self._log_path)}"
+            )
+        if graphics_card_lost(said):
+            raise GpuDeviceLost(
+                f"the graphics card was lost and {problem}:\n{_tail(self._log_path)}"
             )
         raise EngineError(f"{problem}:\n{_tail(self._log_path)}")
 
@@ -753,6 +782,8 @@ class KokoroServer:
                 return data
         except urllib.error.HTTPError as error:
             message = _error_message(error)
+            if _PHONEME_LIMIT_MESSAGE in message:
+                raise _PhonemeLimit(message) from error
             if self.backend != "vulkan":
                 raise EngineError(message) from error
             # The reply names what it couldn't allocate ("Kokoro predictor tail tensors");
@@ -980,9 +1011,10 @@ class AutoKokoro(KokoroServer):
     nothing is skipped), and stays there until the engine is stopped: a book never goes back
     and forth. The next :meth:`start` (the next book) tries the card again.
     :attr:`out_of_memory` is then True and :attr:`warning` says so in one sentence. It isn't
-    a crash or a broken build: it never counts towards "keeps crashing", and a run that hit it
-    neither proves nor rolls back a build. None of this depends on the voice model: it's how
-    audio.cpp's server reports the card's memory, so a second voice on the same server code
+    a crash or a broken build: it never counts towards "keeps crashing", a run that hit it
+    never rolls a build back, and it proves only the builds other than the engine's
+    (:meth:`proves`). None of this depends on the voice model: it's how audio.cpp's server
+    reports the card's memory, so a second voice on the same server code
     (Ming, #11) gets it as it is.
 
     **The card lost** (``VK_ERROR_DEVICE_LOST``: its driver reset it, or crashed) is handled
@@ -1163,7 +1195,9 @@ def self_check(root: Path, use_gpu: bool, cancelled: IsCancelled | None = None) 
     (so a run voices on that build's CPU side anyway) is it checked on the CPU. If the new
     builds don't answer at all (they crash or hang listing the cards) while the builds in use
     do, the new builds have failed, whatever the builds in use see: a run lists the cards
-    first, so it would never use the card. If no build answers, or the card runs out of memory
+    first, so it would never use the card. So have new builds that see no usable card where
+    the builds in use see one: every run would use the CPU, and prove builds the card was
+    never tried with. If no build answers, or the card runs out of memory
     (other programs are using it), there's no verdict. Each build's devices are listed once
     per check, retries included, except that a new build that didn't answer is asked once more
     on the retry before its failure counts.
@@ -1189,24 +1223,48 @@ def self_check(root: Path, use_gpu: bool, cancelled: IsCancelled | None = None) 
         new_engine, new_espeak = new[engine_slot], new.get(ESPEAK_NG.slot)
         old_engine, old_espeak = old.get(engine_slot), old.get(ESPEAK_NG.slot)
         if use_gpu:
-            new_devices = devices = devices_of(new_engine, again=True)
-            if not devices and old_engine is not None:
-                devices = devices_of(old_engine)  # the new one may not see it
-            device = pick_device(devices or [])
-            if new_devices is None and devices is not None:
-                # The build in use answered and this one didn't (it crashed or hung listing
-                # them, twice): that's this build failing, not the card. Every run lists the
-                # cards first, so it would never use the card even if it voices on it.
-                # Recorded, so it isn't asked again (up to 20 s) before every book until the
-                # failure expires.
-                return (
-                    "it couldn't list the graphics cards (it crashed or hung), and the build in "
-                    "use could"
-                )
-            if device is None and (new_devices is None or devices is None):
-                # A build that didn't answer (it crashed or hung listing them) says nothing
-                # about whether there's a card, so a CPU check couldn't stand in for one.
+            new_devices = devices_of(new_engine, again=True)
+            device = pick_device(new_devices or [])
+            # The new one may not see a card the build in use does.
+            old_devices = devices_of(old_engine) if device is None and old_engine else None
+            if new_devices is None:
+                if old_devices is not None:
+                    # The build in use answered and this one didn't (it crashed or hung
+                    # listing them, twice): that's this build failing, not the card. Every
+                    # run lists the cards first, so it would never use the card even if it
+                    # voices on it. Recorded, so it isn't asked again (up to 20 s) before
+                    # every book until the failure expires.
+                    return (
+                        "it couldn't list the graphics cards (it crashed or hung), and the "
+                        "build in use could"
+                    )
+                # No build answered: that says nothing about whether there's a card, so a
+                # CPU check couldn't stand in for one.
                 return Inconclusive("the graphics card didn't answer when asked what it is")
+            if device is None and old_engine is not None:
+                seen = pick_device(old_devices or [])
+                if seen is not None:
+                    same = next(
+                        (
+                            d
+                            for d in new_devices
+                            if (d.description, d.kind) == (seen.description, seen.kind)
+                        ),
+                        None,
+                    )
+                    if same is None:
+                        # The build in use sees a card this one doesn't: every run would use
+                        # the CPU, and a book made there would prove a build the card was
+                        # never tried with. So it has failed.
+                        return (
+                            "it found no usable graphics card, and the build in use found the "
+                            f"{seen.description}"
+                        )
+                    device = same  # the same card, with less free memory just then: try it
+                elif old_devices is None and not new_devices:
+                    # This one sees nothing, and the build in use didn't answer: whether
+                    # there's a card is unknown, so a CPU check couldn't stand in for one.
+                    return Inconclusive("the graphics card didn't answer when asked what it is")
             if device is not None:
                 problem = check_build(
                     root,

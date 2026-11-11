@@ -148,6 +148,15 @@ def test_a_list_printed_before_a_failed_exit_is_still_used(tmp_path: Path) -> No
     assert list_devices(nothing) is None  # no list at all is still "couldn't tell"
 
 
+def test_an_empty_list_before_a_failed_exit_isnt_no_card(tmp_path: Path) -> None:
+    # A driver that fails to start up lists no cards and then fails: that isn't "no card",
+    # which would let a CPU run prove a graphics-card build (#53 review).
+    failed = _executable(tmp_path, "import os; print('{\"devices\": []}', flush=True); os._exit(1)")
+    assert list_devices(failed) is None
+    answered = _executable(tmp_path, "print('{\"devices\": []}')")
+    assert list_devices(answered) == []  # the same list with a clean exit is an answer
+
+
 def test_an_answer_with_nothing_usable_is_no_card(tmp_path: Path) -> None:
     junk = '{"devices": [5, {"backend": "vulkan"}, {"backend": "vulkan", "index": 1}]}'
     assert list_devices(_executable(tmp_path, f"print({junk!r})")) == []

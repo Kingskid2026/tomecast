@@ -13,7 +13,9 @@ with it) change how it behaves:
 ``FAKE_LOADED_DEVICE``    the device ``/v1/models`` says the model is on (default: the config's)
 ``FAKE_SILENT``           voice silence instead of a tone
 ``FAKE_DIE_AFTER``        crash mid-request after this many requests (``FAKE_SLOW_EXIT``: slowly;
-                          ``FAKE_DIE_SAYING``: logging this first)
+                          ``FAKE_DIE_SAYING``: logging this first; ``FAKE_DIE_SAYING_LATER``:
+                          logging this instead after a restart; ``FAKE_DIE_STARTS``: only in
+                          the first this many starts)
 ``FAKE_DELAY``            seconds each request takes
 ``FAKE_START_DELAY``      seconds before it starts serving (a slow first start)
 ``FAKE_OOM_VULKAN_AFTER`` on the Vulkan backend, requests after this many log ggml's lines and
@@ -28,11 +30,14 @@ with it) change how it behaves:
 ``FAKE_OOM_LOG``          log this at start-up (a warning the engine carries on after)
 ``FAKE_BUSY``             a file it creates as each request begins (one is under way)
 ``FAKE_SLOW_LINE``        at start-up, log the first half of this JSON pair, then the second
-                          half (ending the line) a second later
+                          half (ending the line) a second later (or after the third item's
+                          seconds)
+``FAKE_OOM_UNFINISHED``   with ``FAKE_OOM_SAYING``: log it without ending the line
 ``FAKE_LOST_VULKAN_AFTER`` on the Vulkan backend, requests after this many fail with HTTP 500
                           and the reply audio.cpp gives when the card is lost (``LOST_REPLY``),
                           and the server stays up
 ``FAKE_LOST_VULKAN_START`` on the Vulkan backend, log ggml's line for a lost card and exit
+                          (``FAKE_LOST_HANG``: and keep running without ever serving)
 
 Each voiced request is logged with the backend that voiced it.
 
@@ -106,6 +111,8 @@ FAKE_SERVER = textwrap.dedent(
         if k.startswith(("AUDIOCPP_", "TMPDIR", "GGML_", "VK_"))
     }}) + "\\n")
     log.flush()
+    with open(os.environ["FAKE_LOG"]) as earlier:  # which start this is (1 for the first)
+        START = sum(1 for line in earlier if '"event": "start"' in line)
 
     import ctypes, signal
     ctypes.CDLL(None).prctl(4, 0, 0, 0, 0)  # PR_SET_DUMPABLE, 0: its crashes write no core dump
@@ -134,12 +141,14 @@ FAKE_SERVER = textwrap.dedent(
     if os.environ.get("FAKE_OOM_LOG"):
         print(os.environ["FAKE_OOM_LOG"], file=sys.stderr, flush=True)
     if os.environ.get("FAKE_SLOW_LINE"):
-        first, rest = json.loads(os.environ["FAKE_SLOW_LINE"])
+        first, rest, *wait = json.loads(os.environ["FAKE_SLOW_LINE"])
         print(first, end="", file=sys.stderr, flush=True)
-        time.sleep(1)
+        time.sleep(float(wait[0]) if wait else 1)
         print(rest, file=sys.stderr, flush=True)
     if os.environ.get("FAKE_LOST_VULKAN_START") and config["backend"] == "vulkan":
         print(LOST_GGML, file=sys.stderr, flush=True)
+        if os.environ.get("FAKE_LOST_HANG"):
+            time.sleep(60)
         sys.exit(1)
     if os.environ.get("FAKE_OOM_VULKAN_START") and config["backend"] == "vulkan":
         print("\\n".join(OOM_MING_START), file=sys.stderr, flush=True)
@@ -198,9 +207,16 @@ FAKE_SERVER = textwrap.dedent(
                 open(os.environ["FAKE_BUSY"], "a").close()
             time.sleep(float(os.environ.get("FAKE_DELAY", "0")))
             die_after = os.environ.get("FAKE_DIE_AFTER")
-            if die_after is not None and REQUESTS[0] > int(die_after):
-                if os.environ.get("FAKE_DIE_SAYING"):
-                    print(os.environ["FAKE_DIE_SAYING"], file=sys.stderr, flush=True)
+            if (
+                die_after is not None
+                and REQUESTS[0] > int(die_after)
+                and START <= int(os.environ.get("FAKE_DIE_STARTS", "1000"))
+            ):
+                saying = os.environ.get("FAKE_DIE_SAYING")
+                if START > 1 and os.environ.get("FAKE_DIE_SAYING_LATER"):
+                    saying = os.environ["FAKE_DIE_SAYING_LATER"]
+                if saying:
+                    print(saying, file=sys.stderr, flush=True)
                 if os.environ.get("FAKE_SLOW_EXIT"):
                     # The connection drops first, and the process only ends a bit later.
                     self.connection.shutdown(socket.SHUT_RDWR)
@@ -222,7 +238,8 @@ FAKE_SERVER = textwrap.dedent(
                 log.flush()
                 if not os.environ.get("FAKE_OOM_QUIET"):
                     saying = os.environ.get("FAKE_OOM_SAYING") or "\\n".join(OOM_KOKORO_LOG)
-                    print(saying, file=sys.stderr, flush=True)
+                    end = "" if os.environ.get("FAKE_OOM_UNFINISHED") else "\\n"
+                    print(saying, end=end, file=sys.stderr, flush=True)
                 return self.fail(os.environ.get("FAKE_OOM_MESSAGE", OOM_KOKORO_REPLY))
             lost_after = os.environ.get("FAKE_LOST_VULKAN_AFTER")
             if (

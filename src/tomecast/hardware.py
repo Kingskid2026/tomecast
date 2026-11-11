@@ -68,6 +68,8 @@ def list_devices(
     stderr and prints one JSON object on stdout; the last stdout line that parses as JSON is
     used, even if the program then fails (a driver that crashes as it shuts down, after
     printing the list): the self-check and the engine's start catch a card that doesn't work.
+    An empty list followed by a failure isn't an answer (``None``): a driver that failed to
+    start up lists no cards.
     """
     try:
         process = subprocess.Popen(
@@ -103,7 +105,12 @@ def list_devices(
         except ValueError:
             continue
         break
-    return _parse_devices(payload)
+    devices = _parse_devices(payload)
+    if process.returncode != 0 and not devices:
+        # It failed, and said of no card: a driver that failed to start up lists nothing, so
+        # that isn't an answer. Only a list of cards it printed before failing is one.
+        return None
+    return devices
 
 
 def _parse_devices(payload: object) -> list[GpuDevice] | None:

@@ -1047,10 +1047,11 @@ class Backend(QObject):
 
     @Slot(int, str, int)
     def _on_notice(self, job: int, message: str, threads: int) -> None:
-        """The graphics card ran out of memory and the book goes on on the CPU, with
-        ``threads``: say so in the banner while it's being made (the done screen lists it with
-        the other notes), and show the CPU. The thread count is the engine's own, not read
-        again, so the speed this run measures is kept under the count that made it."""
+        """The graphics card ran out of memory or stopped working (it was lost), and the book
+        goes on on the CPU with ``threads``: say so in the banner while it's being made (the
+        done screen lists it with the other notes), and show the CPU. The thread count is the
+        engine's own, not read again, so the speed this run measures is kept under the count
+        that made it."""
         if job != self._convert_job:
             return
         self._cpu_threads = threads

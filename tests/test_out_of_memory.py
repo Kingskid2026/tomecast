@@ -22,6 +22,7 @@ from tomecast.engines.audiocpp import (
     AutoKokoro,
     EngineError,
     GpuOutOfMemory,
+    GpuUnavailable,
     KokoroServer,
     out_of_graphics_memory,
 )
@@ -90,6 +91,7 @@ def _auto(tmp_path: Path, server: Path, **kwargs: object) -> AutoKokoro:
         "failed to allocate ming3_tts.ar.weights backend weight buffer",
         # The binary's other Kokoro replies of this kind.
         "failed to allocate Kokoro generator graph",
+        "failed to allocate Kokoro tail shared LSTM block tensors",  # five words on
         "failed to allocate Kokoro PL-BERT tensors",
         # A warning ggml carries on after, then the real failure.
         "ggml_vulkan: Failed to allocate pinned memory (ErrorOutOfDeviceMemory)\n"
@@ -136,6 +138,41 @@ def test_other_failures_are_not_taken_for_running_out_of_memory(message: str) ->
     assert not out_of_graphics_memory(message)
 
 
+_CORPUS = Path(__file__).parent / "data" / "audiocpp-allocation-failures.txt"
+
+
+def _corpus() -> dict[str, list[str]]:
+    sections: dict[str, list[str]] = {}
+    current: list[str] = []
+    for line in _CORPUS.read_text().splitlines():
+        if line.startswith("#") or not line:
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            current = sections.setdefault(line[1:-1], [])
+        else:
+            current.append(line)
+    return sections
+
+
+def test_every_allocation_failure_in_the_binary_is_sorted_as_before() -> None:
+    # Every "failed to allocate" message in audio.cpp 0.9.4's Vulkan build (#53): the ones
+    # about the card's memory (buffers, memory, tensors, weights, graphs) still count, however
+    # many words come before the word, and the rest (a temporary directory, metadata, a
+    # codec context, pinned memory) still don't.
+    corpus = _corpus()
+    assert len(corpus["card"]) == 421 and len(corpus["not the card"]) == 45
+    assert [line for line in corpus["card"] if not out_of_graphics_memory(line)] == []
+    assert [line for line in corpus["not the card"] if out_of_graphics_memory(line)] == []
+
+
+def test_a_word_inside_a_path_never_counts() -> None:
+    for path in ("/home/reader/memory/cache", "/tmp/tensors/x", "C:\\models\\weights\\k"):
+        message = f"audiocpp_server failed: failed to allocate a directory in {path}"
+        assert not out_of_graphics_memory(message), path
+    assert not out_of_graphics_memory("failed to allocate memory/")  # a path, not the word
+    assert out_of_graphics_memory("failed to allocate (memory) for the decoder")
+
+
 def test_only_whole_lines_of_the_log_count() -> None:
     # The engine may still be writing the last line: half of it could match (its "metadata
     # context" still to come), so only what ends in a line break is read (#53).
@@ -155,6 +192,35 @@ def test_a_half_written_line_at_start_up_isnt_taken_for_running_out(
     with _auto(tmp_path, fake_server) as engine:
         assert (engine.backend, engine.out_of_memory, engine.warning) == ("vulkan", False, None)
     assert _backends_started(tmp_path) == ["vulkan"]
+
+
+def test_a_half_written_line_logged_during_a_request_doesnt_count(
+    tmp_path: Path, fake_server: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The request fails for another reason while the engine is mid-way through a line that,
+    # once whole, isn't about the card ("... metadata context").
+    monkeypatch.setenv("FAKE_OOM_VULKAN_AFTER", "0")
+    monkeypatch.setenv("FAKE_OOM_MESSAGE", "something broke")
+    monkeypatch.setenv("FAKE_OOM_SAYING", "failed to allocate GGUF tensor")
+    monkeypatch.setenv("FAKE_OOM_UNFINISHED", "1")
+    server = KokoroServer(tmp_path / "data", executable=fake_server, backend="vulkan", device=0)
+    with server, pytest.raises(EngineError, match="something broke") as error:
+        server.synthesize("Hello there.", tmp_path / "out.wav")
+    assert not isinstance(error.value, GpuOutOfMemory)
+
+
+def test_a_half_written_line_when_the_start_up_times_out_doesnt_count(
+    tmp_path: Path, fake_server: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(
+        "FAKE_SLOW_LINE", json.dumps(["failed to allocate GGUF tensor", " metadata context", 30])
+    )
+    server = KokoroServer(
+        tmp_path / "data", executable=fake_server, backend="vulkan", device=0, startup_timeout=1.5
+    )
+    with pytest.raises(GpuUnavailable, match="didn't start within") as error:
+        server.start()
+    assert not isinstance(error.value, GpuOutOfMemory)  # a slow start, not out of memory
 
 
 def test_a_reply_when_only_the_computers_memory_ran_out_isnt_the_card(

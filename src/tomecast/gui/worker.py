@@ -568,7 +568,7 @@ class ConversionWorker(QObject):
                 if on_the_card and engine.fell_back:
                     # The card ran out of memory (or was lost) and the preview carried on on
                     # the CPU: the hardware label says so now, not at the next conversion.
-                    self.deviceChosen.emit(engine.gpu_description)
+                    self.deviceChosen.emit(engine.gpu_description, use_gpu)
         except (
             EngineError,
             MissingAudioError,

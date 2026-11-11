@@ -1168,6 +1168,40 @@ def test_a_new_build_that_cant_list_the_cards_fails_even_when_the_old_one_sees_o
     assert _checks(tmp_path) == []  # not tried on the card on the old build's word
 
 
+def test_a_new_build_that_sees_no_card_where_the_old_one_sees_one_fails(
+    tmp_path: Path, engine_root: Path
+) -> None:
+    # Every run would use the CPU ("no usable card"), and a book made there would prove a
+    # build the card was never tried with (#53 review).
+    old = _engine_build(tmp_path, "old", gpu=True, env={"FAKE_DEVICES": _DEVICES})
+    new = _engine_build(tmp_path, "new", gpu=True, env={"FAKE_DEVICES": '{"devices": []}'})
+
+    prepared = _update(engine_root, old, new, gpu=True)
+
+    assert prepared.switched == ()
+    reason = failure(new, engine_root)
+    assert reason is not None and "found no usable graphics card" in reason
+    assert "NVIDIA RTX PRO 1000" in reason
+    assert _checks(tmp_path) == []  # not tried on the card on the old build's word
+
+
+def test_the_same_card_with_less_free_memory_just_then_is_still_tried(
+    tmp_path: Path, engine_root: Path
+) -> None:
+    def igpu(free: int) -> str:
+        return json.dumps({"devices": [{"backend": "vulkan", "index": 0, "name": "Vulkan0",
+                          "type": "igpu", "description": "AMD Radeon 860M Graphics (RADV)",
+                          "memory": {"free_bytes": free, "total_bytes": 20 * 2**30}}]})  # fmt: skip
+
+    old = _engine_build(tmp_path, "old", gpu=True, env={"FAKE_DEVICES": igpu(3 * 2**30)})
+    new = _engine_build(tmp_path, "new", gpu=True, env={"FAKE_DEVICES": igpu(1 * 2**30)})
+
+    prepared = _update(engine_root, old, new, gpu=True)
+
+    assert prepared.switched == (new,)  # it sees the card, just with less free right then
+    assert _checks(tmp_path) == [(build_folder(new, engine_root).name, "vulkan")]
+
+
 def test_a_new_build_that_answers_on_the_retry_is_judged_on_its_answer(
     tmp_path: Path, engine_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
