@@ -9,6 +9,7 @@ from __future__ import annotations
 import struct
 import unicodedata
 import zlib
+from collections.abc import Sequence
 from pathlib import Path
 
 import pypdfium2 as pdfium
@@ -508,24 +509,15 @@ LIGATURE_TEXT = (
 )
 
 
-def _ligature_pdf(path: Path, font: str) -> Path:
+def _typeset_pdf(path: Path, lines: Sequence[str], font: str = "typeset") -> Path:
     page = PageBuilder()
-    page.paragraph(LIGATURE_LINES, font=font)
+    page.paragraph(lines, font=font)
     return build_pdf(path, [page.page])
 
 
-@pytest.mark.parametrize("font", TYPESET_FONTS)
-def test_words_with_ligatures_read_whole(tmp_path: Path, font: str) -> None:
-    """PDFium hands a ligature glyph over as one character per letter, each with the whole
-    glyph's box; that overlap must not cut the word ("f inite"). The spaces around the
-    ligatures stay, and every letter is read once."""
-    book = read_pdf(_ligature_pdf(tmp_path / "ligatures.pdf", font))
-
-    assert book.chapters[0].paragraphs == (LIGATURE_TEXT,)
-
-
-def test_a_ligature_glyph_is_one_character_with_all_its_letters(tmp_path: Path) -> None:
-    document = pdfium.PdfDocument(_ligature_pdf(tmp_path / "ligatures.pdf", "typeset"))
+def _char_texts(path: Path) -> list[str]:
+    """The text of each character the reader takes from the PDF's first page."""
+    document = pdfium.PdfDocument(path)
     page = document[0]
     textpage = page.get_textpage()
     try:
@@ -534,8 +526,24 @@ def test_a_ligature_glyph_is_one_character_with_all_its_letters(tmp_path: Path) 
         textpage.close()
         page.close()
         document.close()
+    return [char.text for char in chars]
 
-    texts = [char.text for char in chars]
+
+@pytest.mark.parametrize("font", TYPESET_FONTS)
+def test_words_with_ligatures_read_whole(tmp_path: Path, font: str) -> None:
+    """PDFium hands a ligature glyph over as one character per letter, each with the whole
+    glyph's box; that overlap must not cut the word ("f inite"). The spaces around the
+    ligatures stay, and every letter is read once, whether the font's ToUnicode map gives a
+    ligature as its letters, as the ligature character, or (fi and fl) as the private-use
+    code points old Windows fonts used."""
+    book = read_pdf(_typeset_pdf(tmp_path / "ligatures.pdf", LIGATURE_LINES, font))
+
+    assert book.chapters[0].paragraphs == (LIGATURE_TEXT,)
+
+
+def test_a_ligature_glyph_is_one_character_with_all_its_letters(tmp_path: Path) -> None:
+    texts = _char_texts(_typeset_pdf(tmp_path / "ligatures.pdf", LIGATURE_LINES))
+
     # Every letter once, in order: none lost, none doubled.
     assert "".join(texts) == "".join(LIGATURE_TEXT.split())
     assert [text for text in texts if len(text) > 1] == [
@@ -546,10 +554,48 @@ def test_a_ligature_glyph_is_one_character_with_all_its_letters(tmp_path: Path) 
     ]
 
 
+# Marks that start where the next letter starts without being one glyph with it: a combining
+# acute that doesn't move the pen, drawn back over its letter, and a zero-width space.
+MARK_LINES = {
+    "accent": "re\u0301sume\u0301 cafe\u0301 and the next",
+    "zero-width": "one\u200btwo and the next",
+}
+
+
+@pytest.mark.parametrize("line", MARK_LINES.values(), ids=MARK_LINES)
+def test_a_mark_or_zero_width_glyph_stays_apart_from_the_next_letter(
+    tmp_path: Path, line: str
+) -> None:
+    """A zero-width mark shares its origin with the next letter, but not its box: only the
+    pieces of one glyph share both. Taken as one character, the mark would lend the letter
+    its narrow box, and the gap after it would read as a space ("rés umé", "one t wo")."""
+    path = _typeset_pdf(tmp_path / "marks.pdf", [line])
+
+    assert read_pdf(path).chapters[0].paragraphs == (line,)
+    texts = _char_texts(path)
+    assert "".join(texts) == "".join(line.split())
+    assert all(len(text) == 1 for text in texts)  # every glyph its own character
+
+
+def test_a_glyph_mapped_to_several_characters_keeps_them_all_in_order(tmp_path: Path) -> None:
+    """An ellipsis glyph mapped to "..." and an ö mapped to o and a combining diaeresis come
+    over like a ligature's letters: one character per code point, each with the glyph's box.
+    Each glyph stays one character, with every code point once and in order, and no space
+    inside it ("wait. . . then")."""
+    path = _typeset_pdf(tmp_path / "several.pdf", ["wait\u2026 then G\u00f6ttingen."])
+
+    assert read_pdf(path).chapters[0].paragraphs == ("wait... then Go\u0308ttingen.",)
+    texts = _char_texts(path)
+    assert "".join(texts) == "wait...thenGo\u0308ttingen."
+    assert [text for text in texts if len(text) > 1] == ["...", "o\u0308"]
+
+
 def test_ligature_characters_become_their_letters_and_nothing_else_is_normalised() -> None:
     assert [_character(code) for code in range(0xFB00, 0xFB07)] == [
         "ff", "fi", "fl", "ffi", "ffl", "st", "st",
     ]  # fmt: skip
+    # Old Windows fonts' private-use fi and fl; other private-use code points mean nothing.
+    assert [_character(code) for code in (0xF001, 0xF002, 0xF003, 0xE000)] == ["fi", "fl", "", ""]
     for text in ("²", "½", "ſ", "Ⅳ", "™", "Ａ", "é"):
         assert _character(ord(text)) == text
 
