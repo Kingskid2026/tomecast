@@ -5,6 +5,9 @@ import pytest
 
 from tomecast import playback
 
+# pw-play, paplay and aplay are Linux's players; Windows will use winsound (#39).
+pytestmark = pytest.mark.posix_only
+
 
 def test_the_first_player_found_is_used(monkeypatch: pytest.MonkeyPatch) -> None:
     found = {"paplay": "/usr/bin/paplay", "aplay": "/usr/bin/aplay"}

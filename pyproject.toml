@@ -84,6 +84,9 @@ files = ["src", "tests"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = ["-ra", "--strict-markers", "--strict-config"]
+markers = [
+    "posix_only: needs POSIX behaviour (shebang scripts, permission bits, symlinks, Linux-only features); skipped on Windows (#39)",
+]
 
 [[tool.mypy.overrides]]
 # pypdfium2 ships no type information; its values are checked where they enter our code.

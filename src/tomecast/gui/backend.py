@@ -342,6 +342,9 @@ class Backend(QObject):
         engine_check: SelfCheckFor | None = None,
     ) -> None:
         super().__init__(parent)
+        # TODO(#39): on Windows, QSettings() writes to the registry (HKCU\Software\Tomecast).
+        # Still to decide: keep that, or store an INI file in tomecast.oslayer.config_dir()
+        # (QSettings(path, QSettings.Format.IniFormat)), as Linux keeps a file today.
         self._settings = settings if settings is not None else QSettings()
         self._data_root = data_root if data_root is not None else data_dir()
         self._player = find_player() if player == "auto" else player

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -51,6 +52,8 @@ def _global_text(data: Path) -> str:
 
 @pytest.fixture
 def read_only(tmp_path: Path) -> Iterator[None]:
+    if sys.platform == "win32":
+        pytest.skip("Windows ignores a folder's read-only setting")
     if os.geteuid() == 0:
         pytest.skip("root can write to read-only folders")
     yield

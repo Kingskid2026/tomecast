@@ -1,3 +1,5 @@
+import os
+import sys
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -15,7 +17,6 @@ from machine_factory import (
 )
 
 from tomecast import machine
-from tomecast.engines.audiocpp import default_threads
 from tomecast.machine import (
     LOW_MEMORY,
     LOW_MEMORY_BYTES,
@@ -31,6 +32,9 @@ from tomecast.machine import (
     scan_machine,
     usual_threads,
 )
+
+# SYS_NAMES_NEED_POSIX: the tests marked with it copy Linux's /sys, whose names have ":" (not
+# allowed in Windows file names) or are symlinks. On Windows, machine.py doesn't read /sys.
 
 GIB = 2**30
 DESKTOP = Power(battery=False, on_battery=False)
@@ -98,6 +102,7 @@ def test_a_laptop_on_battery(tmp_path: Path) -> None:
     assert _power(tmp_path, ON_BATTERY) == Power(battery=True, on_battery=True)
 
 
+@pytest.mark.posix_only  # see SYS_NAMES_NEED_POSIX
 def test_a_full_battery_on_the_charger_isnt_on_battery(tmp_path: Path) -> None:
     # As the maintainer's laptop reports it: charging stopped at a limit, the charger plugged
     # in, and an ACPI battery with no scope file.
@@ -111,6 +116,7 @@ def test_a_full_battery_on_the_charger_isnt_on_battery(tmp_path: Path) -> None:
     assert _power(tmp_path, supplies) == Power(battery=True, on_battery=False)
 
 
+@pytest.mark.posix_only  # see SYS_NAMES_NEED_POSIX
 def test_a_usb_c_charger_counts_as_plugged_in(tmp_path: Path) -> None:
     supplies = {
         **DISCHARGING,  # a weak charger: the battery still drains a little
@@ -126,6 +132,7 @@ def test_a_programmable_usb_supply_counts_as_online(tmp_path: Path) -> None:
     assert _power(tmp_path, supplies).on_battery is False
 
 
+@pytest.mark.posix_only  # see SYS_NAMES_NEED_POSIX
 def test_unplugged_usb_c_ports_mean_on_battery(tmp_path: Path) -> None:
     supplies = {
         "BAT0": {"type": "Battery", "status": "Unknown"},
@@ -161,6 +168,7 @@ def test_a_charging_battery_beats_an_ac_entry_that_says_offline(tmp_path: Path) 
     assert _power(tmp_path, {**AC_OFFLINE, **CHARGING}) == Power(battery=True, on_battery=False)
 
 
+@pytest.mark.posix_only  # see SYS_NAMES_NEED_POSIX
 def test_a_charging_battery_beats_an_idle_usb_c_port(tmp_path: Path) -> None:
     supplies = {
         **CHARGING,
@@ -170,6 +178,7 @@ def test_a_charging_battery_beats_an_idle_usb_c_port(tmp_path: Path) -> None:
     assert _power(tmp_path, supplies) == Power(battery=True, on_battery=False)
 
 
+@pytest.mark.posix_only  # see SYS_NAMES_NEED_POSIX
 def test_a_full_battery_with_the_charger_offline_is_on_battery(tmp_path: Path) -> None:
     supplies = {**AC_OFFLINE, "BAT0": {"type": "Battery", "status": "Full"}}
 
@@ -181,6 +190,7 @@ def _on_hid_bus(entry: Path, subsystem: str = "hid") -> None:
     (entry / "device" / "subsystem").symlink_to(f"../../../../bus/{subsystem}")
 
 
+@pytest.mark.posix_only  # see SYS_NAMES_NEED_POSIX
 @pytest.mark.parametrize(
     "name", ["hid-00:11:22:33:44:55-battery", "hidpp_battery_0", "HID-046d:c52b-battery"]
 )
@@ -190,6 +200,7 @@ def test_an_input_drivers_battery_with_no_scope_doesnt_count(tmp_path: Path, nam
     assert _power(tmp_path, supplies) == DESKTOP
 
 
+@pytest.mark.posix_only  # see SYS_NAMES_NEED_POSIX
 def test_a_battery_on_the_hid_bus_with_no_scope_doesnt_count(tmp_path: Path) -> None:
     folder = power_supply(
         tmp_path / "power_supply",
@@ -200,6 +211,7 @@ def test_a_battery_on_the_hid_bus_with_no_scope_doesnt_count(tmp_path: Path) -> 
     assert read_power(folder) == DESKTOP
 
 
+@pytest.mark.posix_only  # see SYS_NAMES_NEED_POSIX
 def test_a_laptops_own_battery_with_no_scope_still_counts(tmp_path: Path) -> None:
     folder = power_supply(tmp_path / "power_supply", ON_BATTERY)
     _on_hid_bus(folder / "BAT0", subsystem="acpi")
@@ -215,6 +227,7 @@ def test_a_scope_of_system_wins_over_the_name(tmp_path: Path) -> None:
     assert _power(tmp_path, supplies) == Power(battery=True, on_battery=True)
 
 
+@pytest.mark.posix_only  # see SYS_NAMES_NEED_POSIX
 def test_a_mouse_battery_doesnt_make_a_desktop_a_laptop(tmp_path: Path) -> None:
     supplies = {
         "hidpp_battery_0": {
@@ -228,6 +241,7 @@ def test_a_mouse_battery_doesnt_make_a_desktop_a_laptop(tmp_path: Path) -> None:
     assert _power(tmp_path, supplies) == DESKTOP
 
 
+@pytest.mark.posix_only  # see SYS_NAMES_NEED_POSIX
 def test_a_mouse_battery_doesnt_hide_the_laptops_own(tmp_path: Path) -> None:
     supplies = {
         **ON_BATTERY,
@@ -260,6 +274,7 @@ def test_an_empty_battery_bay_doesnt_count(tmp_path: Path) -> None:
     assert _power(tmp_path, supplies) == DESKTOP
 
 
+@pytest.mark.posix_only  # see SYS_NAMES_NEED_POSIX
 def test_any_charger_online_wins(tmp_path: Path) -> None:
     supplies = {
         **CHARGING,
@@ -384,9 +399,13 @@ def test_scan_never_raises_on_a_machine_with_nothing_to_read(tmp_path: Path) -> 
     assert (found.memory, found.power) == (Memory(), Power())
 
 
+# It imports the engine, which can't load on Windows until it moves to tomecast.oslayer.
+@pytest.mark.posix_only
 def test_the_engine_uses_the_scans_thread_count_and_rereads_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from tomecast.engines.audiocpp import default_threads
+
     monkeypatch.setattr(machine, "cpu_count", lambda: 16)
     pin_machine(monkeypatch, tmp_path / "plugged", supplies=PLUGGED_IN)
     assert default_threads() == 8
@@ -396,3 +415,15 @@ def test_the_engine_uses_the_scans_thread_count_and_rereads_it(
 
     pin_machine(monkeypatch, tmp_path / "small", total_gib=3.7, available_gib=1.5)
     assert default_threads() == 4
+
+
+def test_cpu_count_is_at_least_one_here() -> None:
+    assert machine.cpu_count() >= 1
+
+
+def test_cpu_count_on_windows_is_the_systems_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "platform", "win32")  # the branch Windows takes, on any system
+    monkeypatch.setattr(os, "cpu_count", lambda: 6)
+    assert machine.cpu_count() == 6
+    monkeypatch.setattr(os, "cpu_count", lambda: None)
+    assert machine.cpu_count() == 2
