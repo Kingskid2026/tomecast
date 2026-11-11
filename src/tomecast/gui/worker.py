@@ -488,6 +488,14 @@ class ConversionWorker(QObject):
         if thread is not None:
             thread.quit()
 
+    @Slot()
+    def leave_card(self) -> None:
+        """The window's "Use graphics card" was switched off: stop a preview engine started on
+        the card, so it doesn't hold the card's memory until the next preview (on the worker's
+        thread, after the job in hand, which may be a preview starting one)."""
+        if self._preview_gpu:
+            self._close_preview_engine()
+
     # --- Start-up scan --------------------------------------------------------------------
 
     def _scan(self, job: ScanJob) -> None:
