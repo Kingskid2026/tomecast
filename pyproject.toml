@@ -87,7 +87,11 @@ files = ["src", "tests"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = ["-ra", "--strict-markers", "--strict-config"]
+# Integration tests need things from outside the repo; run them with `pytest -m integration`.
+addopts = ["-ra", "--strict-markers", "--strict-config", "-m", "not integration"]
+markers = [
+    "integration: needs something from outside the repo, such as Tomecast's downloaded engines (opt-in: -m integration)",
+]
 
 [[tool.mypy.overrides]]
 # pypdfium2 ships no type information; its values are checked where they enter our code.
