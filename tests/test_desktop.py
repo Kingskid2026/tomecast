@@ -6,6 +6,9 @@ import pytest
 
 from tomecast import desktop
 
+# The freedesktop launcher entry is Linux's; Windows gets a Start Menu shortcut (#39).
+pytestmark = pytest.mark.posix_only
+
 
 @pytest.fixture
 def data_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:

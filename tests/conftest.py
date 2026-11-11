@@ -8,6 +8,7 @@ modules, and two files named conftest would collide).
 """
 
 import os
+import sys
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,32 @@ from typing import Any
 import pytest
 
 from tomecast import machine
+
+if sys.platform == "win32":
+    # The Windows port (#39) isn't done yet. These import tomecast.engines.audiocpp, which
+    # calls ctypes.CDLL(None) (Linux's prctl) when it loads and so can't be imported on
+    # Windows, or (test_cli, gui/test_backend) import fcntl themselves. The window's tests
+    # all load tomecast.gui.backend (through the fixture below), which imports the engine.
+    # Remove names from this list as the call sites move to tomecast.oslayer.
+    collect_ignore_glob = [
+        "gui/*",
+        "test_audiocpp.py",
+        "test_cli.py",
+        "test_machine.py",
+        "test_speed.py",
+        "test_workdirs.py",
+    ]
+
+
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    """Skip ``posix_only`` tests on Windows (they're kept, not deleted, for the port)."""
+    if sys.platform != "win32":
+        return
+    skip = pytest.mark.skip(reason="POSIX-only: not ported to Windows yet (#39)")
+    for item in items:
+        if item.get_closest_marker("posix_only"):
+            item.add_marker(skip)
+
 
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 os.environ["QT_QUICK_BACKEND"] = "software"

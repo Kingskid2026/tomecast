@@ -81,6 +81,7 @@ def _executable(tmp_path: Path, body: str) -> Path:
     return script
 
 
+@pytest.mark.posix_only
 def test_lists_only_the_vulkan_devices(tmp_path: Path) -> None:
     script = _executable(
         tmp_path,
@@ -114,6 +115,7 @@ def test_lists_only_the_vulkan_devices(tmp_path: Path) -> None:
     ]
 
 
+@pytest.mark.posix_only
 @pytest.mark.parametrize(
     "body",
     [
@@ -129,6 +131,7 @@ def test_a_crash_or_odd_output_is_not_knowing_not_no_card(tmp_path: Path, body: 
     assert list_devices(_executable(tmp_path, body)) is None  # "couldn't tell", not "none"
 
 
+@pytest.mark.posix_only
 def test_an_answer_with_nothing_usable_is_no_card(tmp_path: Path) -> None:
     junk = '{"devices": [5, {"backend": "vulkan"}, {"backend": "vulkan", "index": 1}]}'
     assert list_devices(_executable(tmp_path, f"print({junk!r})")) == []
@@ -139,6 +142,7 @@ def test_a_missing_executable_cant_tell(tmp_path: Path) -> None:
     assert list_devices(tmp_path / "nothing-here") is None
 
 
+@pytest.mark.posix_only
 def test_a_hung_executable_times_out_and_cant_tell(tmp_path: Path) -> None:
     script = _executable(tmp_path, "import time; time.sleep(30)")
     started = time.monotonic()
@@ -146,6 +150,7 @@ def test_a_hung_executable_times_out_and_cant_tell(tmp_path: Path) -> None:
     assert time.monotonic() - started < 5
 
 
+@pytest.mark.posix_only
 def test_listing_stops_early_when_the_user_stops(tmp_path: Path) -> None:
     script = _executable(tmp_path, "import time; time.sleep(30)")
     started = time.monotonic()
@@ -155,6 +160,7 @@ def test_listing_stops_early_when_the_user_stops(tmp_path: Path) -> None:
     assert time.monotonic() - started < 3  # not the 20 s time limit
 
 
+@pytest.mark.posix_only
 def test_missing_memory_counts_as_zero(tmp_path: Path) -> None:
     script = _executable(
         tmp_path,

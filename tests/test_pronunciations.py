@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from tomecast import pronunciations
 from tomecast.pronunciations import Pronunciation, Pronunciations, parse, respelling
 
@@ -261,6 +263,7 @@ def test_matches_follows_the_case_rules() -> None:
     assert pronunciations.matches("New  Zealand", "New Zealand")
 
 
+@pytest.mark.posix_only
 def test_save_writes_the_whole_list_and_keeps_its_permissions(tmp_path: Path) -> None:
     path = tmp_path / "Book.pronunciations.txt"
     pronunciations.save(path, "Zed → zed\n")
@@ -272,6 +275,7 @@ def test_save_writes_the_whole_list_and_keeps_its_permissions(tmp_path: Path) ->
     assert [p.name for p in tmp_path.iterdir()] == [path.name]  # no temporary file left
 
 
+@pytest.mark.posix_only
 def test_save_writes_through_a_link_and_removes_an_empty_list(tmp_path: Path) -> None:
     real = tmp_path / "dotfiles" / "pronunciations.txt"
     real.parent.mkdir()
