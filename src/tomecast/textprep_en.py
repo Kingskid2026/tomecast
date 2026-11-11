@@ -13,6 +13,8 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 
+from tomecast.chunking import ABBREVIATIONS
+
 # --- Number words ---------------------------------------------------------------------------
 
 _ONES = (
@@ -196,6 +198,64 @@ def _sentence_end_period(text: str, end: int) -> str:
     return "." if text[index].isupper() else ""
 
 
+_SENTENCE_END_MARKS = ".!?\u2026\u0964"  # . ! ? the ellipsis, and Hindi's danda
+
+
+def _starts_sentence(text: str, start: int) -> bool:
+    """True if ``start`` is where a new sentence begins, after another one in ``text``.
+
+    This mirrors the chunker's rule (:func:`tomecast.chunking.split_sentences`): a sentence
+    ends at ``.``, ``!``, ``?`` or ``…`` and a space, unless the period belongs to an
+    abbreviation or an initial. The chunker only splits there if the next word doesn't start
+    with a lowercase letter, so a rule that turns "5" into "five" at such a place must say
+    "Five", or two sentences would run together. The paragraph's own start doesn't count:
+    it starts a sentence whatever its case.
+    """
+    index = start
+    while index > 0 and text[index - 1] in _OPENERS:
+        index -= 1
+    gap = index
+    while gap > 0 and text[gap - 1].isspace():
+        gap -= 1
+    if gap == index:
+        return False
+    while gap > 0 and text[gap - 1] in _CLOSERS:
+        gap -= 1
+    marks = gap
+    while marks > 0 and text[marks - 1] in _SENTENCE_END_MARKS:
+        marks -= 1
+    if marks == gap:
+        return False
+    if text[marks:gap] != ".":
+        return True
+    before = text[:marks].split()
+    word = before[-1].lstrip(_OPENERS) if before else ""
+    if word.lower() in ABBREVIATIONS:
+        return False
+    return not (len(word) == 1 and word.isupper())  # an initial: "J. R. R. Tolkien"
+
+
+def _sentence_case(text: str, start: int, spoken: str) -> str:
+    """``spoken`` with a capital first letter if it starts a sentence (see
+    :func:`_starts_sentence`)."""
+    if spoken[:1].islower() and _starts_sentence(text, start):
+        return spoken[:1].upper() + spoken[1:]
+    return spoken
+
+
+def _sub(pattern: re.Pattern[str], replace: Callable[[re.Match[str]], str], text: str) -> str:
+    """``pattern.sub(replace, text)``, saying a replacement that starts a sentence with a
+    capital letter."""
+
+    def cased(match: re.Match[str]) -> str:
+        spoken = replace(match)
+        if spoken == match.group(0):
+            return spoken
+        return _sentence_case(match.string, match.start(), spoken)
+
+    return pattern.sub(cased, text)
+
+
 def _valid_day(day: int) -> bool:
     return 1 <= day <= 31
 
@@ -215,8 +275,16 @@ _MONTH_YEAR = re.compile(
     rf"\b(?P<month>{_MONTH_FULL}|(?:{_MONTH_SHORT})\b\.?)\s+(?P<year>\d{{4}})\b"
 )
 _DAY_FIRST = re.compile(
-    rf"{_NOT_AFTER}(?P<day>\d{{1,2}})(?:st|nd|rd|th)?(?:\s+of)?\s+"
+    rf"{_NOT_AFTER}(?P<day>\d{{1,2}})(?:st|nd|rd|th)?(?P<of>\s+of)?\s+"
     rf"(?P<month>{_MONTH_FULL}|(?:{_MONTH_SHORT})\.)(?:,?\s+(?P<year>\d{{4}})\b(?![,.]\d))?"
+)
+
+# "the 21st May" already has its "the", and so do "every 4 July" and "the 2nd and 3rd May".
+_DAY_DETERMINER = re.compile(
+    r"\b(?:the|this|that|every|each|any|my|your|his|her|its|our|their|last|next|same)\s+"
+    r"(?:\d{1,2}(?:st|nd|rd|th)?"
+    r"(?:\s*,\s*(?:(?:and|or)\s+)?|\s*[-\u2013&]\s*|\s+(?:and|or|to|through|till|until)\s+))*$",
+    re.IGNORECASE,
 )
 
 
@@ -227,7 +295,7 @@ def _iso_dates(text: str) -> str:
             return match.group(0)
         return f"{MONTHS[m - 1]} {ordinal(d)}, {year(y)}"
 
-    return _ISO_DATE.sub(replace, text)
+    return _sub(_ISO_DATE, replace, text)
 
 
 def _dates(text: str) -> str:
@@ -248,12 +316,18 @@ def _dates(text: str) -> str:
         if not _valid_day(day):
             return match.group(0)
         month = MONTHS[_month_number(match["month"]) - 1]
-        spoken = f"the {ordinal(day)} of {month}"
+        spoken = f"{ordinal(day)} of {month}"
+        # "21 May" is said "the twenty-first of May". "The 21st of May" is already written
+        # the way it's said, so it keeps the writer's words ("every 4th of July", "that
+        # fateful 21st of May") and gets no second "the".
+        has_article = _DAY_DETERMINER.search(match.string, 0, match.start()) is not None
+        if not match["of"] and not has_article:
+            spoken = "the " + spoken
         return spoken + (f", {_year_text(match['year'])}" if match["year"] else "")
 
-    text = _DAY_FIRST.sub(day_first, text)
-    text = _MONTH_FIRST.sub(month_first, text)
-    return _MONTH_YEAR.sub(month_year, text)
+    text = _sub(_DAY_FIRST, day_first, text)
+    text = _sub(_MONTH_FIRST, month_first, text)
+    return _sub(_MONTH_YEAR, month_year, text)
 
 
 _CLOCK_WITH_MERIDIEM = re.compile(
@@ -284,7 +358,7 @@ def _times(text: str) -> str:
             return f"{cardinal(hour)} o'clock" if hour <= 12 else f"{cardinal(hour)} hundred"
         return f"{cardinal(hour)} {_minutes(minute)}"
 
-    return _CLOCK.sub(plain, _CLOCK_WITH_MERIDIEM.sub(with_meridiem, text))
+    return _sub(_CLOCK, plain, _sub(_CLOCK_WITH_MERIDIEM, with_meridiem, text))
 
 
 # --- Money and percentages ------------------------------------------------------------------
@@ -342,11 +416,11 @@ def _currency(text: str) -> str:
         is_one = digits == "1" and not fraction
         return f"{spoken} {one if is_one else many}"
 
-    return _CURRENCY.sub(replace, text)
+    return _sub(_CURRENCY, replace, text)
 
 
 def _percentages(text: str) -> str:
-    return _PERCENT.sub(lambda m: spoken_number(m["whole"], m["frac"]) + " percent", text)
+    return _sub(_PERCENT, lambda m: spoken_number(m["whole"], m["frac"]) + " percent", text)
 
 
 # --- Abbreviations --------------------------------------------------------------------------
@@ -587,8 +661,8 @@ def _decades(text: str) -> str:
     def short(match: re.Match[str]) -> str:
         return _plural_tens(int(match["decade"]) * 10)
 
-    text = _DECADE.sub(full, text)
-    return _SHORT_DECADE.sub(short, text)
+    text = _sub(_DECADE, full, text)
+    return _sub(_SHORT_DECADE, short, text)
 
 
 def _next_word(text: str, end: int) -> str:
@@ -629,7 +703,7 @@ def _years(text: str) -> str:
         spoken = f"oh {_ONES[short]}" if short < 10 else cardinal(short)
         return f"{year(first)} to {spoken}"
 
-    text = _YEAR_RANGE.sub(year_range, text)
+    text = _sub(_YEAR_RANGE, year_range, text)
 
     # Single years, left to right: the second year of "between 1914 and 1918" counts too.
     pieces: list[str] = []
@@ -641,7 +715,7 @@ def _years(text: str) -> str:
         )
         if linked or _is_year_context(text, match):
             pieces.append(text[cursor : match.start()])
-            pieces.append(year(int(match["y"])))
+            pieces.append(_sentence_case(text, match.start(), year(int(match["y"]))))
             cursor = match.end()
             last_year_end = match.end()
     pieces.append(text[cursor:])
@@ -652,7 +726,7 @@ def _ordinals(text: str) -> str:
     def replace(match: re.Match[str]) -> str:
         return ordinal(int(match["n"].replace(",", "")))
 
-    return _ORDINAL.sub(replace, text)
+    return _sub(_ORDINAL, replace, text)
 
 
 def _fraction_words(numerator: int, denominator: int) -> str:
@@ -689,9 +763,9 @@ def _fractions(text: str) -> str:
             return match.group(0)
         return _fraction_words(numerator, denominator)
 
-    text = _VULGAR_FRACTION.sub(vulgar, text)
-    text = _MIXED_FRACTION.sub(mixed, text)
-    return _FRACTION.sub(simple, text)
+    text = _sub(_VULGAR_FRACTION, vulgar, text)
+    text = _sub(_MIXED_FRACTION, mixed, text)
+    return _sub(_FRACTION, simple, text)
 
 
 def _slashed_numbers(text: str) -> str:
@@ -708,7 +782,7 @@ def _slashed_numbers(text: str) -> str:
         parts = [spoken_number(part) for part in (first, second, third) if part is not None]
         return " slash ".join(parts)
 
-    return _SLASHED.sub(replace, text)
+    return _sub(_SLASHED, replace, text)
 
 
 def _phone_numbers(text: str) -> str:
@@ -716,7 +790,7 @@ def _phone_numbers(text: str) -> str:
         groups = re.findall(r"\d+", match.group(0))
         return ", ".join(digit_words(group) for group in groups)
 
-    return _PHONE.sub(replace, text)
+    return _sub(_PHONE, replace, text)
 
 
 def _ranges(text: str) -> str:
@@ -728,7 +802,7 @@ def _ranges(text: str) -> str:
             return match.group(0)
         return f"{spoken_number(first)} to {spoken_number(second)}"
 
-    return _RANGE.sub(replace, text)
+    return _sub(_RANGE, replace, text)
 
 
 def _numbers(text: str) -> str:
@@ -740,7 +814,7 @@ def _numbers(text: str) -> str:
         # "5km" is "five km", not "fivekm".
         return spoken + " " if following.isalpha() else spoken
 
-    return _PLAIN_NUMBER.sub(replace, text)
+    return _sub(_PLAIN_NUMBER, replace, text)
 
 
 _STEPS: tuple[Callable[[str], str], ...] = (

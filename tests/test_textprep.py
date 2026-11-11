@@ -1,6 +1,9 @@
+from itertools import pairwise
+
 import pytest
 
 from tomecast.book import Chapter
+from tomecast.chunking import split_sentences
 from tomecast.pronunciations import Pronunciation, Pronunciations
 from tomecast.textprep import PassthroughRules, TextPrep, rules_for, words_lost
 from tomecast.textprep_en import (
@@ -227,6 +230,100 @@ def test_years(written: str, spoken: str) -> None:
     ],
 )
 def test_dates(written: str, spoken: str) -> None:
+    assert say(written) == spoken
+
+
+# Each of these once came out with a word doubled ("the the twenty-first of May") or added.
+ORDINAL_DATES = [
+    ("the 21st of May", "the twenty-first of May"),
+    ("It happened on the 21st of May.", "It happened on the twenty-first of May."),
+    ("May 21st", "May twenty-first"),
+    ("21st May", "the twenty-first of May"),
+    ("on 21st May", "on the twenty-first of May"),
+    ("on the 21st May", "on the twenty-first of May"),
+    ("the 21 May", "the twenty-first of May"),
+    ("the 21 of May", "the twenty-first of May"),
+    ("the 1st", "the first"),
+    ("He came on the 1st.", "He came on the first."),
+    ("the 2nd and 3rd", "the second and third"),
+    ("the 2nd and 3rd of May", "the second and third of May"),
+    ("the 2nd and 3rd May", "the second and third of May"),
+    ("the 2nd, 3rd and 4th May", "the second, third and fourth of May"),
+    ("from the 1st to the 3rd of May", "from the first to the third of May"),
+    ("the 22nd of June, 1815", "the twenty-second of June, eighteen fifteen"),
+    (
+        "On the 22nd of June, 1815, the battle ended.",
+        "On the twenty-second of June, eighteen fifteen, the battle ended.",
+    ),
+    ("the 4 July 1776", "the fourth of July, seventeen seventy-six"),
+    ("the 21st of Mar. 1815", "the twenty-first of March, eighteen fifteen"),
+    ("21st-century", "twenty-first-century"),
+    ("a 21st-century city", "a twenty-first-century city"),
+    ("The 21st of May was warm.", "The twenty-first of May was warm."),
+    ("The 21st was a Tuesday.", "The twenty-first was a Tuesday."),
+    ("The 21st May 1815", "The twenty-first of May, eighteen fifteen"),
+    ("THE 21st of May", "THE twenty-first of May"),
+    ("the\n21st of May", "the\ntwenty-first of May"),
+    ("Tuesday the 21st of May", "Tuesday the twenty-first of May"),
+    ("on the 21st, the 22nd of May.", "on the twenty-first, the twenty-second of May."),
+    # With "of" written, the writer's own words are kept and no "the" is added.
+    ("Every 4th of July we met.", "Every fourth of July we met."),
+    ("that fateful 21st of May", "that fateful twenty-first of May"),
+    ("every 4 July", "every fourth of July"),
+    # A paragraph starting with an ordinal.
+    ("21st of May was warm.", "twenty-first of May was warm."),
+    ("21st May was warm.", "the twenty-first of May was warm."),
+    ("1st of all, listen.", "first of all, listen."),
+]  # fmt: skip
+
+
+@pytest.mark.parametrize(("written", "spoken"), ORDINAL_DATES)
+def test_ordinal_dates_say_every_word_once(written: str, spoken: str) -> None:
+    prepared = TextPrep.for_language("en").body(written)
+    assert prepared == spoken
+    words = prepared.lower().split()
+    assert [w for w, after in pairwise(words) if w == after] == []
+    assert words_lost(written, prepared, english.consumed_words) == []
+
+
+# A number that starts a sentence mid-paragraph is said with a capital letter: the chunker
+# only ends a sentence before a word that doesn't start in lowercase.
+SENTENCE_STARTS = [
+    ("He left. 21st May was warm.", "He left. The twenty-first of May was warm."),
+    ("He left. 21st of May was warm.", "He left. Twenty-first of May was warm."),
+    ("He left. The 21st of May was warm.", "He left. The twenty-first of May was warm."),
+    ("Stop! 1st of all, listen.", "Stop! First of all, listen."),
+    ("Why? 21st-century life.", "Why? Twenty-first-century life."),
+    ('He left. "21st May," she said.', 'He left. "The twenty-first of May," she said.'),
+    ("at 3 p.m. 21st May was warm.", "at three pee em. The twenty-first of May was warm."),
+    ("He left. 5 men came.", "He left. Five men came."),
+    ("He left... 3 men came.", "He left... Three men came."),
+    ("Gone. $5 was lost.", "Gone. Five dollars was lost."),
+    ("Done. 50% of it.", "Done. Fifty percent of it."),
+    ("Fine. 1/2 of it.", "Fine. One half of it."),
+    ("He left. 1960s music played.", "He left. Nineteen sixties music played."),
+    ("It ended. 5-7 men came.", "It ended. Five to seven men came."),
+    ("Done. 3:45 p.m. came.", "Done. Three forty-five pee em came."),
+]  # fmt: skip
+
+
+@pytest.mark.parametrize(("written", "spoken"), SENTENCE_STARTS)
+def test_a_number_starting_a_sentence_keeps_the_sentence_apart(written: str, spoken: str) -> None:
+    prepared = say(written)
+    assert prepared == spoken
+    assert len(split_sentences(prepared)) == len(split_sentences(written))
+
+
+@pytest.mark.parametrize(
+    ("written", "spoken"),
+    [
+        ("Mr. 5 came", "Mister five came"),  # an abbreviation's period doesn't end a sentence
+        ("J. 5 men", "J. five men"),  # nor does an initial's
+        ("e.g. 21 May", "for example the twenty-first of May"),
+        ("4 July 1776", "the fourth of July, seventeen seventy-six"),  # the paragraph's start
+    ],
+)
+def test_a_number_not_starting_a_sentence_stays_lowercase(written: str, spoken: str) -> None:
     assert say(written) == spoken
 
 

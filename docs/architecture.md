@@ -1,6 +1,6 @@
 # Tomecast architecture
 
-*How Tomecast is designed, and why. Kept up to date as the design changes. Last updated 2026-11-10.*
+*How Tomecast is designed, and why. Kept up to date as the design changes. Last updated 2026-11-11.*
 
 ## Goal
 
@@ -122,7 +122,8 @@ Text prep turns written text into speakable text, deterministically, in **one pl
 - **English rules** (rules are per language; the book's language picks them, and a book with no language set is treated as English):
   - Numbers: cardinals up to a quadrillion (`1,250` → "one thousand two hundred fifty"), ordinals (`1st`), decimals, negatives, fractions (`3/4`, `1 1/2`, `½`), ranges (`5-7` → "five to seven"). Leading zeros and huge numbers are read digit by digit, and phone numbers digit by digit in groups.
   - Years only in year-like places: after *in, since, until, by, from, during, between...*, after *War of*, *Panic of* and similar, before AD/BC, in ranges (`1914-18`) and as decades (`1860s`, `'60s`). `1865` → "eighteen sixty-five", `1905` → "nineteen oh five", `2010` → "twenty ten". A bare `1500 men` stays a quantity: "one thousand five hundred men".
-  - Dates (`4 July 1776` → "the fourth of July, seventeen seventy-six"; `July 4, 1776`; `2024-03-05`; US-style `12/25`), times (`3:45 p.m.`, `10 a.m.`, `14:30`), currency (`$5.50` → "five dollars and fifty cents", `£3`, `€10`, `$3.5 million`) and percentages.
+  - Dates (`4 July 1776` → "the fourth of July, seventeen seventy-six"; `July 4, 1776`; `2024-03-05`; US-style `12/25`), times (`3:45 p.m.`, `10 a.m.`, `14:30`), currency (`$5.50` → "five dollars and fifty cents", `£3`, `€10`, `$3.5 million`) and percentages. A day written with *of* (`the 21st of May`, `every 4th of July`) is already said the way it's written, so only the number changes; `21 May` gets its "the" only if there isn't one already (`the 21 May`, `the 2nd and 3rd May`).
+  - A number that starts a sentence after another sentence in the paragraph is said with a capital (`He left. 5 men came.` → "He left. Five men came."), because the chunker doesn't end a sentence before a lowercase word.
   - Abbreviations: *Mr., Mrs., Ms., Dr., Prof., Rev., Gen., Capt., Lt., Sgt., Mt., Ft., Jr., Sr., Inc., Ltd., e.g., i.e., etc., vs., cf., et al., No. 5, p. 12, Fig. 3, Vol. 2, ch. 4, A.D., B.C.* The ambiguous ones use context: `St.` is Saint before a capitalised word (`St. Paul`) and Street after a capitalised name (`Baker St.`); `Dr.` is Doctor before a name and Drive after a street name; a title like `Gen.` is only expanded when a name follows. When an abbreviation's period also ends the sentence (`etc.`, `p.m.`), the full stop is kept so the chunker still splits there.
   - Roman numerals: after *Chapter, Book, Part, Act, Volume, Section...* (`Chapter XII` → "Chapter twelve"), after a name as a regnal number (`Henry VIII` → "Henry the eighth"), and as a bare chapter title (`XIV.` → "fourteen."). `Malcolm X`, `Vitamin C` and the pronoun *I* are left alone.
   - Letters in abbreviations are written out as sounds ("ay em", "pee em", "bee see"), because eSpeak reads a lone capital `A` as the word *a*.
