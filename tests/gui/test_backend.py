@@ -38,9 +38,11 @@ from tomecast.downloads import (
     mark_verified,
     waiting_check,
 )
+from tomecast.engines import ming
 from tomecast.engines.audiocpp import (
     AUDIOCPP_CPU,
     AUDIOCPP_VULKAN,
+    DEFAULT_VOICE,
     ESPEAK_NG,
     KOKORO_Q8,
     OUT_OF_MEMORY_NOTE,
@@ -54,6 +56,8 @@ from tomecast.gui.backend import STOPPED_MESSAGE, Backend, safe_file_name, uniqu
 from tomecast.gui.models import DEFAULT_SPEEDUP, ChapterModel, display_title, summarize
 from tomecast.gui.worker import BookRead, SelfCheckFor, TimedControl, preview_file
 from tomecast.hardware import GpuDevice, short_name
+from tomecast.hardware import GpuDevice
+from tomecast.manifest import MING_Q8
 from tomecast.names import Name
 from tomecast.speed import Speeds
 from tomecast.textprep import TextPrep
@@ -3026,3 +3030,80 @@ def test_the_cpus_speed_after_the_switch_is_kept_under_the_engines_threads(
 
     assert "CPU/8" in backend._speeds  # what the engine voiced with
     assert "CPU/4" not in backend._speeds
+# --- The premium voice (Ming, issue #11) --------------------------------------------------
+
+
+def _premium_labels(backend: Backend) -> list[str]:
+    return [group["label"] for group in backend.voiceGroups if "PREMIUM" in group["label"]]
+
+
+def test_the_premium_voices_are_listed_only_while_the_card_is_in_use(
+    make_backend: MakeBackend,
+) -> None:
+    assert _premium_labels(make_backend(gpu=False)) == []
+    backend = make_backend(gpu=True)
+    assert _premium_labels(backend) == ["PREMIUM · BRITISH", "PREMIUM · AMERICAN"]
+    names = [v["id"] for g in backend.voiceGroups if "PREMIUM" in g["label"] for v in g["voices"]]
+    assert sorted(names) == sorted(ming.VOICES)
+    backend.setUseGpu(False)
+    assert _premium_labels(backend) == []
+
+
+def test_choosing_a_premium_voice(make_backend: MakeBackend) -> None:
+    backend = make_backend(gpu=True)
+    backend.setSpeed(3.0)
+    backend.setVoice("UK_George")
+    assert backend.voice == "UK_George"
+    assert backend.voiceLabel == "GEORGE · PREMIUM · BRITISH"
+    assert backend.speed == ming.MAX_SPEED  # all of Ming's speed is the stretch, up to 2x
+    backend.setSpeed(2.5)
+    assert backend.speed == ming.MAX_SPEED
+    backend.setVoice("af_heart")
+    backend.setSpeed(2.5)
+    assert backend.speed == 2.5  # Kokoro still goes to 3x
+
+
+def test_turning_the_card_off_goes_back_to_a_kokoro_voice(make_backend: MakeBackend) -> None:
+    backend = make_backend(gpu=True)
+    backend.setVoice("US_Emma")
+    backend.setUseGpu(False)
+    assert backend.voice == DEFAULT_VOICE
+    backend.setVoice("US_Emma")  # not listed without the card
+    assert backend.voice == DEFAULT_VOICE
+
+
+def test_the_download_note_says_when_start_downloads_the_premium_voice(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    backend = make_backend(gpu=True, assets=None)
+    _open(qtbot, backend, _short_book(tmp_path))
+    backend.goTo("voice")
+    assert backend.downloadNote == _note_for(GPU_DOWNLOADS)
+    backend.setVoice("UK_George")  # the engine build and Ming; no eSpeak or Kokoro
+    mb = math.ceil((AUDIOCPP_VULKAN.size + MING_Q8.size) / 1_000_000)
+    assert backend.downloadNote == (
+        f"STARTING DOWNLOADS THE PREMIUM VOICE ONCE · {mb:,} MB · NEEDS A GRAPHICS CARD"
+    )
+
+
+def test_a_premium_voice_converts_with_ming_and_says_it_is_a_preview(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    engines = Engines()
+    backend = make_backend(engines, gpu=True)
+    _open(qtbot, backend, _short_book(tmp_path))
+    backend.setVoice("UK_Charlotte")
+    _convert(qtbot, backend)
+    assert backend.screen == "done"
+    assert [engine.voice for engine in engines.made] == ["UK_Charlotte"]
+    assert ming.UNCHECKED_NOTE in backend.warnings
+
+
+def test_the_book_is_stretched_by_the_engines_tempo() -> None:
+    """The window's speed meter wraps the engine, and passes its speed split on, so
+    convert_book stretches the book (and allows for the voice's speed) as the CLI does."""
+    from tomecast.gui.worker import _Meter
+
+    engine = FakeEngine(Engines(), "af_heart", 3.0)
+    meter = _Meter(engine, TimedControl(), [])
+    assert (meter.voice_speed, meter.tempo) == (1.5, 2.0)
