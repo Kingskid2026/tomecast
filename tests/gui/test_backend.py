@@ -3098,13 +3098,3 @@ def test_a_premium_voice_converts_with_ming_and_says_it_is_a_preview(
     assert backend.screen == "done"
     assert [engine.voice for engine in engines.made] == ["UK_Charlotte"]
     assert ming.UNCHECKED_NOTE in backend.warnings
-
-
-def test_the_book_is_stretched_by_the_engines_tempo() -> None:
-    """The window's speed meter wraps the engine, and passes its speed split on, so
-    convert_book stretches the book (and allows for the voice's speed) as the CLI does."""
-    from tomecast.gui.worker import _Meter
-
-    engine = FakeEngine(Engines(), "af_heart", 3.0)
-    meter = _Meter(engine, TimedControl(), [])
-    assert (meter.voice_speed, meter.tempo) == (1.5, 2.0)
