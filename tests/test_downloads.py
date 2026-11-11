@@ -1,3 +1,4 @@
+import contextlib
 import dataclasses
 import fcntl
 import hashlib
@@ -6,6 +7,7 @@ import io
 import json
 import os
 import shutil
+import socket
 import tarfile
 import threading
 import time
@@ -877,6 +879,9 @@ def test_a_download_cut_off_mid_way_keeps_the_old_build(
         def read(self, size: int | None = -1) -> bytes:
             raise http.client.IncompleteRead(b"part", 100)
 
+        def read1(self, size: int | None = -1) -> bytes:
+            raise http.client.IncompleteRead(b"part", 100)
+
     monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: CutOff())
 
     prepared = prepare([new], root, check=Check())
@@ -1185,3 +1190,244 @@ def test_a_scan_doesnt_take_the_build_back_if_its_own_fails(
     assert _version(root, ours) == "theirs"
     state = json.loads((root / "installed.json").read_text())
     assert state["slots"]["engine"]["chosen_by"] == "0.3.0"
+
+
+# --- After the 0.2.0 pre-release audit ------------------------------------------------------------
+
+
+def test_a_newer_tomecast_rolls_back_a_build_an_older_one_switched_to(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 0.2.0 switches to v2; Tomecast is updated to 0.2.1 (same pin) before v2 finishes a book.
+    root = tmp_path / "data"
+    monkeypatch.setattr(downloads, "__version__", "0.2.0")
+    old, new, _ = _switched(tmp_path, root)
+    monkeypatch.setattr(downloads, "__version__", "0.2.1")
+    prepared = prepare([new], root, check=Check())
+    assert prepared.builds == {"engine": build_folder(new, root)}
+
+    assert roll_back(root, prepared.builds, "the voice engine keeps crashing")
+
+    assert _version(root, new) == "v1"
+    assert failure(new, root) == "the voice engine keeps crashing"
+    assert prepare([new], root, check=Check()).builds == {"engine": build_folder(old, root)}
+
+
+def test_an_older_tomecast_never_rolls_back_a_newer_ones_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "data"
+    monkeypatch.setattr(downloads, "__version__", "0.3.0")
+    _, new, _ = _switched(tmp_path, root)  # v2 hasn't finished a book yet
+    monkeypatch.setattr(downloads, "__version__", "0.2.0")
+    ours = _build(tmp_path, "ours")
+    Path(ours.url.removeprefix("file://")).unlink()  # not on disk, and it can't be downloaded
+    prepared = prepare([ours], root, check=Check())
+    assert prepared.builds == {"engine": build_folder(new, root)}  # so it runs the newer one's
+
+    assert not roll_back(root, prepared.builds, "crashed on the book")
+
+    assert _version(root, new) == "v2"
+    assert failure(new, root) is None
+
+
+@pytest.mark.parametrize("outcome", ["no verdict", "failed", "cancelled"])
+def test_an_older_tomecast_never_runs_its_own_build_before_it_passes_a_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    # 0.3.0 chose its build. 0.2.0's `tomecast scan` downloads 0.2.0's own, but its check
+    # doesn't pass: the newer one's choice stands, now and once any failure has expired.
+    root = tmp_path / "data"
+    ours, theirs = _build(tmp_path, "ours"), _build(tmp_path, "theirs")
+    monkeypatch.setattr(downloads, "__version__", "0.3.0")
+    prepare([theirs], root, check=Check())
+    monkeypatch.setattr(downloads, "__version__", "0.2.0")
+    stopped = False
+    check = Check(Inconclusive("the card is busy") if outcome == "no verdict" else "broken here")
+    if outcome == "cancelled":
+
+        def stop() -> None:
+            nonlocal stopped
+            stopped = True
+
+        check.during = stop
+        with pytest.raises(Cancelled):
+            prepare([ours], root, check=check, take_over=True, cancelled=lambda: stopped)
+    else:
+        scan = prepare([ours], root, check=check, take_over=True)
+        assert scan.builds == {"engine": build_folder(theirs, root)}
+    assert build_sha256(build_folder(ours, root)) == ours.sha256  # kept for the next scan
+
+    later = time.time() + (FAILURE_DAYS + 0.5) * 86400
+    monkeypatch.setattr("time.time", lambda: later)  # a recorded failure has expired
+    plain = Check()
+    prepared = prepare([ours], root, check=plain)
+
+    assert plain.calls == []
+    assert prepared.builds == {"engine": build_folder(theirs, root)}
+    assert not roll_back(root, prepared.builds, "crashed")  # it was never ours to roll back
+    assert _version(root, theirs) == "theirs"
+
+
+def test_the_install_lock_is_let_go_while_the_user_is_asked(tmp_path: Path) -> None:
+    root = tmp_path / "data"
+    old, new = _build(tmp_path, "v1"), _build(tmp_path, "v2")
+    prepare([old], root, check=Check())
+    free: list[bool] = []
+
+    def consent(missing: Sequence[Asset], updates: bool) -> bool:
+        # Another Tomecast starting while the question is unanswered gets the lock at once.
+        with (root / ".install.lock").open("w") as other:
+            try:
+                fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                free.append(True)
+            except BlockingIOError:
+                free.append(False)
+        return True
+
+    prepared = prepare([new], root, check=Check(), consent=consent)
+
+    assert free == [True]
+    assert prepared.switched == (new,)
+
+
+def test_what_another_tomecast_installed_while_the_user_was_asked_isnt_downloaded_again(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "data"
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"model weights")
+    model = _file_asset(source)
+
+    def consent(missing: Sequence[Asset], updates: bool) -> bool:
+        ensure(model, root)  # the other Tomecast's download finishes first
+        source.unlink()  # so a second download would fail
+        return True
+
+    started: list[Asset] = []
+
+    def on_download(asset: Asset, number: int, count: int) -> ProgressCallback | None:
+        started.append(asset)
+        return None
+
+    prepare([model], root, check=Check(), consent=consent, on_download=on_download)
+
+    assert started == []
+    assert is_installed(model, root)
+
+
+def test_a_declined_update_is_asked_about_again_once_the_run_cant_do_without_it(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "data"
+    old, new = _build(tmp_path, "v1"), _build(tmp_path, "v2")
+    prepare([old], root, check=Check())
+    asked: list[bool] = []
+
+    def consent(missing: Sequence[Asset], updates: bool) -> bool:
+        asked.append(updates)
+        if updates:  # meanwhile the old build goes, so v2 is no longer just an update
+            shutil.rmtree(build_folder(old, root))
+            (root / "installed.json").unlink()
+        return not updates
+
+    prepared = prepare([new], root, check=Check(), consent=consent)
+
+    assert asked == [True, False]
+    assert _version(root, new) == "v2"
+    assert prepared.held_back == ()
+
+
+def test_waiting_for_another_tomecast_is_announced_once(tmp_path: Path) -> None:
+    root = tmp_path / "data"
+    root.mkdir()
+    asset = _build(tmp_path, "v1")
+    other = (root / ".install.lock").open("w")
+    fcntl.flock(other, fcntl.LOCK_EX)
+    threading.Timer(0.6, other.close).start()
+    waits: list[str] = []
+
+    prepare([asset], root, check=Check(), on_wait=lambda: waits.append("waiting"))
+
+    assert waits == ["waiting"]
+    assert _version(root, asset) == "v1"
+    prepare([asset], root, check=Check(), on_wait=lambda: waits.append("again"))
+    assert waits == ["waiting"]  # with the lock free, there's nothing to wait for
+
+
+class _Trickle:
+    """A download that arrives slowly: a first piece, then nothing more until ``rest`` is set.
+    Read through a buffered socket, like an HTTP response."""
+
+    def __init__(self, data: bytes, first: int) -> None:
+        self._data, self._first = data, first
+        self.rest = threading.Event()
+        self._closed = False
+        self._reader, writer = socket.socketpair()
+        self._file = self._reader.makefile("rb")
+        threading.Thread(target=self._send, args=(writer,), daemon=True).start()
+
+    def _send(self, writer: socket.socket) -> None:
+        with writer, contextlib.suppress(OSError):
+            writer.sendall(self._data[: self._first])
+            if self.rest.wait(10) and not self._closed:
+                writer.sendall(self._data[self._first :])
+
+    def __enter__(self) -> "_Trickle":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._closed = True
+        self.rest.set()
+        self._file.close()
+        self._reader.close()
+
+    def read(self, size: int = -1) -> bytes:
+        return self._file.read(size)
+
+    def read1(self, size: int = -1) -> bytes:
+        return self._file.read1(size)
+
+
+def _trickled(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Asset, bytes, _Trickle]:
+    data = os.urandom(3 * 1024 * 1024)
+    source = tmp_path / "source.bin"
+    source.write_bytes(data)
+    trickle = _Trickle(data, first=64 * 1024)
+    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: trickle)
+    return _file_asset(source), data, trickle
+
+
+def test_a_slow_download_shows_progress_before_a_whole_block_arrives(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    asset, data, trickle = _trickled(tmp_path, monkeypatch)
+    seen: list[int] = []
+
+    def progress(done: int, total: int) -> None:
+        seen.append(done)
+        trickle.rest.set()  # the rest only comes once the first piece has been reported
+
+    started = time.monotonic()
+    ensure(asset, tmp_path / "data", progress)
+
+    assert time.monotonic() - started < 5  # it never waited for a whole block
+    assert 0 < seen[0] <= 64 * 1024
+    assert seen[-1] == len(data)
+    assert (tmp_path / "data" / asset.path).read_bytes() == data
+
+
+def test_a_slow_download_can_be_stopped_before_a_whole_block_arrives(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    asset, _, _ = _trickled(tmp_path, monkeypatch)  # the rest never comes
+
+    def progress(done: int, total: int) -> None:
+        raise Cancelled  # what the window's reporter does once Cancel is pressed
+
+    started = time.monotonic()
+    with pytest.raises(Cancelled):
+        ensure(asset, tmp_path / "data", progress)
+
+    assert time.monotonic() - started < 5
+    assert not (tmp_path / "data" / asset.path).exists()

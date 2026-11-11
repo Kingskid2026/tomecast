@@ -1122,6 +1122,7 @@ def prepare_voice(
     on_check: Callable[[], None] | None = None,
     cancelled: IsCancelled | None = None,
     take_over: bool = False,
+    on_wait: Callable[[], None] | None = None,
 ) -> Prepared:
     """Install what a run needs (:func:`required_assets`), switching to new engine builds
     only once they pass :func:`kokoro_check`. See :func:`tomecast.downloads.prepare`; give
@@ -1135,4 +1136,5 @@ def prepare_voice(
         on_check=on_check,
         cancelled=cancelled,
         take_over=take_over,
+        on_wait=on_wait,
     )
