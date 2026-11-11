@@ -14,7 +14,6 @@ The "typeset" fonts set text the way TeX does, for books typeset with ligatures:
 from __future__ import annotations
 
 import textwrap
-import unicodedata
 import zlib
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -37,13 +36,40 @@ FONTS = {
 # Type 3 fonts of plain rectangles, set like a TeX book: "ﬀ", "ﬁ", "ﬂ", "ﬃ" and "ﬄ" in a
 # span's text are each drawn as one ligature glyph, as wide as Computer Modern's, and spaces
 # are gaps between words, not glyphs. Each font's ToUnicode map says what a ligature glyph
-# stands for: its letters ("typeset") or the ligature character ("typeset-forms"). All other
-# text in these fonts must be printable ASCII.
-TYPESET_FONTS = {"typeset": "letters", "typeset-forms": "forms"}
-_TYPESET_LIGATURES = {"\ufb00": (1, 583), "\ufb01": (2, 556), "\ufb02": (3, 556),
-                      "\ufb03": (4, 833), "\ufb04": (5, 833)}  # fmt: skip
-_TYPESET_LETTER = 500  # every other glyph's width, in thousandths of an em
+# stands for: its letters ("typeset"), the ligature character ("typeset-forms"), or, for ﬁ
+# and ﬂ, the private-use code points old Windows fonts gave them, U+F001 and U+F002
+# ("typeset-private"). The rest of _TYPESET_GLYPHS are glyphs that share a spot with their
+# neighbours. All other text in these fonts must be printable ASCII.
+TYPESET_FONTS = {"typeset": "letters", "typeset-forms": "forms", "typeset-private": "private"}
+_TYPESET_LETTER = 500  # a printable ASCII glyph's width, in thousandths of an em
 _TYPESET_SPACE = 333  # the gap between words
+
+
+@dataclass(frozen=True, slots=True)
+class _Glyph:
+    """A typeset-font glyph besides printable ASCII: its code, its width (how far it moves
+    the pen), the left and right edges of its box from the pen, and its ToUnicode text."""
+
+    code: int
+    width: int
+    left: int
+    right: int
+    text: str
+
+
+_TYPESET_GLYPHS = {
+    "\ufb00": _Glyph(1, 583, 20, 563, "ff"),
+    "\ufb01": _Glyph(2, 556, 20, 536, "fi"),
+    "\ufb02": _Glyph(3, 556, 20, 536, "fl"),
+    "\ufb03": _Glyph(4, 833, 20, 813, "ffi"),
+    "\ufb04": _Glyph(5, 833, 20, 813, "ffl"),
+    # A combining acute that doesn't move the pen, drawn back over the letter before it.
+    "\u0301": _Glyph(6, 0, -400, -100, "\u0301"),
+    "\u200b": _Glyph(7, 0, 0, 0, "\u200b"),  # a zero-width space: no width, no ink
+    "\u2026": _Glyph(8, 1000, 20, 980, "..."),  # an ellipsis, mapped to three full stops
+    "\u00f6": _Glyph(9, 500, 20, 480, "o\u0308"),  # an ö, mapped to o and a combining diaeresis
+}
+_PRIVATE_LIGATURES = {"\ufb01": "\uf001", "\ufb02": "\uf002"}
 
 _FONT_KEYS = {name: f"F{number}" for number, name in enumerate([*FONTS, *TYPESET_FONTS], start=1)}
 
@@ -259,8 +285,8 @@ def _typeset_text(text: str) -> bytes:
     for word in text.split(" "):
         codes = bytearray()
         for character in word:
-            if character in _TYPESET_LIGATURES:
-                codes.append(_TYPESET_LIGATURES[character][0])
+            if character in _TYPESET_GLYPHS:
+                codes.append(_TYPESET_GLYPHS[character].code)
             elif "!" <= character <= "~":
                 codes.append(ord(character))
             else:
@@ -270,22 +296,31 @@ def _typeset_text(text: str) -> bytes:
 
 
 def _typeset_font(objects: _Objects, ligatures: str) -> int:
-    """A Type 3 font: printable ASCII and five ligatures, each glyph a filled rectangle with
-    a little space on either side, and a ToUnicode map from codes to text."""
-    widths = {code: _TYPESET_LETTER for code in range(ord("!"), ord("~") + 1)}
-    widths.update(_TYPESET_LIGATURES.values())
-    glyphs = {
-        width: objects.stream(
-            f"{width} 0 20 0 {width - 20} 700 d1 20 0 {width - 40} 700 re f".encode()
-        )
-        for width in sorted(set(widths.values()))
-    }
-    codes = sorted(widths)
+    """A Type 3 font: printable ASCII, five ligatures and the glyphs of _TYPESET_GLYPHS, each
+    a filled rectangle inside its box (or nothing, for an empty box), and a ToUnicode map
+    from codes to text."""
+    letter = _Glyph(0, _TYPESET_LETTER, 20, _TYPESET_LETTER - 20, "")
+    shapes = {code: letter for code in range(ord("!"), ord("~") + 1)}
+    shapes.update((glyph.code, glyph) for glyph in _TYPESET_GLYPHS.values())
+    procedures: dict[tuple[int, int, int], int] = {}
+    for glyph in shapes.values():
+        shape = (glyph.width, glyph.left, glyph.right)
+        if shape not in procedures:
+            width = glyph.right - glyph.left
+            ink = f" {glyph.left} 0 {width} 700 re f" if width > 0 else ""
+            procedures[shape] = objects.stream(
+                f"{glyph.width} 0 {glyph.left} 0 {glyph.right} 700 d1{ink}".encode()
+            )
+    codes = sorted(shapes)
     first, last = codes[0], codes[-1]
     to_unicode = []
-    for character, (code, _) in _TYPESET_LIGATURES.items():
-        text = unicodedata.normalize("NFKC", character) if ligatures == "letters" else character
-        to_unicode.append(f"<{code:02X}> <{text.encode('utf-16-be').hex().upper()}>\n")
+    for character, glyph in _TYPESET_GLYPHS.items():
+        text = glyph.text
+        if "\ufb00" <= character <= "\ufb06" and ligatures == "forms":
+            text = character
+        elif ligatures == "private":
+            text = _PRIVATE_LIGATURES.get(character, text)
+        to_unicode.append(f"<{glyph.code:02X}> <{text.encode('utf-16-be').hex().upper()}>\n")
     cmap = objects.stream(
         b"/CIDInit /ProcSet findresource begin 12 dict begin begincmap\n"
         b"/CMapName /Typeset def /CMapType 2 def\n"
@@ -295,8 +330,13 @@ def _typeset_font(objects: _Objects, ligatures: str) -> int:
         + b"endcmap CMapName currentdict /CMap defineresource pop end end"
     )  # fmt: skip
     differences = " ".join(f"{code} /g{code}" for code in codes)
-    char_procs = " ".join(f"/g{code} {glyphs[widths[code]]} 0 R" for code in codes)
-    width_list = " ".join(str(widths.get(code, 0)) for code in range(first, last + 1))
+    char_procs = " ".join(
+        f"/g{code} {procedures[(shapes[code].width, shapes[code].left, shapes[code].right)]} 0 R"
+        for code in codes
+    )
+    width_list = " ".join(
+        str(shapes[code].width if code in shapes else 0) for code in range(first, last + 1)
+    )
     return objects.add(
         f"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 700] "
         f"/FontMatrix [0.001 0 0 0.001 0 0] /CharProcs << {char_procs} >> "
