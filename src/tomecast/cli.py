@@ -466,8 +466,9 @@ def _convert(args: argparse.Namespace) -> int:
             # programs using it did that, not the build, and what failed after it on the CPU
             # is most likely short of memory too (on a graphics chip built into the processor,
             # the card's memory is the computer's).
-            out_of_memory = engine is not None and engine.out_of_memory
-            if not out_of_memory and roll_back(root, builds, str(error)):
+            # Nor after the card was lost (reset by its driver, or the driver crashed).
+            blameless = engine is not None and (engine.out_of_memory or engine.device_lost)
+            if not blameless and roll_back(root, builds, str(error)):
                 raise CliError(f"{error}\nNote: {UPDATE_FAILED_NOTE} {AGAIN_NOTE}") from error
             raise CliError(f"{error}\n{_saved_note(workdir)}".rstrip()) from error
         except OutputExistsError as error:
@@ -495,12 +496,12 @@ def _convert(args: argparse.Namespace) -> int:
     )
     sys.stdout.flush()
     # After "Done", and never waiting long on another Tomecast's install. A run that fell back
-    # to the CPU (as it started, or partway) says nothing about how the build does on the
-    # card, so it proves nothing. The book is made either way, so a disk that won't take
-    # installed.json isn't an error.
-    if engine is not None and not engine.fell_back:
+    # to the CPU (as it started, or partway) says nothing about how the engine build does on
+    # the card, so it proves only the others (eSpeak NG). The book is made either way, so a
+    # disk that won't take installed.json isn't an error.
+    if engine is not None:
         with contextlib.suppress(OSError):
-            mark_proven(root, builds)
+            mark_proven(root, engine.proves(builds))
     return 0
 
 
@@ -648,7 +649,10 @@ def _scan(args: argparse.Namespace) -> int:
     print("Measuring how fast this computer voices (a few seconds each)…")
     speeds = probe(root, gpu=use_gpu)
     choice = recommend(scan_machine())
-    threads = f"{_plural(choice.threads, 'thread')}{_fewer_text(choice)}"
+    # The count the CPU was measured with (a charger pulled meanwhile changes today's).
+    measured_with = speeds.cpu_threads or choice.threads
+    why = _fewer_text(choice) if measured_with == choice.threads else ""
+    threads = f"{_plural(measured_with, 'thread')}{why}"
     if speeds.cpu is not None:
         print(f"CPU, {threads}: about {speeds.cpu:.1f}\u00d7 real time.")
     else:

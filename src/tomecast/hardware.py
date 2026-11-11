@@ -62,10 +62,14 @@ def list_devices(
     """The Vulkan devices ``executable`` (audio.cpp's Vulkan build) can see.
 
     ``[]`` means it answered and there's no device. ``None`` means it couldn't tell: the
-    program is missing, crashed, hung past ``timeout``, printed nothing usable, or
-    ``cancelled`` said the user stopped. A card that doesn't answer isn't "no card", so callers
-    must not treat ``None`` as one. Never raises. The server logs on stderr and prints one
-    JSON object on stdout; the last stdout line that parses as JSON is used.
+    program is missing, crashed before printing the list, hung past ``timeout``, printed
+    nothing usable, or ``cancelled`` said the user stopped. A card that doesn't answer isn't
+    "no card", so callers must not treat ``None`` as one. Never raises. The server logs on
+    stderr and prints one JSON object on stdout; the last stdout line that parses as JSON is
+    used, even if the program then fails (a driver that crashes as it shuts down, after
+    printing the list): the self-check and the engine's start catch a card that doesn't work.
+    An empty list followed by a failure isn't an answer (``None``): a driver that failed to
+    start up lists no cards.
     """
     try:
         process = subprocess.Popen(
@@ -94,8 +98,6 @@ def list_devices(
                 process.wait(timeout=5)
         if process.stdout is not None:
             process.stdout.close()
-    if process.returncode != 0:
-        return None
     payload: object = None
     for line in reversed(stdout.decode(errors="replace").splitlines()):
         try:
@@ -103,7 +105,12 @@ def list_devices(
         except ValueError:
             continue
         break
-    return _parse_devices(payload)
+    devices = _parse_devices(payload)
+    if process.returncode != 0 and not devices:
+        # It failed, and said of no card: a driver that failed to start up lists nothing, so
+        # that isn't an answer. Only a list of cards it printed before failing is one.
+        return None
+    return devices
 
 
 def _parse_devices(payload: object) -> list[GpuDevice] | None:

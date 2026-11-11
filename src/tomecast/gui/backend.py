@@ -972,11 +972,12 @@ class Backend(QObject):
     def _on_speeds(self, speeds: Speeds) -> None:
         """The start-up scan's speeds. A speed this session measured converting is better,
         so it isn't replaced."""
-        # The CPU was measured with the thread count of a moment ago (the probe reads it
-        # itself), so it's kept under the count read now.
+        # Kept under the thread count the CPU was measured with (the probe reads it once, on
+        # the worker), not the one read now: a charger pulled meanwhile changes that.
         self._rescan_machine()
         if speeds.cpu is not None:
-            self._speeds.setdefault(self._speed_key("CPU"), speeds.cpu)
+            key = f"CPU/{speeds.cpu_threads}" if speeds.cpu_threads else self._speed_key("CPU")
+            self._speeds.setdefault(key, speeds.cpu)
         if speeds.gpu is not None and speeds.gpu_description:
             self._speeds.setdefault(short_name(speeds.gpu_description), speeds.gpu)
             if not self._gpuName and self._gpuAvailable:
@@ -1046,10 +1047,11 @@ class Backend(QObject):
 
     @Slot(int, str, int)
     def _on_notice(self, job: int, message: str, threads: int) -> None:
-        """The graphics card ran out of memory and the book goes on on the CPU, with
-        ``threads``: say so in the banner while it's being made (the done screen lists it with
-        the other notes), and show the CPU. The thread count is the engine's own, not read
-        again, so the speed this run measures is kept under the count that made it."""
+        """The graphics card ran out of memory or stopped working (it was lost), and the book
+        goes on on the CPU with ``threads``: say so in the banner while it's being made (the
+        done screen lists it with the other notes), and show the CPU. The thread count is the
+        engine's own, not read again, so the speed this run measures is kept under the count
+        that made it."""
         if job != self._convert_job:
             return
         self._cpu_threads = threads

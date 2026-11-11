@@ -81,6 +81,9 @@ class Speeds:
     cpu: float | None = None
     gpu: float | None = None
     gpu_description: str = ""  # the card the GPU speed was measured on
+    # The CPU threads the CPU speed was measured with (0: not said). Read once by the probe,
+    # so a charger pulled meanwhile doesn't file the speed under the new count.
+    cpu_threads: int = 0
 
 
 # --- Estimates ------------------------------------------------------------------------------
@@ -273,16 +276,22 @@ def probe(
     """
     if not (local_path(KOKORO_Q8, root).is_file() and build_in_use(ESPEAK_NG, root)):
         return Speeds()
+    threads = default_threads()  # once: the CPU's speed is measured and filed with these
     cpu_build = build_in_use(AUDIOCPP_CPU, root) or build_in_use(AUDIOCPP_VULKAN, root)
-    cpu = _speed_on(root, cpu_build, "cpu", None, "", cancelled) if cpu_build else None
+    cpu = _speed_on(root, cpu_build, "cpu", None, "", cancelled, threads) if cpu_build else None
+    cpu_threads = threads if cpu is not None else 0
     vulkan = build_in_use(AUDIOCPP_VULKAN, root) if gpu else None
     if vulkan is not None and not listed:
         devices = list_devices(vulkan / EXECUTABLE, cancelled=cancelled)
     device = pick_device(devices or []) if vulkan else None
     if vulkan is None or device is None:
-        return Speeds(cpu=cpu)
-    on_card = _speed_on(root, vulkan, "vulkan", device.index, device.description, cancelled)
-    return Speeds(cpu, on_card, device.description if on_card is not None else "")
+        return Speeds(cpu=cpu, cpu_threads=cpu_threads)
+    on_card = _speed_on(
+        root, vulkan, "vulkan", device.index, device.description, cancelled, threads
+    )
+    return Speeds(
+        cpu, on_card, device.description if on_card is not None else "", cpu_threads=cpu_threads
+    )
 
 
 # The probe runs at the window's start-up: an engine that hangs mustn't hold the window's
@@ -298,8 +307,9 @@ def _speed_on(
     device: int | None,
     description: str,
     cancelled: IsCancelled | None,
+    threads: int | None = None,
 ) -> float | None:
-    threads = default_threads()
+    threads = threads or default_threads()
     key = speed_key(build, backend=backend, gpu_description=description, threads=threads)
     if (known := known_speed(root, key)) is not None:
         return known

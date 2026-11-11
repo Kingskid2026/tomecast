@@ -96,12 +96,16 @@ class Engine(VoiceEngine, Protocol):
     # after start(): why the CPU is used when the card was wanted. Also set partway through
     # a book, when the card runs out of memory and the engine carries on on the CPU.
     warning: str | None
-    # after start(): the card was wanted but the CPU is used (since the start, or since the
-    # card ran out of memory partway), so the run doesn't prove a graphics-card build
+    # after start(): the card was wanted, but the CPU is used because it didn't work (since
+    # the start, or since the card ran out of memory or was lost partway), so the run doesn't
+    # prove a graphics-card build. Not set when there's no usable card at all.
     fell_back: bool
     # the card ran out of memory (as the engine started, or partway): other programs were
     # using it, so a failure in this run is never blamed on the build
     out_of_memory: bool
+    # the card was lost (reset by its driver, or the driver crashed) as the engine started or
+    # partway: a failure in this run is never blamed on the build either
+    device_lost: bool
 
     @property
     def threads(self) -> int:
@@ -111,6 +115,11 @@ class Engine(VoiceEngine, Protocol):
     def pin_builds(self, builds: Mapping[str, Path]) -> None:
         """Run exactly these engine builds (``Prepared.builds``): the work folder is keyed by
         them, so crash restarts must not pick up another."""
+        ...
+
+    def proves(self, builds: Mapping[str, Path]) -> dict[str, Path]:
+        """Which of ``builds`` a finished book proves: all, or all but the engine build after
+        falling back from the card (see :meth:`AutoKokoro.proves`)."""
         ...
 
     def start(self) -> None: ...
@@ -552,7 +561,14 @@ class ConversionWorker(QObject):
                 )
                 return
             engine = self._preview_engine_for(job.voice, job.speed, use_gpu)
-            self._voice_text(engine, job.text, job.output)
+            on_the_card = not engine.fell_back
+            try:
+                self._voice_text(engine, job.text, job.output)
+            finally:
+                if on_the_card and engine.fell_back:
+                    # The card ran out of memory (or was lost) and the preview carried on on
+                    # the CPU: the hardware label says so now, not at the next conversion.
+                    self.deviceChosen.emit(engine.gpu_description, use_gpu)
         except (
             EngineError,
             MissingAudioError,
@@ -659,7 +675,10 @@ class ConversionWorker(QObject):
             # graphics chip built into the processor, the card's memory is the computer's).
             failed_voicing = isinstance(error, EngineError | MissingAudioError)
             stopped = job.control.cancelled or self._stopping.is_set()
-            blameless = stopped or (engine is not None and engine.out_of_memory)
+            # Nor after the card was lost (reset by its driver, or the driver crashed).
+            blameless = stopped or (
+                engine is not None and (engine.out_of_memory or engine.device_lost)
+            )
             if failed_voicing and builds and not blameless and self._roll_back(job, builds, error):
                 message += f" {UPDATE_FAILED_NOTE} Start again to make the book with it."
             elif workdir is not None and any((workdir / "chunks").glob("*.wav")):
@@ -667,10 +686,10 @@ class ConversionWorker(QObject):
             self.failed.emit(job.job, message)
             return
         self.converted.emit(job.job, outcome)  # the book is done: tell the window first
-        # A run that fell back to the CPU (as it started, or partway) proves nothing for the card.
-        if not engine.fell_back:
-            with contextlib.suppress(Cancelled, OSError):
-                mark_proven(self._root, builds, self._stopping.is_set)
+        # A run that fell back to the CPU (as it started, or partway) proves nothing for the
+        # card, so only the builds other than the engine's (eSpeak NG).
+        with contextlib.suppress(Cancelled, OSError):
+            mark_proven(self._root, engine.proves(builds), self._stopping.is_set)
 
     def _roll_back(self, job: ConvertJob, builds: Mapping[str, Path], error: Exception) -> bool:
         """An update that passed its check failed on the book: go back to the build before
@@ -702,9 +721,9 @@ class ConversionWorker(QObject):
         control = job.control
 
         def tell_out_of_memory() -> None:
-            """The card ran out of memory, so the CPU is in use: say so in the banner now,
-            not only on the done screen, with the thread count the engine really uses (the
-            window would otherwise read today's, which on battery may differ)."""
+            """The card ran out of memory (or was lost), so the CPU is in use: say so in the
+            banner now, not only on the done screen, with the thread count the engine really
+            uses (the window would otherwise read today's, which on battery may differ)."""
             self.noticed.emit(job.job, engine.warning or "", engine.threads)
 
         try:

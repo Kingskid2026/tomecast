@@ -1,0 +1,473 @@
+# Every message containing "failed to allocate" in audio.cpp 0.9.4's Vulkan build
+# (`strings -n 6 audiocpp_server | grep -i 'failed to allocate' | sort -u`, 2026-11-11),
+# sorted by what tomecast.engines.audiocpp.out_of_graphics_memory() must say about it.
+# Format strings keep their %s placeholders.
+[card]
+CAV-MAE-ST visual failed to allocate graph
+failed to allocate ACE-Step planner CFG prefill graph
+failed to allocate ACE-Step planner decode graph
+failed to allocate ACE-Step planner prefill graph
+failed to allocate AST graph
+failed to allocate Audio8 TTS AR prefill graph
+failed to allocate Audio8 TTS AR step state tensors
+failed to allocate Audio8 TTS AR step tensors
+failed to allocate Audio8 TTS codec decode graph
+failed to allocate Audio8 TTS codec encode graph
+failed to allocate Audio8 TTS Falcon step CPU weights
+failed to allocate Audio8 TTS fast AR CPU weights
+failed to allocate Audio8 TTS fast AR graph
+failed to allocate Audio8 TTS fast AR state tensors
+failed to allocate Audio Flamingo audio encoder graph
+failed to allocate Audio Flamingo projector graph
+failed to allocate AudioSR UNet graph
+failed to allocate AudioSR VAE decoder graph
+failed to allocate AudioSR VAE encoder graph
+failed to allocate backend graph tensors for S3 flow decoder
+failed to allocate backend tensors for CAMPPlus graph
+failed to allocate backend tensors for S3 tokenizer
+failed to allocate backend tensors for T3 decode runner
+failed to allocate backend tensors for T3 prefill runner
+failed to allocate backend tensors for T3 Turbo decode runner
+failed to allocate backend tensors for T3 Turbo prefill runner
+failed to allocate batched attention graph
+failed to allocate batched decode graph scratch
+Failed to allocate batched FlowLM graph
+failed to allocate BigVGAN graph memory
+failed to allocate Breeze speech decoder graph
+failed to allocate Breeze speech encoder conv graph
+failed to allocate Breeze speech encoder transformer graph
+failed to allocate BreezeTTS fused depth graph
+failed to allocate BreezeTTS text encoder graph
+failed to allocate cache-lane prefill graph
+failed to allocate CED graph
+failed to allocate CLAP audio frontend graph
+failed to allocate CLAP audio graph
+failed to allocate Confucius4-TTS S2A condition graph
+failed to allocate Confucius4-TTS S2A condition input buffer
+failed to allocate Confucius4-TTS T2S decode graph
+failed to allocate Confucius4-TTS T2S decode state buffer
+failed to allocate Confucius4-TTS T2S forward graph
+failed to allocate Confucius4-TTS T2S forward input buffer
+failed to allocate Confucius4-TTS T2S prefill graph
+failed to allocate Confucius4-TTS T2S prefill input buffer
+failed to allocate Confucius4-TTS T2S prefill output buffer
+failed to allocate Confucius4-TTS T2S speaker graph
+failed to allocate Confucius4-TTS T2S speaker input buffer
+failed to allocate Confucius S2Mel CFM graph
+failed to allocate Confucius S2Mel CFM input buffer
+failed to allocate ControlFoley condition graph
+failed to allocate ControlFoley flow graph
+failed to allocate CosyVoice3 DiT graph
+failed to allocate CosyVoice3 flow condition graph
+failed to allocate DeepFilterNet2 forward graph
+failed to allocate DotTTS AudioVAE decoder graph memory
+failed to allocate DotTTS AudioVAE encoder graph memory
+failed to allocate DotTTS AudioVAE streaming decoder graph memory
+failed to allocate DotTTS AudioVAE streaming frontend graph memory
+failed to allocate DotTTS EOS graph memory
+failed to allocate DotTTS LLM embedding graph memory
+failed to allocate DotTTS MeanFlow DiT cached step graph memory
+failed to allocate DotTTS MeanFlow DiT cache memory
+failed to allocate DotTTS MeanFlow DiT prefill graph memory
+failed to allocate DotTTS modulation cache memory
+failed to allocate DotTTS modulation graph memory
+failed to allocate DotTTS patch encoder decode graph memory
+failed to allocate DotTTS patch encoder prefill graph memory
+failed to allocate DotTTS SOAR DiT cached step graph memory
+failed to allocate DotTTS SOAR DiT cache memory
+failed to allocate DotTTS SOAR DiT prefill graph memory
+failed to allocate DotTTS speaker projection graph memory
+failed to allocate DotTTS velocity graph memory
+failed to allocate Drama 3 backbone cached decode graph
+failed to allocate Drama 3 backbone graph
+failed to allocate Drama 3 backbone LM head graph
+failed to allocate Drama 3 backbone prefill graph
+failed to allocate Drama 3 backbone token embedding graph
+failed to allocate Drama 3 tower frame graph
+failed to allocate Drama 3 tower graph
+failed to allocate Drama 3 tower prefill graph
+failed to allocate ECAPA backend graph
+failed to allocate FireRedAudio audio encoder adapter graph
+failed to allocate FireRedAudio audio encoder chunk graph
+failed to allocate FireRedAudio DiT graph
+failed to allocate FireRedAudio patch encoder graph
+failed to allocate FireRedTTS3 DiT graph
+failed to allocate FireRedTTS3 LM head graph
+failed to allocate FireRedTTS3 patch encoder graph
+failed to allocate FireRedTTS3 stop head graph
+failed to allocate FireRedTTS3 token embedding graph
+failed to allocate Fish Audio AR prefill graph
+failed to allocate Fish Audio AR step state tensors
+failed to allocate Fish Audio AR step tensors
+failed to allocate Fish Audio fast AR graph
+failed to allocate Fish Audio fast AR state tensors
+failed to allocate Fish DAC codec decode graph
+failed to allocate Fish DAC codec encode-conv graph
+failed to allocate Fish DAC codec encode graph
+failed to allocate Fish DAC codec encode-tail graph
+failed to allocate Fish DAC codec latent decode graph
+failed to allocate FlashSR GGML graph
+failed to allocate FSQ audio codec graph
+failed to allocate Fun-ASR-Nano adaptor graph tensors
+failed to allocate Fun-ASR-Nano decoder decode graph
+failed to allocate Fun-ASR-Nano decoder prefill graph
+failed to allocate Fun-ASR-Nano encoder graph tensors
+Failed to allocate GGML graph for Granite 5 ASR encoder
+failed to allocate GLM-TTS Flow graph memory
+failed to allocate GLM-TTS speech tokenizer graph
+failed to allocate graph
+failed to allocate greedy Qwen decoder decode graph
+failed to allocate GTCRN frame graph tensors
+failed to allocate HeartCodec conditioning graph
+failed to allocate HeartCodec flow estimator graph
+failed to allocate HeartCodec scalar decoder graph
+failed to allocate HeartMuLa backbone cached step graph
+failed to allocate HeartMuLa backbone prefill graph
+failed to allocate HeartMuLa decoder cached step graph
+failed to allocate HeartMuLa decoder prefill graph
+failed to allocate HeartMuLa frame embedding graph
+failed to allocate HiFi-GAN graph memory
+failed to allocate HiFi-GAN input buffer
+failed to allocate HiFT backend graph
+failed to allocate HiFT F0 graph
+failed to allocate Higgs Audio STT audio encoder graph
+failed to allocate Higgs Audio STT text_decoder decode graph
+failed to allocate Higgs Audio STT text_decoder prefill graph
+failed to allocate Higgs TTS AR decode graph
+failed to allocate Higgs TTS AR embedding graph
+failed to allocate Higgs TTS AR final prefill graph
+failed to allocate Higgs TTS AR layer prefill graph
+failed to allocate Higgs TTS AR prefill graph
+failed to allocate Higgs TTS codec decode graph
+failed to allocate Higgs TTS codec encode graph
+failed to allocate HTDemucs graph buffer
+Failed to allocate Hviske decoder beam decode graph
+Failed to allocate Hviske decoder decode graph
+Failed to allocate Hviske decoder prefill graph
+Failed to allocate Hviske encoder graph tensors
+Failed to allocate Hviske encoder position projection graph tensors
+failed to allocate IndexTTS2 GPT conditioning graph
+failed to allocate IndexTTS2 GPT conditioning input buffer
+failed to allocate IndexTTS2 GPT decode bank graph
+failed to allocate IndexTTS2 GPT decode graph
+failed to allocate IndexTTS2 GPT decode state buffer
+failed to allocate IndexTTS2 GPT emotion vector graph
+failed to allocate IndexTTS2 GPT emotion vector input buffer
+failed to allocate IndexTTS2 GPT forward graph
+failed to allocate IndexTTS2 GPT forward input buffer
+failed to allocate IndexTTS2 GPT prefill graph
+failed to allocate IndexTTS2 GPT prefill input buffer
+failed to allocate IndexTTS2 GPT prefill output buffer
+failed to allocate IndexTTS2 Qwen emotion decode graph
+failed to allocate IndexTTS2 Qwen emotion decode input buffer
+failed to allocate IndexTTS2 Qwen emotion decode state buffer
+failed to allocate IndexTTS2 Qwen emotion prefill graph
+failed to allocate IndexTTS2 Qwen emotion prefill input buffer
+failed to allocate IndexTTS2 Qwen emotion prefill output buffer
+failed to allocate IndexTTS2 S2Mel CFM graph
+failed to allocate IndexTTS2 S2Mel CFM input buffer
+failed to allocate IndexTTS2 S2Mel GPT layer graph
+failed to allocate IndexTTS2 S2Mel GPT layer input buffer
+failed to allocate IndexTTS2 S2Mel length regulator graph
+failed to allocate IndexTTS2 S2Mel length regulator input buffer
+failed to allocate IndexTTS2 semantic codec code graph
+failed to allocate IndexTTS2 semantic codec code input buffer
+failed to allocate IndexTTS2 semantic codec quantize graph
+failed to allocate IndexTTS2 semantic codec quantize input buffer
+failed to allocate IndexTTS2 Wav2Vec2-BERT graph
+failed to allocate IndexTTS2 Wav2Vec2-BERT input buffer
+failed to allocate Irodori-TTS codec encode graph
+failed to allocate Irodori-TTS codec graph
+failed to allocate Irodori-TTS condition graph
+failed to allocate Irodori-TTS RF context graph
+failed to allocate Irodori-TTS RF graph
+failed to allocate Irodori-TTS RF graph IO buffer
+failed to allocate Irodori-TTS RF modulation graph
+failed to allocate Irodori-TTS speaker graph
+failed to allocate Kitten generator graph tensors
+failed to allocate Kitten PL-BERT graph tensors
+failed to allocate Kitten predictor pre-tail graph tensors
+failed to allocate Kitten predictor tail graph tensors
+failed to allocate Kitten predictor text graph tensors
+failed to allocate Kitten source graph tensors
+failed to allocate Kitten tail shared LSTM block graph tensors
+failed to allocate Kokoro generator graph 
+failed to allocate Kokoro PL-BERT tensors
+failed to allocate Kokoro predictor pre-tail tensors
+failed to allocate Kokoro predictor tail tensors
+failed to allocate Kokoro predictor text tensors
+failed to allocate Kokoro source graph tensors
+failed to allocate Kokoro tail shared LSTM block tensors
+failed to allocate Kroko subsampling graph
+failed to allocate Kroko Zipformer graph
+failed to allocate MeanVC2 ASR encoder graph
+failed to allocate MeanVC2 DiT graph
+failed to allocate MeanVC2 GTM graph
+failed to allocate MeanVC2 vocoder graph
+failed to allocate MiDashengLM-Gen audio projector graph
+failed to allocate MiDashengLM-Gen audio tokenizer decode graph
+failed to allocate MiDashengLM-Gen audio tokenizer decode input buffer
+failed to allocate MiDashengLM-Gen flow graph
+failed to allocate MiDashengLM-Gen prompt encoder graph
+failed to allocate MiDashengLM-Gen prompt encoder input buffer
+failed to allocate MiDashengLM-Gen stop head graph
+failed to allocate Mimi codec quantizer decoder graph
+failed to allocate MiniMax-H3 audio VAE graph
+failed to allocate MiniMax-H3 CFG DiT graph
+failed to allocate MiniMax-H3 DiT final graph
+failed to allocate MiniMax-H3 DiT first-block cached final graph
+failed to allocate MiniMax-H3 DiT first-block graph
+failed to allocate MiniMax-H3 DiT first-block tail/final graph
+failed to allocate MiniMax-H3 DiT graph
+failed to allocate MiniMax-H3 DiT layerwise block graph
+failed to allocate MiniMax-H3 DiT layerwise chunked block graph
+failed to allocate MiniMax-H3 DiT layerwise final graph
+failed to allocate MiniMax-H3 DiT layerwise prelude graph
+failed to allocate MiniMax-H3 sampler graph
+failed to allocate MiniMax-H3 video VAE graph
+failed to allocate MiniMax Music 3 condition graph
+failed to allocate MiniMax Music 3 depth graph
+failed to allocate MiniMax Music 3 feedback graph
+failed to allocate MiniMax Music 3 flow graph
+failed to allocate MiniMax Music 3 vocoder graph
+failed to allocate MioCodec content encoder graph
+failed to allocate MioCodec global encoder graph
+failed to allocate MioCodec wave decoder graph
+failed to allocate MioTTS lm decode graph
+failed to allocate MioTTS lm prefill graph
+failed to allocate MiraTTS decoder graph
+failed to allocate MiraTTS processor graph
+failed to allocate Moonshine decoder cross-KV graph
+failed to allocate Moonshine decoder state tensors
+failed to allocate Moonshine decoder step graph
+failed to allocate Moonshine encoder graph
+failed to allocate MOSS codec decoder forward graph
+failed to allocate MOSS codec encoder forward graph
+failed to allocate MOSS codec streaming decoder graph
+failed to allocate MOSS delay backbone prefill graph
+failed to allocate MOSS delay backbone step graph
+failed to allocate MOSS delay heads graph
+failed to allocate MOSS global decode graph
+failed to allocate MOSS global K/V cache tensors
+failed to allocate MOSS global prefill graph
+failed to allocate MOSS local frame K/V cache tensors
+failed to allocate MOSS-TTS-Local backbone prefill graph
+failed to allocate MOSS-TTS-Local backbone step graph
+failed to allocate MOSS-TTS-Local depth forward graph
+failed to allocate MuScriptor condition graph
+failed to allocate MuScriptor decode graph
+failed to allocate MuScriptor decode state tensors
+failed to allocate MuScriptor prefill graph
+failed to allocate MuScriptor prefill input tensors
+failed to allocate MusicGen style graph
+failed to allocate MusicGen style projection graph
+Failed to allocate Nemotron ASR encoder graph tensors
+Failed to allocate Nemotron ASR encoder position graph tensors
+Failed to allocate Nemotron ASR streaming encoder graph tensors
+Failed to allocate Nemotron ASR streaming encoder position graph tensors
+failed to allocate Nemotron diarization graph tensors
+failed to allocate Niagara runtime graph
+failed to allocate Niagara runtime graph context
+failed to allocate OmniVoice audio-tokenizer decoder graph
+failed to allocate OmniVoice audio-tokenizer encoder graph
+failed to allocate OmniVoice generator graph buffer
+failed to allocate OmniVoice generator input buffer
+failed to allocate OuteTTS cached-step graph
+failed to allocate OuteTTS DAC encoder graph
+failed to allocate OuteTTS DAC graph
+failed to allocate OuteTTS Llama graph
+Failed to allocate Parakeet TDT encoder graph tensors
+Failed to allocate Parakeet TDT encoder position graph tensors
+failed to allocate PersonaPlex depformer graph
+failed to allocate PersonaPlex main step graph
+failed to allocate prompt embedding graph
+failed to allocate Qwen3.5 decoder cached decode graph
+failed to allocate Qwen3.5 decoder graph
+failed to allocate Qwen3.5 decoder LM head graph
+failed to allocate Qwen3.5 decoder prefill graph
+failed to allocate Qwen3.5 decoder token embedding graph
+failed to allocate Qwen3 ASR thinker classification graph
+failed to allocate Qwen3 ASR thinker decode graph
+failed to allocate Qwen3 audio encoder graph
+failed to allocate Qwen3 code predictor graph
+failed to allocate Qwen3 speaker encoder graph
+failed to allocate Qwen3 speech decoder graph
+failed to allocate Qwen3 speech tokenizer graph
+failed to allocate Qwen3 talker cached step graph
+failed to allocate Qwen3 talker prefill graph
+failed to allocate Qwen3 text projection graph
+failed to allocate Qwen3-VL embedding graph
+failed to allocate Qwen3-VL encoder graph
+failed to allocate Qwen3-VL final head graph
+failed to allocate Qwen3-VL layerwise graph
+failed to allocate QwenCausalDecodeRuntime batched decode graph
+failed to allocate QwenCausalDecodeRuntime batched prefill graph
+failed to allocate QwenCausalDecodeRuntime decode graph
+failed to allocate QwenCausalDecodeRuntime prefill graph
+failed to allocate R2T2 ASR audio encoder graph
+failed to allocate RedAE codec encoder input graph
+failed to allocate RMVPE feature graph tensors
+failed to allocate RMVPE GRU graph tensors
+failed to allocate RMVPE head graph tensors
+failed to allocate RNNoise graph buffer
+failed to allocate RNNoise sequence graph buffer
+failed to allocate roformer graph buffer
+failed to allocate RVC synthesizer graph tensors
+failed to allocate S3 token2mel prepare graph tensors
+failed to allocate S3 token embedding graph tensors
+failed to allocate Seed-VC ASTRAL graph tensors
+failed to allocate Seed-VC CFM length regulator graph context
+failed to allocate Seed-VC CFM length regulator graph tensors
+failed to allocate Seed-VC length regulator graph context
+failed to allocate Seed-VC length regulator graph tensors
+failed to allocate Seed-VC V1 CFM estimator graph memory
+failed to allocate Seed-VC V1 length regulator graph context
+failed to allocate Seed-VC V1 length regulator graph tensors
+failed to allocate Seed-VC V2 CFM estimator graph memory
+failed to allocate SenseVoice encoder graph tensors
+failed to allocate Sherpa subsampling graph
+failed to allocate Sherpa Zipformer graph
+Failed to allocate Silero VAD backend tensors
+failed to allocate SNAC decoder graph
+failed to allocate soprano decoder graph
+Failed to allocate Sortformer diar backend tensors
+failed to allocate Supertonic duration predictor backend graph buffer
+failed to allocate Supertonic duration predictor IO buffer
+failed to allocate Supertonic text encoder backend graph buffer
+failed to allocate Supertonic text encoder IO buffer
+failed to allocate Supertonic vector estimator backend graph buffer
+failed to allocate Supertonic vector estimator IO buffer
+failed to allocate Supertonic vocoder backend graph buffer
+failed to allocate Supertonic vocoder IO buffer
+Failed to allocate the GGML graph for the VibeASR VAE encoder
+failed to allocate the Sopro conditioning graph
+failed to allocate the Sopro semantic encoder graph
+failed to allocate the Sopro speaker encoder graph
+failed to allocate the Sopro velocity graph
+failed to allocate the Sopro vocoder graph
+Failed to allocate the Whistle encoder graph
+failed to allocate Vevo2 AR decode graph
+failed to allocate Vevo2 AR prefill graph
+failed to allocate Vevo2 Coco tokenizer graph
+failed to allocate Vevo2 FM graph
+failed to allocate Vevo2 FM step graph
+failed to allocate Vevo2 vocoder graph
+failed to allocate VibeVoice connector graph
+failed to allocate VibeVoice decoder cached batch graph
+failed to allocate VibeVoice decoder cached step graph
+failed to allocate VibeVoice decoder cached suffix graph
+failed to allocate VibeVoice decoder embedding graph
+failed to allocate VibeVoice decoder final prefill graph
+failed to allocate VibeVoice decoder layer prefill graph
+failed to allocate VibeVoice decoder prefill graph
+failed to allocate VibeVoice diffusion head graph
+failed to allocate VibeVoice streaming tokenizer graph
+failed to allocate VibeVoice tokenizer decoder graph
+failed to allocate VibeVoice tokenizer encoder graph
+failed to allocate VieNeu-TTS code predictor graph
+failed to allocate VieNeu-TTS speaker encoder graph
+failed to allocate VieNeu-TTS talker cached step graph
+failed to allocate VieNeu-TTS talker prefill graph
+failed to allocate VoxCPM1 AudioVAE encoder graph
+failed to allocate VoxCPM1 AudioVAE graph
+failed to allocate VoxCPM1 AudioVAE streaming decoder graph
+failed to allocate VoxCPM1 DiT estimator graph
+failed to allocate VoxCPM1 local encoder graph
+failed to allocate VoxCPM1 MiniCPM step graph
+failed to allocate VoxCPM1 prompt prefill graph
+failed to allocate VoxCPM1 step projection graph
+failed to allocate VoxCPM1 text embedding graph
+failed to allocate VoxCPM2 AudioVAE encoder graph
+failed to allocate VoxCPM2 AudioVAE graph
+failed to allocate VoxCPM2 DiT estimator graph
+failed to allocate VoxCPM2 local encoder graph
+failed to allocate VoxCPM2 MiniCPM step graph
+failed to allocate VoxCPM2 prompt prefill graph
+failed to allocate VoxCPM2 step projection graph
+failed to allocate VoxCPM2 text embedding graph
+failed to allocate VoxTral audio encoder graph
+failed to allocate VoxTral streaming audio cache tensors
+failed to allocate VoxTral streaming audio encoder graph
+failed to allocate VoxTral text decoder graph
+failed to allocate VoxTral text decoder step graph tensors
+failed to allocate VoxTral text decoder step state tensors
+failed to allocate Wav2Vec2-BERT graph
+failed to allocate Wav2Vec2-BERT input buffer
+failed to allocate Wav2Vec2 graph tensors
+failed to allocate WavLM graph tensors
+failed to allocate Whisper frontend graph tensors
+failed to allocate Yue2 AR prefix-state graph
+failed to allocate Yue2 NAR graph
+failed to allocate ZipEnhancer forward graph
+GGML status: error (failed to allocate memory)
+Inflect v2 failed to allocate backend graph
+Inflect v2 failed to allocate graph input buffer
+MagpieTTS failed to allocate decoder cross-cache graph
+MagpieTTS failed to allocate graph
+MagpieTTS failed to allocate local transformer graph
+Mel latent VAE 44k failed to allocate graph
+Ming3 Audio failed to allocate offload graph
+Ming3 Audio failed to allocate offload prefill graph
+Ming3 Audio failed to allocate Thinker graph
+MiraTTS failed to allocate speaker graph
+NeMo nano codec failed to allocate graph
+OpenCLIP image failed to allocate graph
+OpenCLIP text failed to allocate graph
+Piper TTS failed to allocate backend graph
+Piper TTS failed to allocate graph input buffer
+sanoTTS failed to allocate backend graph
+sanoTTS failed to allocate graph input buffer
+%s: failed to allocate buffer for graph copy
+%s: failed to allocate buffer of size %zu
+%s: failed to allocate context for graph copy
+%s: failed to allocate graph
+%s: failed to allocate %s buffer of size %zu
+Synchformer failed to allocate frame graph
+Synchformer failed to allocate graph
+
+[not the card]
+ControlFoley FFmpeg decoder failed to allocate codec context
+ControlFoley FFmpeg decoder failed to allocate packet/frame
+failed to allocate 
+failed to allocate ACE-Step planner CFG bucket scratch
+failed to allocate ACE-Step planner CFG decode state
+failed to allocate a unique model installer temporary directory
+failed to allocate backend tenso
+failed to allocate BreezeTTS depth projection graphs
+failed to allocate BreezeTTS fused depth inputs
+failed to allocate Drama 3 attention bucket
+failed to allocate Drama 3 tower cache
+failed to allocate GGUF context
+failed to allocate GGUF tensor metadata context
+failed to allocate Higgs TTS AR KV cache
+failed to allocate Kitten head metadata
+failed to allocate MiniMax-H3 audio VAE inputs
+failed to allocate MiniMax-H3 CFG DiT inputs
+failed to allocate MiniMax-H3 DiT inputs
+failed to allocate MiniMax-H3 first-block device state
+failed to allocate MiniMax-H3 sampler inputs
+failed to allocate MiniMax-H3 video VAE inputs
+failed to allocate MOSS local frame graphs
+failed to allocate MOSS-TTS-Local depth step graphs
+failed to allocate MOSS-TTS-Local projection graphs
+Failed to allocate Nemotron ASR speaker caches
+failed to allocate Qwen3 decoder stream state
+failed to allocate Qwen3-VL embedding inputs
+failed to allocate Qwen3-VL encoder inputs
+failed to allocate Qwen3-VL final head inputs
+failed to allocate Qwen3-VL layerwise inputs
+failed to allocate VibeVoice decoder KV cache
+failed to allocate Yue2 AR prefix-state cache
+ggml_vulkan: Failed to allocate pinned memory (%s)
+Ming3 Audio failed to allocate capture cleanup metadata
+Ming3 Audio failed to allocate encoder graph metadata
+Ming3 Audio failed to allocate expert scheduler
+Ming3 Audio failed to allocate offload prefill inputs
+Ming3 Audio failed to allocate offload prefill metadata
+Ming3 Audio failed to allocate state metadata
+Ming3 Audio failed to allocate Thinker graph metadata
+Ming3 Audio failed to allocate Thinker state
+SAM Audio FFmpeg decoder failed to allocate codec context
+SAM Audio FFmpeg decoder failed to allocate packet/frame
+%s: failed to allocate %6.2f MB
+WARNING: failed to allocate %.2f MB of pinned memory

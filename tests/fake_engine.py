@@ -6,25 +6,38 @@ environment variables (or ``env`` given to :func:`write_fake_server`, which a bu
 with it) change how it behaves:
 
 ``FAKE_DEVICES``          what ``--list-devices --json`` prints (default: no devices)
-``FAKE_LIST_FAIL``        ``--list-devices`` crashes; ``FAKE_LIST_HANG``: it hangs
+``FAKE_LIST_FAIL``        ``--list-devices`` crashes; ``FAKE_LIST_HANG``: it hangs;
+                          ``FAKE_LIST_EXIT``: it prints the list, then exits with this status
 ``FAKE_CRASH``            exit at start-up; ``FAKE_CRASH_VULKAN``: only on the Vulkan backend
 ``FAKE_REPORT_BACKEND``   the backend ``/health`` reports (default: the configured one)
 ``FAKE_LOADED_DEVICE``    the device ``/v1/models`` says the model is on (default: the config's)
 ``FAKE_SILENT``           voice silence instead of a tone
 ``FAKE_DIE_AFTER``        crash mid-request after this many requests (``FAKE_SLOW_EXIT``: slowly;
-                          ``FAKE_DIE_SAYING``: logging this first)
+                          ``FAKE_DIE_SAYING``: logging this first; ``FAKE_DIE_SAYING_LATER``:
+                          logging this instead after a restart; ``FAKE_DIE_STARTS``: only in
+                          the first this many starts)
 ``FAKE_DELAY``            seconds each request takes
 ``FAKE_START_DELAY``      seconds before it starts serving (a slow first start)
 ``FAKE_OOM_VULKAN_AFTER`` on the Vulkan backend, requests after this many log ggml's lines and
                           fail with HTTP 500, and the server stays up: what Kokoro did when the
                           graphics card was out of memory (``OOM_KOKORO_*``);
                           ``FAKE_OOM_CPU_TOO``: on the CPU backend too; ``FAKE_OOM_MESSAGE``:
-                          another reply; ``FAKE_OOM_QUIET``: the reply alone, nothing logged
+                          another reply; ``FAKE_OOM_QUIET``: the reply alone, nothing logged;
+                          ``FAKE_OOM_SAYING``: log this instead of ggml's lines
 ``FAKE_OOM_VULKAN_START`` on the Vulkan backend, log what Ming did when it ran out while
                           loading (``OOM_MING_START``) and exit; ``FAKE_OOM_HANG``: log it
                           and keep running without ever serving
 ``FAKE_OOM_LOG``          log this at start-up (a warning the engine carries on after)
 ``FAKE_BUSY``             a file it creates as each request begins (one is under way)
+``FAKE_SLOW_LINE``        at start-up, log the first half of this JSON pair, then the second
+                          half (ending the line) a second later (or after the third item's
+                          seconds)
+``FAKE_OOM_UNFINISHED``   with ``FAKE_OOM_SAYING``: log it without ending the line
+``FAKE_LOST_VULKAN_AFTER`` on the Vulkan backend, requests after this many fail with HTTP 500
+                          and the reply audio.cpp gives when the card is lost (``LOST_REPLY``),
+                          and the server stays up
+``FAKE_LOST_VULKAN_START`` on the Vulkan backend, log ggml's line for a lost card and exit
+                          (``FAKE_LOST_HANG``: and keep running without ever serving)
 
 Each voiced request is logged with the backend that voiced it.
 
@@ -54,6 +67,20 @@ OOM_KOKORO_LOG = (
     "ggml_vulkan: vk::Device::allocateMemory: ErrorOutOfDeviceMemory",
     "alloc_tensor_range: failed to allocate Vulkan0 buffer of size 186707936",
 )
+# The graphics card lost (a GPU reset, or the driver crashed), as audio.cpp 0.9.4's Vulkan build
+# words it: Vulkan-Hpp's message for a failed call ends "ErrorDeviceLost" (checked in the
+# binary's vk::ErrorCategoryImpl::message), which the server sends as the HTTP 500 reply, or
+# which ends the program when it isn't caught; ggml's own check prints the last line and exits.
+LOST_REPLY = "vk::Device::waitForFences: ErrorDeviceLost"
+LOST_CRASH = (
+    "terminate called after throwing an instance of 'vk::DeviceLostError'\n"
+    "  what():  vk::Device::waitForFences: ErrorDeviceLost"
+)
+LOST_GGML = (
+    "ggml_vulkan: ctx->device->device.waitForFences({ ctx->fence }, true, UINT64_MAX) error "
+    "ErrorDeviceLost at /home/runner/work/audio.cpp/audio.cpp/external/ggml/src/ggml-vulkan/"
+    "ggml-vulkan.cpp:5215"
+)
 # Ming exited (status 1) 0.9 s after starting, having logged:
 OOM_MING_START = (
     "ggml_vulkan: Device memory allocation of size 652936336 failed.",
@@ -75,8 +102,8 @@ FAKE_SERVER = textwrap.dedent(
         if os.environ.get("FAKE_LIST_FAIL"):
             sys.exit(3)  # crashed while asking the driver
         print("ggml_vulkan: Found 2 Vulkan devices", file=sys.stderr)
-        print(os.environ.get("FAKE_DEVICES", '{"devices": []}'))
-        sys.exit(0)
+        print(os.environ.get("FAKE_DEVICES", '{"devices": []}'), flush=True)
+        sys.exit(int(os.environ.get("FAKE_LIST_EXIT", "0")))  # e.g. failed shutting down
     config = json.load(open(sys.argv[sys.argv.index("--config") + 1]))
     log = open(os.environ["FAKE_LOG"], "a")
     log.write(json.dumps({"event": "start", "exe": sys.argv[0], "config": config, "env": {
@@ -84,6 +111,8 @@ FAKE_SERVER = textwrap.dedent(
         if k.startswith(("AUDIOCPP_", "TMPDIR", "GGML_", "VK_"))
     }}) + "\\n")
     log.flush()
+    with open(os.environ["FAKE_LOG"]) as earlier:  # which start this is (1 for the first)
+        START = sum(1 for line in earlier if '"event": "start"' in line)
 
     import ctypes, signal
     ctypes.CDLL(None).prctl(4, 0, 0, 0, 0)  # PR_SET_DUMPABLE, 0: its crashes write no core dump
@@ -111,6 +140,16 @@ FAKE_SERVER = textwrap.dedent(
         sys.exit(3)
     if os.environ.get("FAKE_OOM_LOG"):
         print(os.environ["FAKE_OOM_LOG"], file=sys.stderr, flush=True)
+    if os.environ.get("FAKE_SLOW_LINE"):
+        first, rest, *wait = json.loads(os.environ["FAKE_SLOW_LINE"])
+        print(first, end="", file=sys.stderr, flush=True)
+        time.sleep(float(wait[0]) if wait else 1)
+        print(rest, file=sys.stderr, flush=True)
+    if os.environ.get("FAKE_LOST_VULKAN_START") and config["backend"] == "vulkan":
+        print(LOST_GGML, file=sys.stderr, flush=True)
+        if os.environ.get("FAKE_LOST_HANG"):
+            time.sleep(60)
+        sys.exit(1)
     if os.environ.get("FAKE_OOM_VULKAN_START") and config["backend"] == "vulkan":
         print("\\n".join(OOM_MING_START), file=sys.stderr, flush=True)
         if os.environ.get("FAKE_OOM_HANG"):
@@ -168,9 +207,16 @@ FAKE_SERVER = textwrap.dedent(
                 open(os.environ["FAKE_BUSY"], "a").close()
             time.sleep(float(os.environ.get("FAKE_DELAY", "0")))
             die_after = os.environ.get("FAKE_DIE_AFTER")
-            if die_after is not None and REQUESTS[0] > int(die_after):
-                if os.environ.get("FAKE_DIE_SAYING"):
-                    print(os.environ["FAKE_DIE_SAYING"], file=sys.stderr, flush=True)
+            if (
+                die_after is not None
+                and REQUESTS[0] > int(die_after)
+                and START <= int(os.environ.get("FAKE_DIE_STARTS", "1000"))
+            ):
+                saying = os.environ.get("FAKE_DIE_SAYING")
+                if START > 1 and os.environ.get("FAKE_DIE_SAYING_LATER"):
+                    saying = os.environ["FAKE_DIE_SAYING_LATER"]
+                if saying:
+                    print(saying, file=sys.stderr, flush=True)
                 if os.environ.get("FAKE_SLOW_EXIT"):
                     # The connection drops first, and the process only ends a bit later.
                     self.connection.shutdown(socket.SHUT_RDWR)
@@ -191,8 +237,19 @@ FAKE_SERVER = textwrap.dedent(
                 log.write(json.dumps({"event": "out of memory", "body": body}) + "\\n")
                 log.flush()
                 if not os.environ.get("FAKE_OOM_QUIET"):
-                    print("\\n".join(OOM_KOKORO_LOG), file=sys.stderr, flush=True)
+                    saying = os.environ.get("FAKE_OOM_SAYING") or "\\n".join(OOM_KOKORO_LOG)
+                    end = "" if os.environ.get("FAKE_OOM_UNFINISHED") else "\\n"
+                    print(saying, end=end, file=sys.stderr, flush=True)
                 return self.fail(os.environ.get("FAKE_OOM_MESSAGE", OOM_KOKORO_REPLY))
+            lost_after = os.environ.get("FAKE_LOST_VULKAN_AFTER")
+            if (
+                lost_after is not None
+                and config["backend"] == "vulkan"
+                and REQUESTS[0] > int(lost_after)
+            ):
+                log.write(json.dumps({"event": "lost", "body": body}) + "\\n")
+                log.flush()
+                return self.fail(LOST_REPLY)
             log.write(json.dumps(
                 {"event": "voiced", "body": body, "backend": config["backend"]}) + "\\n")
             log.flush()
@@ -223,7 +280,8 @@ def write_fake_server(path: Path, env: Mapping[str, str] | None = None) -> Path:
     header = f"import os; os.environ.update({json.dumps(dict(env or {}))})\n" if env else ""
     messages = (
         f"OOM_KOKORO_REPLY = {OOM_KOKORO_REPLY!r}\nOOM_KOKORO_LOG = {OOM_KOKORO_LOG!r}\n"
-        f"OOM_MING_START = {OOM_MING_START!r}\n"
+        f"OOM_MING_START = {OOM_MING_START!r}\nLOST_REPLY = {LOST_REPLY!r}\n"
+        f"LOST_GGML = {LOST_GGML!r}\n"
     )
     path.write_text(f"#!{sys.executable}\n{header}{messages}{FAKE_SERVER}")
     path.chmod(path.stat().st_mode | stat.S_IXUSR)

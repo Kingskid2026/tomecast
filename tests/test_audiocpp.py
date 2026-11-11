@@ -10,6 +10,7 @@ import tarfile
 import textwrap
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -40,6 +41,7 @@ from tomecast.engines.audiocpp import (
     check_system,
     required_assets,
 )
+from tomecast.hardware import GpuDevice, list_devices
 
 
 @pytest.fixture
@@ -1058,10 +1060,60 @@ def test_auto_says_when_it_fell_back_from_the_card(
         assert engine.fell_back is False  # the CPU was asked for
 
 
-def test_auto_without_a_card_has_fallen_back_too(tmp_path: Path, fake_server: Path) -> None:
+def test_auto_without_a_usable_card_hasnt_fallen_back(tmp_path: Path, fake_server: Path) -> None:
+    # No build sees a usable card, so the self-check ran on the CPU, and the run uses the CPU
+    # just as checked: that proves the build (#53), or a CPU-only machine never could.
+    builds = {AUDIOCPP_VULKAN.slot: tmp_path / "engine", ESPEAK_NG.slot: tmp_path / "espeak"}
     with AutoKokoro(tmp_path / "data", executable=fake_server, startup_timeout=20) as engine:
         assert engine.warning == audiocpp.NO_DEVICE_NOTE
+        assert engine.fell_back is False
+        assert engine.proves(builds) == builds
+
+
+def test_after_falling_back_only_the_engine_build_goes_unproven(
+    tmp_path: Path, fake_server: Path, with_devices: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    builds = {AUDIOCPP_VULKAN.slot: tmp_path / "engine", ESPEAK_NG.slot: tmp_path / "espeak"}
+    with AutoKokoro(tmp_path / "data", executable=fake_server, startup_timeout=20) as engine:
+        assert engine.proves(builds) == builds  # on the card, as asked
+    monkeypatch.setenv("FAKE_CRASH_VULKAN", "1")
+    with AutoKokoro(tmp_path / "data", executable=fake_server, startup_timeout=20) as engine:
         assert engine.fell_back is True
+        # The card was never tried with the engine build; eSpeak NG worked as in any run.
+        assert engine.proves(builds) == {ESPEAK_NG.slot: tmp_path / "espeak"}
+
+
+def test_closing_the_window_stops_the_card_probe_at_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The window's engines have no "cancelled": closing it calls stop_all_engines(), which
+    # must reach an engine still asking the build which cards it sees (#53).
+    monkeypatch.setenv("FAKE_LOG", str(tmp_path / "fake.log"))
+    stalled = write_fake_server(tmp_path / "audiocpp_server", {"FAKE_LIST_HANG": "1"})
+    engine = AutoKokoro(tmp_path / "data", executable=stalled, startup_timeout=20)
+    errors: list[BaseException] = []
+
+    def start() -> None:
+        try:
+            engine.start()
+        except BaseException as error:  # recorded for the test
+            errors.append(error)
+
+    worker = threading.Thread(target=start)
+    worker.start()
+    deadline = time.monotonic() + 10
+    while not any(e["event"] == "list" for e in _events_if_any(tmp_path)):
+        assert time.monotonic() < deadline
+        time.sleep(0.05)
+    started = time.monotonic()
+    audiocpp.stop_all_engines()
+    worker.join(timeout=10)
+
+    assert not worker.is_alive()
+    assert time.monotonic() - started < 3  # not the 20 s the listing may take
+    assert len(errors) == 1 and isinstance(errors[0], Cancelled)  # stopped, not a CPU run
+    assert _starts(tmp_path) == []
+    assert engine not in audiocpp._RUNNING
 
 
 def test_a_card_that_doesnt_answer_isnt_taken_for_no_card(
@@ -1075,19 +1127,132 @@ def test_a_card_that_doesnt_answer_isnt_taken_for_no_card(
         assert engine.fell_back is True
 
 
-def test_a_new_build_that_cant_list_the_cards_is_not_switched_on_a_cpu_check(
-    tmp_path: Path, engine_root: Path
+@pytest.mark.parametrize("broken", ["FAKE_LIST_FAIL", "FAKE_LIST_HANG"])
+def test_a_new_build_that_cant_list_the_cards_fails_when_the_old_one_can(
+    tmp_path: Path, engine_root: Path, monkeypatch: pytest.MonkeyPatch, broken: str
 ) -> None:
+    monkeypatch.setattr(audiocpp, "list_devices", _quick_list_devices)
     old = _engine_build(tmp_path, "old", gpu=True)  # answers: no card
-    new = _engine_build(tmp_path, "new", gpu=True, env={"FAKE_LIST_FAIL": "1"})  # no answer
+    new = _engine_build(tmp_path, "new", gpu=True, env={broken: "1"})  # crashes, or hangs
 
     prepared = _update(engine_root, old, new, gpu=True)
 
     assert prepared.switched == ()  # a CPU check can't stand in for a card nobody could see
     assert build_in_use(new, engine_root) == build_folder(old, engine_root)
-    assert failure(new, engine_root) is None  # no verdict, so nothing is blamed
-    assert waiting_check(new, engine_root)
+    reason = failure(new, engine_root)
+    assert reason is not None and "couldn't list the graphics cards" in reason  # a verdict
+    assert prepared.notes == (UPDATE_FAILED_NOTE,)
+    assert not waiting_check(new, engine_root)  # so the next books don't ask it again
     assert _checks(tmp_path) == []  # not even started
+    asked = [Path(str(e["exe"])).parent.name for e in _listings(tmp_path)]
+    assert asked.count(build_folder(new, engine_root).name) == 2  # asked again on the retry
+
+    listed = len(_listings(tmp_path))
+    prepare([new, ESPEAK_NG], engine_root, check=audiocpp.self_check(engine_root, True))
+    assert len(_listings(tmp_path)) == listed  # the next run doesn't probe it again
+
+
+def test_a_new_build_that_cant_list_the_cards_fails_even_when_the_old_one_sees_one(
+    tmp_path: Path, engine_root: Path, with_devices: None
+) -> None:
+    # It might voice on the card it's given, but every run lists the cards first, gets no
+    # answer and uses the CPU: switching to it would leave the card unused for good (#53).
+    old = _engine_build(tmp_path, "old", gpu=True)  # sees the NVIDIA card
+    new = _engine_build(tmp_path, "new", gpu=True, env={"FAKE_LIST_FAIL": "1"})
+
+    prepared = _update(engine_root, old, new, gpu=True)
+
+    assert prepared.switched == ()
+    reason = failure(new, engine_root)
+    assert reason is not None and "couldn't list the graphics cards" in reason
+    assert _checks(tmp_path) == []  # not tried on the card on the old build's word
+
+
+def test_a_new_build_that_sees_no_card_where_the_old_one_sees_one_fails(
+    tmp_path: Path, engine_root: Path
+) -> None:
+    # Every run would use the CPU ("no usable card"), and a book made there would prove a
+    # build the card was never tried with (#53 review).
+    old = _engine_build(tmp_path, "old", gpu=True, env={"FAKE_DEVICES": _DEVICES})
+    new = _engine_build(tmp_path, "new", gpu=True, env={"FAKE_DEVICES": '{"devices": []}'})
+
+    prepared = _update(engine_root, old, new, gpu=True)
+
+    assert prepared.switched == ()
+    reason = failure(new, engine_root)
+    assert reason is not None and "found no usable graphics card" in reason
+    assert "NVIDIA RTX PRO 1000" in reason
+    assert _checks(tmp_path) == []  # not tried on the card on the old build's word
+
+
+def test_the_same_card_with_less_free_memory_just_then_is_still_tried(
+    tmp_path: Path, engine_root: Path
+) -> None:
+    def igpu(free: int) -> str:
+        return json.dumps({"devices": [{"backend": "vulkan", "index": 0, "name": "Vulkan0",
+                          "type": "igpu", "description": "AMD Radeon 860M Graphics (RADV)",
+                          "memory": {"free_bytes": free, "total_bytes": 20 * 2**30}}]})  # fmt: skip
+
+    old = _engine_build(tmp_path, "old", gpu=True, env={"FAKE_DEVICES": igpu(3 * 2**30)})
+    new = _engine_build(tmp_path, "new", gpu=True, env={"FAKE_DEVICES": igpu(1 * 2**30)})
+
+    prepared = _update(engine_root, old, new, gpu=True)
+
+    assert prepared.switched == (new,)  # it sees the card, just with less free right then
+    assert _checks(tmp_path) == [(build_folder(new, engine_root).name, "vulkan")]
+
+
+def test_a_new_build_that_answers_on_the_retry_is_judged_on_its_answer(
+    tmp_path: Path, engine_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    old = _engine_build(tmp_path, "old", gpu=True)  # no card
+    new = _engine_build(tmp_path, "new", gpu=True)  # no card either, but slow once
+    prepare([old, ESPEAK_NG], engine_root, check=audiocpp.self_check(engine_root, True))
+    hiccups = [build_folder(new, engine_root) / "audiocpp_server"]
+
+    def list_once_badly(
+        executable: Path | str, timeout: float = 20, cancelled: Callable[[], bool] | None = None
+    ) -> list[GpuDevice] | None:
+        if Path(executable) in hiccups:
+            hiccups.remove(Path(executable))
+            return None  # a driver slow to wake, once
+        return list_devices(executable, timeout=timeout, cancelled=cancelled)
+
+    monkeypatch.setattr(audiocpp, "list_devices", list_once_badly)
+
+    prepared = prepare([new, ESPEAK_NG], engine_root, check=audiocpp.self_check(engine_root, True))
+
+    assert hiccups == []  # asked once more on the retry...
+    assert prepared.switched == (new,)  # ...and judged on that answer: no card, CPU check passed
+    assert failure(new, engine_root) is None
+
+
+def test_no_build_that_can_list_the_cards_is_still_no_verdict(
+    tmp_path: Path, engine_root: Path
+) -> None:
+    old = _engine_build(tmp_path, "old", gpu=True, env={"FAKE_LIST_FAIL": "1"})
+    new = _engine_build(tmp_path, "new", gpu=True, env={"FAKE_LIST_FAIL": "1"})
+
+    prepared = _update(engine_root, old, new, gpu=True)
+
+    assert prepared.switched == ()
+    assert failure(new, engine_root) is None  # the card (or its driver), not the update
+    assert waiting_check(new, engine_root)
+
+
+def _quick_list_devices(
+    executable: Path | str, timeout: float = 20, cancelled: Callable[[], bool] | None = None
+) -> list[GpuDevice] | None:
+    return list_devices(executable, timeout=2, cancelled=cancelled)  # a hang, without the wait
+
+
+def _listings(tmp_path: Path) -> list[dict[str, object]]:
+    return [event for event in _events_if_any(tmp_path) if event["event"] == "list"]
+
+
+def _events_if_any(tmp_path: Path) -> list[dict[str, object]]:
+    log = tmp_path / "fake.log"
+    return [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
 
 
 def test_each_build_lists_its_cards_once_per_check(
