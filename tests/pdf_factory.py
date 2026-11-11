@@ -6,11 +6,15 @@ hand, so the tests need no PDF library besides the one under test, and every byt
 Text uses the standard Times and Helvetica fonts (not embedded; every PDF reader has their
 metrics) with WinAnsiEncoding, so text is encoded as Windows-1252. A line is a list of spans;
 a span may be raised and smaller, for superscript footnote markers.
+
+The "typeset" fonts set text the way TeX does, for books typeset with ligatures: see
+:data:`TYPESET_FONTS`.
 """
 
 from __future__ import annotations
 
 import textwrap
+import unicodedata
 import zlib
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -29,7 +33,19 @@ FONTS = {
     "italic": "Times-Italic",
     "sans": "Helvetica",
 }
-_FONT_KEYS = {name: f"F{number}" for number, name in enumerate(FONTS, start=1)}
+
+# Type 3 fonts of plain rectangles, set like a TeX book: "ﬀ", "ﬁ", "ﬂ", "ﬃ" and "ﬄ" in a
+# span's text are each drawn as one ligature glyph, as wide as Computer Modern's, and spaces
+# are gaps between words, not glyphs. Each font's ToUnicode map says what a ligature glyph
+# stands for: its letters ("typeset") or the ligature character ("typeset-forms"). All other
+# text in these fonts must be printable ASCII.
+TYPESET_FONTS = {"typeset": "letters", "typeset-forms": "forms"}
+_TYPESET_LIGATURES = {"\ufb00": (1, 583), "\ufb01": (2, 556), "\ufb02": (3, 556),
+                      "\ufb03": (4, 833), "\ufb04": (5, 833)}  # fmt: skip
+_TYPESET_LETTER = 500  # every other glyph's width, in thousandths of an em
+_TYPESET_SPACE = 333  # the gap between words
+
+_FONT_KEYS = {name: f"F{number}" for number, name in enumerate([*FONTS, *TYPESET_FONTS], start=1)}
 
 
 @dataclass(frozen=True, slots=True)
@@ -236,6 +252,60 @@ def _pdf_string(text: str) -> bytes:
     return b"<" + data.hex().encode() + b">"
 
 
+def _typeset_text(text: str) -> bytes:
+    """Text in a typeset font, as a TJ array: a ligature character is its glyph's code, and a
+    space is a gap the width of a space, as TeX leaves it."""
+    words = []
+    for word in text.split(" "):
+        codes = bytearray()
+        for character in word:
+            if character in _TYPESET_LIGATURES:
+                codes.append(_TYPESET_LIGATURES[character][0])
+            elif "!" <= character <= "~":
+                codes.append(ord(character))
+            else:
+                raise ValueError(f"the typeset fonts have no {character!r}")
+        words.append(b"<" + codes.hex().encode() + b">")
+    return b"[" + f" -{_TYPESET_SPACE} ".encode().join(words) + b"] TJ"
+
+
+def _typeset_font(objects: _Objects, ligatures: str) -> int:
+    """A Type 3 font: printable ASCII and five ligatures, each glyph a filled rectangle with
+    a little space on either side, and a ToUnicode map from codes to text."""
+    widths = {code: _TYPESET_LETTER for code in range(ord("!"), ord("~") + 1)}
+    widths.update(_TYPESET_LIGATURES.values())
+    glyphs = {
+        width: objects.stream(
+            f"{width} 0 20 0 {width - 20} 700 d1 20 0 {width - 40} 700 re f".encode()
+        )
+        for width in sorted(set(widths.values()))
+    }
+    codes = sorted(widths)
+    first, last = codes[0], codes[-1]
+    to_unicode = []
+    for character, (code, _) in _TYPESET_LIGATURES.items():
+        text = unicodedata.normalize("NFKC", character) if ligatures == "letters" else character
+        to_unicode.append(f"<{code:02X}> <{text.encode('utf-16-be').hex().upper()}>\n")
+    cmap = objects.stream(
+        b"/CIDInit /ProcSet findresource begin 12 dict begin begincmap\n"
+        b"/CMapName /Typeset def /CMapType 2 def\n"
+        b"1 begincodespacerange <00> <FF> endcodespacerange\n"
+        b"1 beginbfrange <21> <7E> <0021> endbfrange\n"
+        + f"{len(to_unicode)} beginbfchar\n{''.join(to_unicode)}endbfchar\n".encode()
+        + b"endcmap CMapName currentdict /CMap defineresource pop end end"
+    )  # fmt: skip
+    differences = " ".join(f"{code} /g{code}" for code in codes)
+    char_procs = " ".join(f"/g{code} {glyphs[widths[code]]} 0 R" for code in codes)
+    width_list = " ".join(str(widths.get(code, 0)) for code in range(first, last + 1))
+    return objects.add(
+        f"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 700] "
+        f"/FontMatrix [0.001 0 0 0.001 0 0] /CharProcs << {char_procs} >> "
+        f"/Encoding << /Type /Encoding /Differences [{differences}] >> "
+        f"/FirstChar {first} /LastChar {last} /Widths [{width_list}] /Resources << >> "
+        f"/ToUnicode {cmap} 0 R >>".encode()
+    )
+
+
 def _content(page: PdfPage) -> bytes:
     out: list[bytes] = []
     for number, picture in enumerate(page.pictures, start=1):
@@ -248,8 +318,11 @@ def _content(page: PdfPage) -> bytes:
         for span in line.spans:
             parts.append(
                 f"/{_FONT_KEYS[span.font]} {span.size:.2f} Tf {span.rise:.2f} Ts ".encode()
-                + _pdf_string(span.text)
-                + b" Tj"
+                + (
+                    _typeset_text(span.text)
+                    if span.font in TYPESET_FONTS
+                    else _pdf_string(span.text) + b" Tj"
+                )
             )
         parts.append(b"ET")
         out.append(b" ".join(parts))
@@ -327,6 +400,8 @@ def build_pdf(
         )
         for name, base in FONTS.items()
     }  # fmt: skip
+    for name, ligatures in TYPESET_FONTS.items():
+        fonts[name] = _typeset_font(objects, ligatures)
     font_resources = " ".join(f"/{_FONT_KEYS[name]} {number} 0 R" for name, number in fonts.items())
     grey = objects.stream(
         bytes([150, 150, 150] * 4),
