@@ -5,7 +5,8 @@ It writes one JSON line per start and per voiced request to ``$FAKE_LOG``, and t
 environment variables (or ``env`` given to :func:`write_fake_server`, which a build carries
 with it) change how it behaves:
 
-``FAKE_DEVICES``          what ``--list-devices --json`` prints
+``FAKE_DEVICES``          what ``--list-devices --json`` prints (default: no devices)
+``FAKE_LIST_FAIL``        ``--list-devices`` crashes; ``FAKE_LIST_HANG``: it hangs
 ``FAKE_CRASH``            exit at start-up; ``FAKE_CRASH_VULKAN``: only on the Vulkan backend
 ``FAKE_REPORT_BACKEND``   the backend ``/health`` reports (default: the configured one)
 ``FAKE_LOADED_DEVICE``    the device ``/v1/models`` says the model is on (default: the config's)
@@ -29,13 +30,21 @@ FAKE_SERVER = textwrap.dedent(
     import http.server, json, math, os, socket, struct, sys, time, wave, io
 
     if "--list-devices" in sys.argv:
+        if os.environ.get("FAKE_LOG"):
+            with open(os.environ["FAKE_LOG"], "a") as listed:
+                listed.write(json.dumps({"event": "list", "exe": sys.argv[0]}) + "\\n")
+        if os.environ.get("FAKE_LIST_HANG"):
+            time.sleep(60)
+        if os.environ.get("FAKE_LIST_FAIL"):
+            sys.exit(3)  # crashed while asking the driver
         print("ggml_vulkan: Found 2 Vulkan devices", file=sys.stderr)
-        print(os.environ.get("FAKE_DEVICES", "{}"))
+        print(os.environ.get("FAKE_DEVICES", '{"devices": []}'))
         sys.exit(0)
     config = json.load(open(sys.argv[sys.argv.index("--config") + 1]))
     log = open(os.environ["FAKE_LOG"], "a")
     log.write(json.dumps({"event": "start", "exe": sys.argv[0], "config": config, "env": {
-        k: v for k, v in os.environ.items() if k.startswith(("AUDIOCPP_", "TMPDIR"))
+        k: v for k, v in os.environ.items()
+        if k.startswith(("AUDIOCPP_", "TMPDIR", "GGML_", "VK_"))
     }}) + "\\n")
     log.flush()
     time.sleep(float(os.environ.get("FAKE_START_DELAY", "0")))  # a slow first start

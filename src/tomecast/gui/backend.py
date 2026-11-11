@@ -63,7 +63,7 @@ from tomecast.gui.worker import (
     megabytes,
     preview_file,
     probe_speeds,
-    scan_gpu,
+    scan_devices,
 )
 from tomecast.hardware import short_name, vulkan_possible
 from tomecast.names import Name
@@ -324,7 +324,7 @@ class Backend(QObject):
         system_check: Callable[[], None] = check_system,
         cover_sink: Callable[[bytes | None], None] | None = None,
         gpu_check: Callable[[], bool] = vulkan_possible,
-        device_scanner: DeviceScanner = scan_gpu,
+        device_scanner: DeviceScanner = scan_devices,
         speed_probe: SpeedProbe = probe_speeds,
         engine_check: SelfCheckFor | None = None,
     ) -> None:
@@ -875,9 +875,9 @@ class Backend(QObject):
             return
         self._shut_down = True
         self._worker.stop()
-        packaging = self._control is not None and self._control.committed
-        if self._control is not None:
-            self._control.cancel()
+        # cancel() refuses (False) exactly when packaging has begun, deciding under the
+        # control's own lock, so a commit can't slip in between looking and cancelling.
+        packaging = self._control is not None and not self._control.cancel()
         self._stop_preview()
         self._shutdownRequested.emit()
         if packaging:
@@ -893,6 +893,10 @@ class Backend(QObject):
         if self._preview_cache is not None:
             shutil.rmtree(self._preview_cache, ignore_errors=True)
             self._preview_cache = None
+
+    def save_settings(self) -> None:
+        """Write the saved settings to disk now (before leaving without Qt's own clean-up)."""
+        self._settings.sync()
 
     @property
     def worker_thread(self) -> QThread:

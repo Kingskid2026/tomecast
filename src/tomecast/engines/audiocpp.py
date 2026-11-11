@@ -54,7 +54,7 @@ from tomecast.downloads import (
     local_path,
     prepare,
 )
-from tomecast.hardware import list_devices, pick_device, short_name
+from tomecast.hardware import GpuDevice, list_devices, pick_device, short_name
 
 # The pins live in tomecast.manifest; they're re-exported so callers can import them here.
 from tomecast.manifest import AUDIOCPP_BUILD as AUDIOCPP_BUILD
@@ -462,10 +462,12 @@ class KokoroServer:
         except _ConnectionLost as error:
             if self._process is None or not _has_exited(self._process):
                 raise  # still running, just not answering
+            # Stopped on purpose (Cancel, or closing the window): not a crash, so neither a
+            # restart nor "keeps crashing", which could be blamed on the build.
+            self._stop_if_asked()
             log = _tail(self._log_path)
             if self._consecutive_restarts >= _MAX_RESTARTS:
                 raise EngineError(f"the voice engine keeps crashing. Its log:\n{log}") from error
-            self._stop_if_asked()  # it was stopped on purpose: don't start it again
             self._consecutive_restarts += 1
             self._stop_process()
             self._launch()
@@ -665,8 +667,20 @@ class KokoroServer:
             # The server unpacks model files under TMPDIR on every start and never removes
             # them; a fixed folder means they're reused instead of piling up in /tmp.
             "TMPDIR": str(cache),
+            **(_NO_GRAPHICS_CARD if self.backend == "cpu" else {}),
         }
 
+
+# On the CPU backend, the Vulkan build still starts Vulkan: the loader loads every graphics
+# driver and ggml sets up each card it finds (checked on the maintainer's AMD 860M), though it
+# never computes there. "Use graphics card" off means the card isn't touched at all, so a CPU
+# run hides every device from ggml and gives the Vulkan loader no driver to load. (The CPU
+# build has no Vulkan, so this changes nothing for it.)
+_NO_GRAPHICS_CARD = {
+    "GGML_VK_VISIBLE_DEVICES": "",
+    "VK_DRIVER_FILES": "/nonexistent/tomecast-cpu-run.json",
+    "VK_ICD_FILENAMES": "/nonexistent/tomecast-cpu-run.json",  # older loaders' name for it
+}
 
 # Every engine with a running process, so closing the window can stop them all at once.
 _RUNNING: weakref.WeakSet[KokoroServer] = weakref.WeakSet()
@@ -756,12 +770,15 @@ class AutoKokoro(KokoroServer):
     drivers expose, and starts on the best one. If there is none, or the engine won't start on
     it (or reports another backend), it starts again on the CPU with the same build and sets
     :attr:`warning`. After :meth:`start`, :attr:`device_label` says what is in use ("CPU" or
-    the card's name) and :attr:`gpu_description` is the card's full description (or ``""``).
+    the card's name), :attr:`gpu_description` is the card's full description (or ``""``),
+    and :attr:`fell_back` is True if the card was wanted but the CPU is used, so the run says
+    nothing about how a new build does on the card (it isn't proven by it).
     """
 
     def __init__(self, root: Path, *, use_gpu: bool = True, **kwargs: object) -> None:
         self.use_gpu = use_gpu
         self.warning: str | None = None
+        self.fell_back = False
         self.device_label = "CPU"
         self.gpu_description = ""
         super().__init__(root, backend="vulkan" if use_gpu else "cpu", **kwargs)  # type: ignore[arg-type]
@@ -773,12 +790,16 @@ class AutoKokoro(KokoroServer):
     def start(self) -> None:
         if self._process is not None:
             return
-        self.warning = None
+        self.warning, self.fell_back = None, False
         self.device_label, self.gpu_description = "CPU", ""
         if not self.use_gpu:
             super().start()
             return
-        device = pick_device(list_devices(self.executable))
+        devices = list_devices(self.executable, cancelled=self._cancelled)
+        if devices is None:  # the card didn't answer: that's not "no card"
+            self._use_cpu(CPU_FALLBACK_NOTE)
+            return
+        device = pick_device(devices)
         if device is None:
             self._use_cpu(NO_DEVICE_NOTE)
             return
@@ -795,7 +816,7 @@ class AutoKokoro(KokoroServer):
         """Run on the CPU backend of the same build, and say why."""
         self.backend, self.device = "cpu", None
         super().start()
-        self.warning = note
+        self.warning, self.fell_back = note, True
 
 
 # --- Installing, and checking a new build before switching to it ------------------------------
@@ -857,19 +878,34 @@ def self_check(root: Path, use_gpu: bool, cancelled: IsCancelled | None = None) 
     driver, or another program using it) is the problem, not the update, so the result is
     :class:`~tomecast.downloads.Inconclusive`: nothing is switched or recorded, and the next
     run checks again. A graphics-card build is never switched to on the strength of a CPU
-    check while there's a card to use; only when no build can see a card at all (so a run
-    voices on that build's CPU side anyway) is it checked on the CPU.
+    check while there's a card to use; only when every build answers that it sees no card
+    (so a run voices on that build's CPU side anyway) is it checked on the CPU. If a build
+    doesn't answer at all, there's no verdict either. Each build's devices are listed once
+    per check, retries included.
     """
     engine_slot = engine_asset(use_gpu).slot
+
+    listed: dict[Path, list[GpuDevice] | None] = {}  # once per build, even when retried
+
+    def devices_of(engine: Path) -> list[GpuDevice] | None:
+        if engine not in listed:
+            listed[engine] = list_devices(engine / EXECUTABLE, cancelled=cancelled)
+            if cancelled is not None and cancelled():
+                raise Cancelled
+        return listed[engine]
 
     def check(new: Mapping[str, Path], old: Mapping[str, Path]) -> CheckResult:
         new_engine, new_espeak = new[engine_slot], new.get(ESPEAK_NG.slot)
         old_engine, old_espeak = old.get(engine_slot), old.get(ESPEAK_NG.slot)
         if use_gpu:
-            devices = list_devices(new_engine / EXECUTABLE)
+            new_devices = devices = devices_of(new_engine)
             if not devices and old_engine is not None:
-                devices = list_devices(old_engine / EXECUTABLE)  # the new one may not see it
-            device = pick_device(devices)
+                devices = devices_of(old_engine)  # the new one may not see it
+            device = pick_device(devices or [])
+            if device is None and (new_devices is None or devices is None):
+                # A build that didn't answer (it crashed or hung listing them) says nothing
+                # about whether there's a card, so a CPU check couldn't stand in for one.
+                return Inconclusive("the graphics card didn't answer when asked what it is")
             if device is not None:
                 problem = check_build(
                     root,
@@ -913,6 +949,7 @@ def prepare_voice(
     on_download: DownloadReporter | None = None,
     on_check: Callable[[], None] | None = None,
     cancelled: IsCancelled | None = None,
+    take_over: bool = False,
 ) -> Prepared:
     """Install what a run needs (:func:`required_assets`), switching to new engine builds
     only once they pass :func:`kokoro_check`. See :func:`tomecast.downloads.prepare`; give
@@ -925,4 +962,5 @@ def prepare_voice(
         on_download=on_download,
         on_check=on_check,
         cancelled=cancelled,
+        take_over=take_over,
     )

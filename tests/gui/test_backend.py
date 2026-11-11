@@ -17,6 +17,7 @@ import time
 import wave
 from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
+from typing import Any
 
 import pytest
 from PySide6.QtCore import QSettings, QUrl
@@ -49,6 +50,7 @@ from tomecast.gui import fixes as fixes_module
 from tomecast.gui.backend import STOPPED_MESSAGE, Backend, safe_file_name, unique_output
 from tomecast.gui.models import DEFAULT_SPEEDUP, ChapterModel, display_title, summarize
 from tomecast.gui.worker import BookRead, SelfCheckFor, TimedControl, preview_file
+from tomecast.hardware import GpuDevice
 from tomecast.names import Name
 from tomecast.speed import Speeds
 from tomecast.textprep import TextPrep
@@ -93,6 +95,8 @@ class Engines:
         self.start_error: str | None = None
         self.gpu: str = "NVIDIA RTX PRO 1000 Blackwell Generation Laptop GPU"  # a use_gpu run
         self.gpu_warning: str | None = None  # set: a use_gpu run fell back to the CPU
+        self.before_start: Callable[[], None] | None = None  # runs as an engine starts
+        self.after_close: Callable[[], None] | None = None  # runs once an engine has stopped
 
     def __call__(self, root: Path, voice: str, speed: float, use_gpu: bool = False) -> FakeEngine:
         engine = FakeEngine(self, voice, speed, use_gpu)
@@ -113,6 +117,7 @@ class FakeEngine:
         self.device_label = "CPU"
         self.gpu_description = ""
         self.warning: str | None = None
+        self.fell_back = False
         self.started = False
         self.closed = False
         self.thread_id: int | None = None  # the OS thread that started it
@@ -131,10 +136,13 @@ class FakeEngine:
 
     def start(self) -> None:
         self.thread_id = threading.get_ident()
+        if self._engines.before_start:
+            self._engines.before_start()
         if self._engines.start_error:
             raise EngineError(self._engines.start_error)
         if self.use_gpu and self._engines.gpu_warning:
             self.warning = self._engines.gpu_warning
+            self.fell_back = True
         elif self.use_gpu and self._engines.gpu:
             self.gpu_description = self._engines.gpu
         self.started = True
@@ -142,6 +150,8 @@ class FakeEngine:
     def close(self) -> None:
         assert threading.get_ident() == self.thread_id  # stopped on the thread that started it
         self.closed = True
+        if self._engines.after_close:
+            self._engines.after_close()
 
     def synthesize(self, text: str, output: Path) -> None:
         engines = self._engines
@@ -235,15 +245,18 @@ def make_backend(
         engine_check: SelfCheckFor | None = None,
         probed: list[bool] | None = None,  # records each speed probe's "look at the card"
     ) -> Backend:
-        def probe(root: Path, card: bool, cancelled: object) -> Speeds:
+        def probe(root: Path, card: bool, cancelled: object, devices: object) -> Speeds:
             if probed is not None:
                 probed.append(card)
             return speeds
 
+        def scanner(root: Path, cancelled: object) -> list[GpuDevice]:
+            return [GpuDevice(0, "Vulkan0", scan, "gpu", 7 * 2**30, 8 * 2**30)] if scan else []
+
         backend = Backend(
             engine_factory=engines if engines is not None else Engines(),
             gpu_check=lambda: gpu,
-            device_scanner=lambda root: scan,
+            device_scanner=scanner,
             speed_probe=probe,
             engine_check=engine_check,
             assets=assets,
@@ -2286,7 +2299,7 @@ def test_the_start_up_scan_looks_at_the_card_only_when_it_is_switched_on(
 ) -> None:
     asked: list[bool] = []
 
-    def probe(root: Path, gpu: bool, cancelled: object) -> Speeds:
+    def probe(root: Path, gpu: bool, cancelled: object, devices: object) -> Speeds:
         asked.append(gpu)
         return Speeds()
 
@@ -2298,7 +2311,7 @@ def test_the_start_up_scan_looks_at_the_card_only_when_it_is_switched_on(
         backend = Backend(
             engine_factory=Engines(),
             gpu_check=lambda driver=driver: driver,  # type: ignore[misc]
-            device_scanner=lambda root: "",
+            device_scanner=lambda root, cancelled: [],
             speed_probe=probe,
             assets=(),
             data_root=tmp_path / "data",
@@ -2487,3 +2500,150 @@ def test_turning_the_card_on_looks_at_it_once(qtbot: QtBot, make_backend: MakeBa
     backend.setUseGpu(True)  # its name and speed are still unknown: look again
 
     qtbot.waitUntil(lambda: probed == [True, True])
+
+
+# --- Second review: Done first, fallbacks prove nothing, stops, the shutdown race -------------
+
+
+def _installed_state(tmp_path: Path) -> dict[str, Any]:
+    state: dict[str, Any] = json.loads((tmp_path / "data" / "installed.json").read_text())
+    return state
+
+
+def test_the_done_screen_doesnt_wait_for_another_install(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    import fcntl
+
+    asset, _ = _engine_update(tmp_path)
+    engines = Engines()
+    held: list[Any] = []
+
+    def another_tomecast_starts_installing() -> None:  # just as the book is finished
+        lock = (tmp_path / "data" / ".install.lock").open("w")
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        held.append(lock)
+
+    engines.after_close = another_tomecast_starts_installing
+    backend = make_backend(engines, assets=(asset,), engine_check=lambda r, g, c: lambda n, o: None)
+    _open(qtbot, backend, _short_book(tmp_path))
+    backend.goTo("voice")
+    backend.startConversion()
+
+    qtbot.waitUntil(lambda: backend.screen == "done", timeout=5000)  # not after the lock
+
+    assert held  # it was held the whole time
+    qtbot.wait(3000)  # the worker gave up proving after a couple of seconds...
+    held[0].close()
+    assert _installed_state(tmp_path)["slots"]["engine"]["proven"] is False  # ...quietly
+
+
+def test_a_book_made_on_the_cpu_fallback_doesnt_prove_a_card_build(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    asset, _ = _engine_update(tmp_path)
+    engines = Engines()
+    engines.gpu_warning = "The graphics card didn't work, so Tomecast used the CPU."
+    backend = make_backend(
+        engines, gpu=True, assets=(asset,), engine_check=lambda r, g, c: lambda n, o: None
+    )
+    _open(qtbot, backend, _short_book(tmp_path))
+
+    _convert(qtbot, backend)
+
+    assert backend.screen == "done"
+    slot = _installed_state(tmp_path)["slots"]["engine"]
+    assert slot["proven"] is False  # the card was never tried with it
+    assert slot["previous"] == "engines/engine-0.1"  # so the build that worked is kept
+
+
+def test_a_book_made_as_asked_proves_the_build(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    asset, _ = _engine_update(tmp_path)
+    backend = make_backend(assets=(asset,), engine_check=lambda r, g, c: lambda n, o: None)
+    _open(qtbot, backend, _short_book(tmp_path))
+
+    _convert(qtbot, backend)
+
+    qtbot.waitUntil(lambda: _installed_state(tmp_path)["slots"]["engine"]["proven"] is True)
+
+
+def test_stopping_doesnt_roll_back_an_update(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    asset, _ = _engine_update(tmp_path)
+    engines = Engines()
+    engines.start_error = "the voice engine keeps crashing. Its log:\n(stopped)"
+    backend = make_backend(engines, assets=(asset,), engine_check=lambda r, g, c: lambda n, o: None)
+
+    def press_stop() -> None:  # Stop, as the engine goes down
+        _control(backend).cancel()
+
+    engines.before_start = press_stop
+    _open(qtbot, backend, _short_book(tmp_path))
+    backend.goTo("voice")
+    backend.startConversion()
+
+    qtbot.waitUntil(lambda: bool(engines.made) and engines.made[0].thread_id is not None)
+    qtbot.wait(500)
+
+    new_build = tmp_path / "data" / asset.path / asset.sha256[:12]
+    assert build_in_use(asset, tmp_path / "data") == new_build  # still the update
+    assert failure(asset, tmp_path / "data") is None  # a stop says nothing about the build
+
+
+def test_closing_during_packaging_waits_even_if_it_began_a_moment_ago(
+    make_backend: MakeBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stopped: list[bool] = []
+    monkeypatch.setattr(backend_module, "stop_all_engines", lambda: stopped.append(True))
+    backend = make_backend()
+
+    class JustCommitted(TimedControl):
+        """Packaging began between looking at ``committed`` and calling ``cancel()``."""
+
+        @property
+        def committed(self) -> bool:
+            return False  # what shutdown would have seen a moment before
+
+        def cancel(self) -> bool:
+            return False  # packaging has begun: cancel refuses
+
+    backend._control = JustCommitted()
+
+    backend.shutdown()
+
+    assert stopped == []  # it took the packaging path: no engine is stopped mid-book
+
+
+def test_the_start_up_scan_lists_the_cards_once(qtbot: QtBot, tmp_path: Path) -> None:
+    scanned: list[bool] = []
+    given: list[object] = []
+    card = GpuDevice(0, "Vulkan0", NVIDIA, "gpu", 7 * 2**30, 8 * 2**30)
+
+    def scanner(root: Path, cancelled: object) -> list[GpuDevice]:
+        scanned.append(True)
+        return [card]
+
+    def probe(root: Path, gpu: bool, cancelled: object, devices: object) -> Speeds:
+        given.append(devices)
+        return Speeds()
+
+    backend = Backend(
+        engine_factory=Engines(),
+        gpu_check=lambda: True,
+        device_scanner=scanner,
+        speed_probe=probe,
+        assets=(),
+        data_root=tmp_path / "data",
+        player=None,
+        settings=QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat),
+        system_check=lambda: None,
+    )
+    qtbot.waitUntil(lambda: bool(given))
+    backend.shutdown()
+
+    assert scanned == [True]
+    assert given == [[card]]  # the probe gets that list instead of asking again
+    assert backend.gpuName == NVIDIA

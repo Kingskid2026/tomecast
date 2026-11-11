@@ -311,3 +311,14 @@ def test_engine_speed_remembers_a_failure_too(tmp_path: Path, installed: Path) -
         told: list[str] = []
         assert engine_speed(installed, engine, measuring=lambda: told.append("x")) is None
         assert told == []  # not measured again
+
+
+def test_a_failed_measurement_dated_in_the_future_has_expired(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = time.time()
+    monkeypatch.setattr("time.time", lambda: now + 10 * 365 * 86400)  # the clock was years ahead
+    speed_module.remember_failure(tmp_path, "build/vulkan/card", "it crashed")
+    monkeypatch.setattr("time.time", lambda: now)  # put right
+
+    assert not speed_module.failed_recently(tmp_path, "build/vulkan/card")  # measured again

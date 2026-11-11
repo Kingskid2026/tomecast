@@ -64,7 +64,7 @@ from tomecast.engines.audiocpp import (
     kokoro_check,
 )
 from tomecast.gui.fixes import FixLists, ListFile
-from tomecast.hardware import list_devices, pick_device
+from tomecast.hardware import GpuDevice, list_devices, pick_device
 from tomecast.names import Name, find_book_names
 from tomecast.packaging import PackagingError, stretch_wav
 from tomecast.pronunciations import (
@@ -94,6 +94,9 @@ class Engine(VoiceEngine, Protocol):
     device_label: str  # after start(): what is in use, "CPU" or the card's short name
     gpu_description: str  # after start(): the card's full description, or "" on the CPU
     warning: str | None  # after start(): why the CPU is used when the card was wanted
+    # after start(): the card was wanted but the CPU is used, so the run doesn't prove a
+    # graphics-card build
+    fell_back: bool
 
     def pin_builds(self, builds: Mapping[str, Path]) -> None:
         """Run exactly these engine builds (``Prepared.builds``): the work folder is keyed by
@@ -109,11 +112,12 @@ class Engine(VoiceEngine, Protocol):
 EngineFactory = Callable[[Path, str, float, bool], Engine]
 # (use the graphics card) -> the files that choice needs installed
 AssetsFor = Callable[[bool], Sequence[Asset]]
-# (data folder) -> the graphics card's description if one would be used, else ""
-DeviceScanner = Callable[[Path], str]
-# (data folder, look at the graphics card too, has the user stopped?) -> the speeds measured
-# (or remembered) there
-SpeedProbe = Callable[[Path, bool, IsCancelled], Speeds]
+# (data folder, has the user stopped?) -> the graphics cards the installed Vulkan build sees:
+# [] for none, None if there's no such build or it didn't answer
+DeviceScanner = Callable[[Path, IsCancelled], list[GpuDevice] | None]
+# (data folder, look at the graphics card too, has the user stopped?, the cards the scanner
+# found) -> the speeds measured (or remembered) there
+SpeedProbe = Callable[[Path, bool, IsCancelled, list[GpuDevice] | None], Speeds]
 # (data folder, use the graphics card, has the user stopped?) -> the checks a new engine build
 # must pass (one per voice that uses it)
 SelfCheckFor = Callable[[Path, bool, IsCancelled], SelfCheck | Sequence[VoiceCheck]]
@@ -125,20 +129,20 @@ def kokoro_engine(root: Path, voice: str, speed: float, use_gpu: bool) -> Engine
     return AutoKokoro(root, voice=voice, speed=speed, use_gpu=use_gpu)
 
 
-def scan_gpu(root: Path) -> str:
-    """The description of the graphics card that would be used, or ``""``. Only looks if a
-    graphics-card engine build is installed; it never downloads."""
+def scan_devices(root: Path, cancelled: IsCancelled) -> list[GpuDevice] | None:
+    """The graphics cards the installed graphics-card engine build sees (``None`` if there's
+    no such build, or it didn't answer). It never downloads."""
     build = build_in_use(AUDIOCPP_VULKAN, root)
-    if build is None:
-        return ""
-    device = pick_device(list_devices(build / EXECUTABLE))
-    return device.description if device else ""
+    return list_devices(build / EXECUTABLE, cancelled=cancelled) if build else None
 
 
-def probe_speeds(root: Path, gpu: bool, cancelled: IsCancelled) -> Speeds:
-    """The real speed probe: the CPU's speed, and the card's with ``gpu``, measured once per
-    engine build and device (a few seconds each) and remembered after that."""
-    return probe(root, gpu=gpu, cancelled=cancelled)
+def probe_speeds(
+    root: Path, gpu: bool, cancelled: IsCancelled, devices: list[GpuDevice] | None
+) -> Speeds:
+    """The real speed probe: the CPU's speed, and the card's with ``gpu`` (on the cards the
+    scan found, so they aren't listed twice), measured once per engine build and device (a
+    few seconds each) and remembered after that."""
+    return probe(root, gpu=gpu, cancelled=cancelled, devices=devices, listed=gpu)
 
 
 def voice_checks(root: Path, use_gpu: bool, cancelled: IsCancelled) -> list[VoiceCheck]:
@@ -363,7 +367,7 @@ class ConversionWorker(QObject):
         assets: AssetsFor,
         data_root: Path,
         system_check: Callable[[], None],
-        device_scanner: DeviceScanner = scan_gpu,
+        device_scanner: DeviceScanner = scan_devices,
         speed_probe: SpeedProbe = probe_speeds,
         engine_check: SelfCheckFor = voice_checks,
     ) -> None:
@@ -413,11 +417,13 @@ class ConversionWorker(QObject):
     # --- Start-up scan --------------------------------------------------------------------
 
     def _scan(self, job: ScanJob) -> None:
+        devices = self._device_scanner(self._root, self._stopping.is_set) if job.gpu else None
         if job.gpu:
-            self.deviceChosen.emit(self._device_scanner(self._root))
+            device = pick_device(devices or [])
+            self.deviceChosen.emit(device.description if device else "")
         self._close_preview_engine()  # one model in memory at a time
         try:
-            speeds = self._speed_probe(self._root, job.gpu, self._stopping.is_set)
+            speeds = self._speed_probe(self._root, job.gpu, self._stopping.is_set, devices)
         except Cancelled:
             return  # the window is closing
         self.speedsKnown.emit(speeds)
@@ -548,8 +554,6 @@ class ConversionWorker(QObject):
                 self.stageChanged.emit(job.job, "starting")
                 outcome = self._voice_book(job, engine, chunks, workdir, prep, notes, install_notes)
             shutil.rmtree(workdir, ignore_errors=True)
-            with contextlib.suppress(Cancelled, OSError):
-                mark_proven(self._root, builds, self._stopping.is_set)
         except (ConversionCancelled, Cancelled):
             self.cancelled.emit(job.job)
             return
@@ -559,14 +563,19 @@ class ConversionWorker(QObject):
         ) as error:  # fmt: skip
             message = _as_sentence(str(error))
             # A switched-to update that crashes (or makes no usable audio) on its first book.
+            # Not when the run was stopped: a stopped engine says nothing about the build.
             failed_voicing = isinstance(error, EngineError | MissingAudioError)
-            if failed_voicing and builds and self._roll_back(job, builds, error):
+            stopped = job.control.cancelled or self._stopping.is_set()
+            if failed_voicing and builds and not stopped and self._roll_back(job, builds, error):
                 message += f" {UPDATE_FAILED_NOTE} Start again to make the book with it."
             elif workdir is not None and any((workdir / "chunks").glob("*.wav")):
                 message += " The audio made so far is kept, so starting again continues from there."
             self.failed.emit(job.job, message)
             return
-        self.converted.emit(job.job, outcome)
+        self.converted.emit(job.job, outcome)  # the book is done: tell the window first
+        if not engine.fell_back:  # a run that fell back to the CPU proves nothing for the card
+            with contextlib.suppress(Cancelled, OSError):
+                mark_proven(self._root, builds, self._stopping.is_set)
 
     def _roll_back(self, job: ConvertJob, builds: Mapping[str, Path], error: Exception) -> bool:
         """An update that passed its check failed on the book: go back to the build before

@@ -16,7 +16,7 @@ from typing import Literal
 
 import pytest
 
-from tomecast import downloads
+from tomecast import __version__, downloads
 from tomecast.downloads import (
     FAILURE_DAYS,
     UPDATE_FAILED_NOTE,
@@ -437,14 +437,19 @@ def test_declining_what_a_run_cant_do_without_stops_it(tmp_path: Path) -> None:
         prepare([asset], tmp_path / "data", check=Check(), consent=lambda m, u: False)
 
 
+def _book_finished(root: Path, prepared: Prepared) -> None:
+    """A book was made with the builds ``prepared`` chose: they're proven."""
+    assert mark_proven(root, prepared.builds)
+
+
 def test_each_engine_keeps_at_most_two_builds(tmp_path: Path) -> None:
     root = tmp_path / "data"
     v1, v2, v3, v4 = (_build(tmp_path, f"v{n}") for n in range(1, 5))
     prepare([v1], root, check=Check())
-    prepare([v2], root, check=Check())
+    _book_finished(root, prepare([v2], root, check=Check()))
     assert _builds(root) == {_relative(build_folder(a, root), root) for a in (v1, v2)}
 
-    prepare([v3], root, check=Check())  # v1 is no longer needed
+    _book_finished(root, prepare([v3], root, check=Check()))  # v1 is no longer needed
     assert _builds(root) == {_relative(build_folder(a, root), root) for a in (v2, v3)}
 
     prepare([v4], root, check=Check("broken"))  # v3 in use, v4 kept for a retry, v2 goes
@@ -623,7 +628,7 @@ def test_after_the_upgrade_the_old_build_goes_once_a_newer_one_passes(tmp_path: 
     root = tmp_path / "data"
     legacy = _tomecast_0_1_2(root)
     ours = _ours(tmp_path)
-    prepare([ours, ESPEAK_NG], root, check=Check())
+    _book_finished(root, prepare([ours, ESPEAK_NG], root, check=Check()))
     archive = tmp_path / "next.tar.gz"
     _make_tar(archive, {"audiocpp_server": b"the next build"})
     data = archive.read_bytes()
@@ -838,7 +843,7 @@ def test_a_half_deleted_build_never_looks_complete(
     root = tmp_path / "data"
     v1, v2, v3 = (_build(tmp_path, f"v{n}") for n in range(1, 4))
     prepare([v1], root, check=Check())
-    prepare([v2], root, check=Check())
+    _book_finished(root, prepare([v2], root, check=Check()))
     real_rmtree = shutil.rmtree
 
     def killed_halfway(path: object, *args: object, **kwargs: object) -> None:
@@ -967,3 +972,171 @@ def test_the_gui_check_never_hashes(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     assert not needs_download(asset, root, verify=False)  # the pinned size: counts for now
     target.write_bytes(b"short")
     assert needs_download(asset, root, verify=False)
+
+
+# --- Second review: deadlines, fallbacks, clocks, scans --------------------------------------
+
+
+def test_proving_a_build_never_waits_long_for_another_install(tmp_path: Path) -> None:
+    root = tmp_path / "data"
+    _, _, prepared = _switched(tmp_path, root)
+    other = (root / ".install.lock").open("w")
+    fcntl.flock(other, fcntl.LOCK_EX)  # another Tomecast is in the middle of a long download
+    done: list[bool] = []
+    thread = threading.Thread(target=lambda: done.append(mark_proven(root, prepared.builds)))
+    started = time.monotonic()
+    thread.start()
+    thread.join(timeout=8)
+    other.close()
+    thread.join()
+
+    assert time.monotonic() - started < 6  # it gave up after a couple of seconds
+    assert done == [False]  # quietly: not proven this time...
+    assert roll_back(root, prepared.builds, "still unproven")  # ...so it can still roll back
+
+
+def test_rolling_back_never_waits_for_good_either(tmp_path: Path) -> None:
+    root = tmp_path / "data"
+    _, new, prepared = _switched(tmp_path, root)
+    with (root / ".install.lock").open("w") as other:
+        fcntl.flock(other, fcntl.LOCK_EX)
+        started = time.monotonic()
+        assert not roll_back(root, prepared.builds, "crashed", wait=0.5)
+        assert time.monotonic() - started < 3
+    assert _version(root, new) == "v2"  # the next failure rolls it back
+    assert roll_back(root, prepared.builds, "crashed")
+
+
+def test_a_build_that_never_finished_a_book_keeps_its_fallback_through_the_next_update(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "data"
+    v1, v2, v3 = (_build(tmp_path, f"v{n}") for n in range(1, 4))
+    prepare([v1], root, check=Check())  # v1 worked (a first install)
+    prepare([v2], root, check=Check())  # v2 passed its check but never finished a book
+    # (say every run since fell back to the CPU, which proves nothing for the card)
+
+    prepared = prepare([v3], root, check=Check())  # the next update arrives and passes
+
+    assert prepared.switched == (v3,)
+    assert build_sha256(build_folder(v1, root)) == v1.sha256  # the build known to work stays
+    assert roll_back(root, prepared.builds, "v3 crashed on the book")
+    assert _version(root, v3) == "v1"  # and that's where a failure goes back to
+
+
+def test_a_failure_dated_in_the_future_has_expired(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "data"
+    _, new, prepared = _switched(tmp_path, root)
+    now = time.time()
+    monkeypatch.setattr("time.time", lambda: now + 10 * 365 * 86400)  # the clock was years ahead
+    assert roll_back(root, prepared.builds, "crashed")
+    monkeypatch.setattr("time.time", lambda: now)  # and then it was put right
+
+    assert failure(new, root) is None  # not blocked for ten years
+    assert waiting_check(new, root)
+    assert prepare([new], root, check=Check()).switched == (new,)
+
+
+def test_a_rolled_back_build_is_checked_again_once_its_failure_expires(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "data"
+    old, new, prepared = _switched(tmp_path, root)
+    assert roll_back(root, prepared.builds, "no usable audio for c1")
+    again = prepare([new], root, check=Check())
+    assert again.builds == {"engine": build_folder(old, root)}
+    assert not roll_back(root, again.builds, "the same book fails on the old one too")
+
+    now = time.time()
+    monkeypatch.setattr("time.time", lambda: now + FAILURE_DAYS * 86400 - 60)
+    check = Check()
+    prepare([new], root, check=check)
+    assert check.calls == [] and failure(new, root)  # not yet
+    monkeypatch.setattr("time.time", lambda: now + FAILURE_DAYS * 86400 + 60)
+    check = Check()
+    third = prepare([new], root, check=check)
+    assert len(check.calls) == 1 and third.switched == (new,)  # tried again, once
+    assert roll_back(root, third.builds, "again")  # and can be rolled back again
+    assert _version(root, new) == "v1"
+
+
+def test_a_failure_written_by_the_first_format_is_read(tmp_path: Path) -> None:
+    root = tmp_path / "data"
+    old, new = _build(tmp_path, "v1"), _build(tmp_path, "v2")
+    prepare([old], root, check=Check())
+    prepare([new], root, check=Check("fails"))
+    slot = json.loads((root / "installed.json").read_text())["slots"]["engine"]
+    (root / "installed.json").write_text(  # as #47 wrote it: one record, no time
+        json.dumps(
+            {
+                "format": 1,
+                "slots": {
+                    "engine": {
+                        "current": slot["current"],
+                        "previous": slot["previous"],
+                        "failed": {"sha256": new.sha256, "tomecast": __version__},
+                    }
+                },
+            }
+        )
+    )
+    check = Check()
+
+    prepared = prepare([new], root, check=check)
+
+    assert len(check.calls) == 1 and prepared.switched == (new,)  # no time: tried again
+
+
+def test_a_scan_keeps_which_tomecast_chose_each_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "data"
+    theirs = _build(tmp_path, "theirs")
+    monkeypatch.setattr(downloads, "__version__", "0.3.0")
+    prepare([theirs], root, check=Check())
+
+    forget_failures(root)  # `tomecast scan` in either version
+
+    state = json.loads((root / "installed.json").read_text())
+    assert state["slots"]["engine"]["chosen_by"] == "0.3.0"
+
+
+def test_a_scan_takes_the_build_back_for_a_downgraded_tomecast(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "data"
+    ours, theirs = _build(tmp_path, "ours"), _build(tmp_path, "theirs")
+    monkeypatch.setattr(downloads, "__version__", "0.3.0")  # the newer one chose last...
+    prepare([theirs], root, check=Check())
+    monkeypatch.setattr(downloads, "__version__", "0.2.0")  # ...then it was uninstalled
+    plain = Check()
+    assert prepare([ours], root, check=plain).switched == ()  # a normal run leaves it alone
+    assert plain.calls == []
+
+    check = Check()
+    taken = prepare([ours], root, check=check, take_over=True)  # what `tomecast scan` does
+
+    assert len(check.calls) == 1  # its own build is checked first, like any switch
+    assert taken.switched == (ours,)
+    assert _version(root, ours) == "ours"
+    state = json.loads((root / "installed.json").read_text())
+    assert state["slots"]["engine"]["chosen_by"] == "0.2.0"  # the new choice is recorded
+
+
+def test_a_scan_doesnt_take_the_build_back_if_its_own_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "data"
+    ours, theirs = _build(tmp_path, "ours"), _build(tmp_path, "theirs")
+    monkeypatch.setattr(downloads, "__version__", "0.3.0")
+    prepare([theirs], root, check=Check())
+    monkeypatch.setattr(downloads, "__version__", "0.2.0")
+
+    taken = prepare([ours], root, check=Check("broken here"), take_over=True)
+
+    assert taken.switched == ()
+    assert _version(root, ours) == "theirs"
+    state = json.loads((root / "installed.json").read_text())
+    assert state["slots"]["engine"]["chosen_by"] == "0.3.0"

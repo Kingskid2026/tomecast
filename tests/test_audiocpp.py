@@ -801,3 +801,102 @@ def test_loaded_device_reads_audiocpps_reply(tmp_path: Path, fake_server: Path) 
         tmp_path / "data", executable=fake_server, backend="vulkan", device=1, startup_timeout=20
     ) as engine:
         assert engine.loaded_device() == 1
+
+
+# --- Second review: CPU fallbacks, stops, cards that don't answer, the CPU path ---------------
+
+
+def test_auto_says_when_it_fell_back_from_the_card(
+    tmp_path: Path, fake_server: Path, with_devices: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with AutoKokoro(tmp_path / "data", executable=fake_server, startup_timeout=20) as engine:
+        assert engine.fell_back is False  # on the card, as asked
+    monkeypatch.setenv("FAKE_CRASH_VULKAN", "1")
+    with AutoKokoro(tmp_path / "data", executable=fake_server, startup_timeout=20) as engine:
+        assert engine.fell_back is True  # the card didn't work: a CPU run proves nothing for it
+    with AutoKokoro(tmp_path / "data", use_gpu=False, executable=fake_server) as engine:
+        assert engine.fell_back is False  # the CPU was asked for
+
+
+def test_auto_without_a_card_has_fallen_back_too(tmp_path: Path, fake_server: Path) -> None:
+    with AutoKokoro(tmp_path / "data", executable=fake_server, startup_timeout=20) as engine:
+        assert engine.warning == audiocpp.NO_DEVICE_NOTE
+        assert engine.fell_back is True
+
+
+def test_a_card_that_doesnt_answer_isnt_taken_for_no_card(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FAKE_LOG", str(tmp_path / "fake.log"))
+    stalled = write_fake_server(tmp_path / "audiocpp_server", {"FAKE_LIST_FAIL": "1"})
+
+    with AutoKokoro(tmp_path / "data", executable=stalled, startup_timeout=20) as engine:
+        assert engine.warning == audiocpp.CPU_FALLBACK_NOTE  # "didn't work", not "none found"
+        assert engine.fell_back is True
+
+
+def test_a_new_build_that_cant_list_the_cards_is_not_switched_on_a_cpu_check(
+    tmp_path: Path, engine_root: Path
+) -> None:
+    old = _engine_build(tmp_path, "old", gpu=True)  # answers: no card
+    new = _engine_build(tmp_path, "new", gpu=True, env={"FAKE_LIST_FAIL": "1"})  # no answer
+
+    prepared = _update(engine_root, old, new, gpu=True)
+
+    assert prepared.switched == ()  # a CPU check can't stand in for a card nobody could see
+    assert build_in_use(new, engine_root) == build_folder(old, engine_root)
+    assert failure(new, engine_root) is None  # no verdict, so nothing is blamed
+    assert waiting_check(new, engine_root)
+    assert _checks(tmp_path) == []  # not even started
+
+
+def test_each_build_lists_its_cards_once_per_check(
+    tmp_path: Path, engine_root: Path, with_devices: None
+) -> None:
+    old = _engine_build(tmp_path, "old", gpu=True)
+    new = _engine_build(tmp_path, "new", gpu=True, env={"FAKE_REPORT_BACKEND": "cpu"})
+    prepare([old, ESPEAK_NG], engine_root, check=audiocpp.self_check(engine_root, True))
+    assert not (tmp_path / "fake.log").exists()  # a first install: nothing listed or started
+
+    prepare([new, ESPEAK_NG], engine_root, check=audiocpp.self_check(engine_root, True))
+
+    listed = [e for e in _events(tmp_path) if e["event"] == "list"]
+    assert len(listed) == 1  # the new build, once, though the failed check ran twice
+    assert len(_checks(tmp_path)) == 4  # (new, old) on the card, twice
+
+
+def test_a_stopped_engine_is_never_called_crashing(tmp_path: Path, fake_server: Path) -> None:
+    with KokoroServer(tmp_path / "data", executable=fake_server, startup_timeout=20) as engine:
+        engine._consecutive_restarts = audiocpp._MAX_RESTARTS  # it had crashed on this text
+        engine.abort()  # and then the user stopped it
+        assert engine._process is not None
+        engine._process.wait(timeout=10)
+        with pytest.raises(Cancelled):  # not "keeps crashing", which would blame the build
+            engine.synthesize("Anyone there?", tmp_path / "x.wav")
+
+
+def test_a_cpu_run_hides_the_graphics_card(tmp_path: Path, fake_server: Path) -> None:
+    with KokoroServer(tmp_path / "data", executable=fake_server, backend="cpu"):
+        pass
+    with KokoroServer(
+        tmp_path / "data", executable=fake_server, backend="vulkan", device=0, startup_timeout=20
+    ):
+        pass
+    cpu_env, card_env = (start["env"] for start in _starts(tmp_path))
+    assert isinstance(cpu_env, dict) and isinstance(card_env, dict)
+    # ggml sees no card, and the Vulkan loader finds no driver to load: nothing touches the
+    # card (checked on the AMD 860M: no driver loaded, no device set up, busy % unchanged).
+    assert cpu_env["GGML_VK_VISIBLE_DEVICES"] == ""
+    assert not Path(cpu_env["VK_DRIVER_FILES"]).exists()
+    assert not Path(cpu_env["VK_ICD_FILENAMES"]).exists()
+    assert "GGML_VK_VISIBLE_DEVICES" not in card_env and "VK_DRIVER_FILES" not in card_env
+
+
+def test_the_cpu_fallback_hides_the_card_too(
+    tmp_path: Path, fake_server: Path, with_devices: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FAKE_CRASH_VULKAN", "1")
+    with AutoKokoro(tmp_path / "data", executable=fake_server, startup_timeout=20) as engine:
+        assert engine.backend == "cpu"
+    cpu_start = _starts(tmp_path)[-1]["env"]
+    assert isinstance(cpu_start, dict) and cpu_start["GGML_VK_VISIBLE_DEVICES"] == ""

@@ -397,6 +397,7 @@ def _convert(args: argparse.Namespace) -> int:
                 speedup = engine_speed(root, engine, measuring=_measuring)
                 if speedup is not None:
                     print(_estimate_line(words_in(book, chapters), args.speed, speedup))
+                fell_back = engine.fell_back  # on the CPU although the card was wanted
                 result = convert_book(
                     book,
                     engine,
@@ -424,7 +425,6 @@ def _convert(args: argparse.Namespace) -> int:
             progress.finish()
             raise CliError(f"{error}\n{_saved_note(workdir)}".rstrip()) from error
         progress.finish()
-    mark_proven(root, builds)
     shutil.rmtree(workdir, ignore_errors=True)
 
     for warning in result.warnings:
@@ -437,6 +437,11 @@ def _convert(args: argparse.Namespace) -> int:
         f"{_plural(len(result.chapters), 'chapter')}, "
         f"made in {_duration(time.monotonic() - started)})."
     )
+    sys.stdout.flush()
+    # After "Done", and never waiting long on another Tomecast's install. A run that fell back
+    # to the CPU says nothing about how the build does on the card, so it proves nothing.
+    if not fell_back:
+        mark_proven(root, builds)
     return 0
 
 
@@ -502,7 +507,9 @@ def _doctor() -> int:
     vulkan = build_in_use(AUDIOCPP_VULKAN, root)
     if vulkan is not None:
         devices = list_devices(vulkan / EXECUTABLE)
-        if devices:
+        if devices is None:
+            print("Vulkan devices: couldn't tell (the graphics-card engine didn't answer)")
+        elif devices:
             print("Vulkan devices:")
             for device in devices:
                 free = (
@@ -545,7 +552,7 @@ def _scan(args: argparse.Namespace) -> int:
     use_gpu = _wants_gpu(args.gpu)
     forget_failures(root)
     forget_speeds(root)
-    _prepare(use_gpu, root, assume_yes=args.yes)
+    _prepare(use_gpu, root, assume_yes=args.yes, take_over=True)
     print("Measuring how fast this computer voices (a few seconds each)…")
     speeds = probe(root, gpu=use_gpu)
     threads = default_threads()
@@ -723,9 +730,10 @@ def _saved_note(workdir: Path) -> str:
     return ""
 
 
-def _prepare(use_gpu: bool, root: Path, *, assume_yes: bool) -> Prepared:
+def _prepare(use_gpu: bool, root: Path, *, assume_yes: bool, take_over: bool = False) -> Prepared:
     """Download what a run needs (after asking), and switch to new engine builds only once
-    they pass their self-check. Prints a note when an update was kept back."""
+    they pass their self-check. Prints a note when an update was kept back. ``take_over``
+    (``tomecast scan``) checks this Tomecast's own builds even where a newer one chose."""
 
     def consent(missing: Sequence[Asset], updates: bool) -> bool:
         total = sum(asset.size for asset in missing)
@@ -759,7 +767,12 @@ def _prepare(use_gpu: bool, root: Path, *, assume_yes: bool) -> Prepared:
 
     try:
         prepared = prepare_voice(
-            root, use_gpu, consent=consent, on_download=_download_printer, on_check=checking
+            root,
+            use_gpu,
+            consent=consent,
+            on_download=_download_printer,
+            on_check=checking,
+            take_over=take_over,
         )
     except DownloadError as error:
         raise CliError(str(error)) from error

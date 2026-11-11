@@ -8,7 +8,7 @@ Tomecast never installs, updates or configures a graphics driver. It asks two qu
   expose, so Tomecast needs no detection code of its own.
 
 :func:`pick_device` chooses among them. Nothing here raises on a broken driver: the answer is
-"no graphics card", and the caller uses the CPU.
+"no graphics card" or "couldn't tell", and the caller uses the CPU.
 """
 
 from __future__ import annotations
@@ -18,7 +18,8 @@ import glob
 import json
 import re
 import subprocess
-from collections.abc import Sequence
+import time
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -52,25 +53,42 @@ def vulkan_possible() -> bool:
     return any(glob.glob(pattern) for pattern in _DEVICE_NODES)
 
 
-def list_devices(executable: Path | str, timeout: float = 20) -> list[GpuDevice]:
+def list_devices(
+    executable: Path | str,
+    timeout: float = 20,
+    cancelled: Callable[[], bool] | None = None,
+) -> list[GpuDevice] | None:
     """The Vulkan devices ``executable`` (audio.cpp's Vulkan build) can see.
 
-    Never raises: any failure (no such file, a crash, a timeout, odd output) gives ``[]``.
-    The server logs on stderr and prints one JSON object on stdout; the last stdout line that
-    parses as JSON is used.
+    ``[]`` means it answered and there's no device. ``None`` means it couldn't tell: the
+    program is missing, crashed, hung past ``timeout``, printed nothing usable, or
+    ``cancelled`` said the user stopped. A card that doesn't answer isn't "no card", so callers
+    must not treat ``None`` as one. Never raises. The server logs on stderr and prints one
+    JSON object on stdout; the last stdout line that parses as JSON is used.
     """
     try:
-        done = subprocess.run(
+        process = subprocess.Popen(
             [str(executable), "--backend", "vulkan", "--list-devices", "--json"],
             stdin=subprocess.DEVNULL,
-            capture_output=True,
-            timeout=timeout,
-            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
         )
-    except (OSError, subprocess.SubprocessError, ValueError):
-        return []
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            stdout, _ = process.communicate(timeout=0.2)
+            break
+        except subprocess.TimeoutExpired:
+            if time.monotonic() >= deadline or (cancelled is not None and cancelled()):
+                process.kill()
+                process.communicate()
+                return None
+    if process.returncode != 0:
+        return None
     payload: object = None
-    for line in reversed(done.stdout.decode(errors="replace").splitlines()):
+    for line in reversed(stdout.decode(errors="replace").splitlines()):
         try:
             payload = json.loads(line)
         except ValueError:
@@ -79,12 +97,12 @@ def list_devices(executable: Path | str, timeout: float = 20) -> list[GpuDevice]
     return _parse_devices(payload)
 
 
-def _parse_devices(payload: object) -> list[GpuDevice]:
+def _parse_devices(payload: object) -> list[GpuDevice] | None:
     if not isinstance(payload, dict):
-        return []
+        return None
     entries = payload.get("devices")
     if not isinstance(entries, list):
-        return []
+        return None
     devices: list[GpuDevice] = []
     for entry in entries:
         if not isinstance(entry, dict) or entry.get("backend") != "vulkan":
