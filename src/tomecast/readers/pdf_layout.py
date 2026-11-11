@@ -30,6 +30,7 @@ document index and so on. It never reads the words. Every word comes from the PD
 
 from __future__ import annotations
 
+import statistics
 import time
 from collections import Counter
 from collections.abc import Sequence
@@ -354,8 +355,14 @@ def layout_page(
     used = [(region, group) for region, group in zip(regions, members, strict=True) if group]
 
     furniture = [(r, g) for r, g in used if r.label in _FURNITURE]
+    body_size = statistics.median(word.size for word in words) if words else 0.0
+    banded = {id(r): band for r, g in used if (band := _heading_in_band(r, g, body_size, height))}
     notes = [(r, g) for r, g in used if r.label is Label.FOOTNOTE]
-    flow = [(r, g) for r, g in used if r.label not in _FURNITURE and r.label is not Label.FOOTNOTE]
+    flow = [
+        (r, g)
+        for r, g in used
+        if r.label not in _FURNITURE and r.label is not Label.FOOTNOTE and id(r) not in banded
+    ]
     words_of = {id(region): group for region, group in used}
 
     blocks: list[_PageBlock] = []
@@ -365,6 +372,9 @@ def layout_page(
         key=lambda item: (-item[0].y1, item[0].x0),
     ):
         blocks.append(_furniture_block(region, group, page, unit))
+    for region, group in used:
+        if banded.get(id(region)) is Band.TOP:
+            blocks.append(_band_block(group, Band.TOP, page, unit))
     for column in reading_order([region for region, _ in flow]):
         unit += 1
         blocks.extend(_column_blocks(column, words_of, page, unit))
@@ -372,6 +382,9 @@ def layout_page(
         unit += 1
         blocks.extend(_column_blocks(column, words_of, page, unit))
     unit += 1
+    for region, group in used:
+        if banded.get(id(region)) is Band.BOTTOM:
+            blocks.append(_band_block(group, Band.BOTTOM, page, unit))
     for region, group in sorted(
         (item for item in furniture if item[0].label is Label.PAGE_FOOTER),
         key=lambda item: (-item[0].y1, item[0].x0),
@@ -388,6 +401,31 @@ def layout_page(
     )
     check_words(words, result)
     return result
+
+
+def _heading_in_band(
+    region: Region, words: Sequence[_Word], body_size: float, height: float
+) -> Band | None:
+    """Whether a heading box is more likely a running header or footer: one line in the top
+    or bottom fifth of the page, set no bigger than the page's usual text. (Heron sometimes
+    calls a running header a section header.) Such a line becomes a header or footer line
+    that cleanup removes only if it repeats, like the rules reader's bands, so a real heading
+    there is still read."""
+    if region.label not in (Label.SECTION_HEADER, Label.TITLE) or not words:
+        return None
+    if max(word.size for word in words) > 1.1 * body_size:
+        return None
+    if len(_group_lines(_segments(_chars(words)))) != 1:
+        return None
+    if region.y0 >= (1 - BAND_SHARE) * height:
+        return Band.TOP
+    if region.y1 <= BAND_SHARE * height:
+        return Band.BOTTOM
+    return None
+
+
+def _band_block(words: list[_Word], band: Band, page: int, unit: int) -> _PageBlock:
+    return _PageBlock(_group_lines(_segments(_chars(words))), page, unit, band=band)
 
 
 def _furniture_block(region: Region, words: list[_Word], page: int, unit: int) -> _PageBlock:

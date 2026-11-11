@@ -203,6 +203,22 @@ def test_a_header_on_one_page_only_is_left_out_only_with_the_model(tmp_path: Pat
     assert with_rules[1:] == with_boxes
 
 
+def test_a_running_header_called_a_section_header_still_goes(tmp_path: Path) -> None:
+    """Heron sometimes labels a small running header as a section header. One line in the
+    top fifth, no bigger than the text, is a header line instead: it goes once it repeats,
+    and the real (big) chapter heading stays."""
+    pages = [story_page(), story_page(), story_page()]
+    path = build_pdf(tmp_path / "story.pdf", pages)
+    as_heading = box(Label.SECTION_HEADER, *(HEADER.x0, HEADER.y0, HEADER.x1, HEADER.y1))
+    boxes = [[as_heading if b is HEADER else b for b in story_boxes()]] * 3
+
+    result = clean(read_pdf(path, layout=HeronLayout(FakeDetector(boxes))))
+
+    text = " ".join(p for c in result.book.chapters for p in (c.title, *c.paragraphs))
+    assert "MAGI" not in text
+    assert [c.title for c in result.book.chapters] == ["Chapter One"] * 3
+
+
 # --- Words no box holds, and boxes that overlap ------------------------------------------------
 
 
