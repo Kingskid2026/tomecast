@@ -1087,6 +1087,77 @@ def test_an_update_isnt_downloaded_without_permission_and_the_old_build_is_used(
     assert build_in_use(asset, tmp_path / "data") == legacy
 
 
+def _at_a_terminal(monkeypatch: pytest.MonkeyPatch, *, output_shown: bool = True) -> None:
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: output_shown)
+
+
+def _ctrl_d(prompt: object = "") -> str:
+    raise EOFError
+
+
+def _a_model() -> Asset:
+    return Asset("Kokoro voice model", "https://example.invalid/m.gguf", "0" * 64, 190_000_000, "m")
+
+
+def test_ctrl_d_at_the_download_question_is_a_no_without_a_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(audiocpp, "required_assets", lambda use_gpu: (_a_model(),))
+    _at_a_terminal(monkeypatch)
+    monkeypatch.setattr("builtins.input", _ctrl_d)
+
+    assert cli.main(["convert", str(_epub(tmp_path))]) == 1
+
+    captured = capsys.readouterr()
+    assert "tomecast: error: nothing was downloaded" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_ctrl_d_at_the_update_question_keeps_the_version_it_has(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    asset, legacy = _engine_update(tmp_path)
+    monkeypatch.setattr(audiocpp, "required_assets", lambda use_gpu: (asset,))
+    _at_a_terminal(monkeypatch)
+    monkeypatch.setattr("builtins.input", _ctrl_d)
+
+    assert cli.main(["convert", str(_epub(tmp_path))]) == 0
+
+    assert "Tomecast will keep using the version it has." in capsys.readouterr().out
+    assert build_in_use(asset, tmp_path / "data") == legacy
+
+
+def test_nothing_is_asked_when_the_output_goes_to_a_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(audiocpp, "required_assets", lambda use_gpu: (_a_model(),))
+    _at_a_terminal(monkeypatch, output_shown=False)  # `tomecast convert book.epub > log.txt`
+
+    def unseen_question(prompt: object = "") -> str:
+        raise AssertionError("the question went where nobody can see it")
+
+    monkeypatch.setattr("builtins.input", unseen_question)
+
+    assert cli.main(["convert", str(_epub(tmp_path))]) == 1
+
+    assert "--yes" in capsys.readouterr().err
+
+
+def test_waiting_for_another_tomecast_says_so(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "data"
+    root.mkdir()
+    other = (root / ".install.lock").open("w")  # another Tomecast is installing
+    fcntl.flock(other, fcntl.LOCK_EX)
+    threading.Timer(0.6, other.close).start()
+
+    assert cli.main(["convert", str(_epub(tmp_path))]) == 0
+
+    assert "Waiting for another Tomecast to finish installing" in capsys.readouterr().out
+
+
 def test_an_update_that_fails_its_check_is_reported_and_the_old_build_kept(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
