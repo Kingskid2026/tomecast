@@ -16,10 +16,10 @@ All numbers measured on this laptop with **4 CPU threads, no graphics card**, on
 
 | Option | Licence | Download | CPU speed (wall / 4 cores) | Peak memory | Skips caught / false alarms | Packaging |
 |---|---|---|---|---|---|---|
-| **audio.cpp + Moonshine Streaming Tiny Q8_0** | audio.cpp MIT; model MIT | **60 MB** | **30.6× / 40.9×** | **189 MB** | **86/86 · 2/290** | One GGUF from `audio-cpp/audio.cpp-gguf`, pinned by revision and SHA-256 like Kokoro and Ming. Same `audiocpp_server` (`moonshine_asr` family) |
-| audio.cpp + Moonshine Streaming Small Q8_0 | MIT; MIT | 301 MB | 7.7× / 9.7× | 430 MB | 86/86 · 0/290 | Same |
-| audio.cpp + Canary 180M Flash Q8_0 | MIT; CC-BY-4.0 | 249 MB | 4.1× / 5.9× | 467 MB | 83/86 · 0/290 | Same |
-| audio.cpp + Parakeet TDT 0.6B v3 Q8_0 (what the Ming tests used) | MIT; CC-BY-4.0 | 916 MB | 4.1× / 5.9× | 2.98 GB | 86/86 · 1/290 | Same |
+| **audio.cpp + Moonshine Streaming Tiny Q8_0** | audio.cpp Apache-2.0; model MIT | **60 MB** | **30.6× / 40.9×** | **189 MB** | **86/86 · 2/290** | One GGUF from `audio-cpp/audio.cpp-gguf`, pinned by revision and SHA-256 like Kokoro and Ming. Same `audiocpp_server` (`moonshine_asr` family) |
+| audio.cpp + Moonshine Streaming Small Q8_0 | Apache-2.0; MIT | 301 MB | 7.7× / 9.7× | 430 MB | 86/86 · 0/290 | Same |
+| audio.cpp + Canary 180M Flash Q8_0 | Apache-2.0; CC-BY-4.0 | 249 MB | 4.1× / 5.9× | 467 MB | 83/86 · 0/290 | Same |
+| audio.cpp + Parakeet TDT 0.6B v3 Q8_0 (what the Ming tests used) | Apache-2.0; CC-BY-4.0 | 916 MB | 4.1× / 5.9× | 2.98 GB | 86/86 · 1/290 | Same |
 | whisper.cpp v1.9.5 + Whisper base.en Q8_0 | MIT; MIT | 82 MB model + a second engine | 1.4× / 2.6× | – | 3/3 · 0/57 (60 chunks) | A second C++ engine: no official Linux binaries, so Tomecast would have to build, pin and self-check it like audio.cpp (#27) |
 | sherpa-onnx 2.0.1 + Parakeet TDT 0.6B v3 int8 | Apache-2.0; CC-BY-4.0 | 671 MB model + 4 MB wheel + `sherpa-onnx-core` (43 MB installed) | 4.4× (60 chunks) / – | 1.25 GB | 3/3 · 0/57 (60 chunks) | A PyPI dependency (wheels for Linux, Windows and macOS) plus four ONNX files pinned by SHA-256. Same model as audio.cpp's Parakeet at the same speed, in a second runtime |
 
@@ -32,13 +32,15 @@ Notes:
 
 ## Comparing the words
 
-`compare(expected_text, heard_text, prepare_heard=...)` in `spoken_check.py`:
+`compare(expected_text, heard_text, prepare_heard=..., respellings=...)` in `spoken_check.py`:
 
-1. **Normalise both sides the same way** (`spoken_words`): lowercase, accents removed (*Namárië* = *namarie*), apostrophes dropped (*Alice's* = *alices*, *o'clock* = *oclock*), and hyphens, dashes and slashes split words (*daisy-chain* = *daisy chain*).
-2. **Numbers.** The chunk's text has already been through text prep, so its numbers are words. Recognisers write digits ("1865", "$5.50", "Dr."), so the transcript goes through **the same text prep** (`TextPrep.for_language(lang).body`) before comparing. "1865" then becomes "eighteen sixty-five", exactly what the voice was given.
-3. **Align** with a minimum-edit (Levenshtein) table over words, not difflib's longest-block heuristic, so a skip that jumps between two copies of a repeated word is still lined up. Two words match when they're equal, or (both four letters or more, of similar length) at least 75% alike: *Lothlorien* and *Lothlorian*.
-4. **Gaps.** Every run of the chunk's words that didn't match is a gap, with what was heard in its place. A gap's **lost words are net**: expected words minus heard words, and zero when the letters of the two sides match (*daisy chain* heard as *daisychain*, *down stairs* as *downstairs*). So a misheard name (one word heard as one other word) loses nothing, while *to her that she ought* heard as nothing loses five.
-5. **Names and respellings.** A name the user respelled in the Names step is sent to the voice as the respelling (*noo zee-lund*) but written by the recogniser as the name (*New Zealand*). `compare(..., respellings=...)` takes the spoken sides of the book's pronunciation lists, and those words never count as lost.
+1. **Normalise both sides the same way** (`spoken_words`): lowercase, accents removed (*Namárië* = *namarie*), *ß*, *æ*, *ø* and friends spelled out, apostrophes dropped (*Alice's* = *alices*), and hyphens, dashes and slashes split words (*daisy-chain* = *daisy chain*). Dotted initialisms are one word (*U.S.A.* = *USA*, *p.m.* = *pm*).
+2. **Numbers and abbreviations.** The chunk's text has already been through text prep, so its numbers are words. Recognisers write digits ("1865", "$5.50"), so the transcript goes through **the same text prep** (`TextPrep.for_language(lang).body`) first. That isn't enough on its own, because recognisers also write forms text prep never sees ("315 pm", "3.15 PM", "E.g.", "kilograms" for "kg"). So both sides then get the same short forms (*pee em*, *p.m.* and *PM* are all *pm*; *for example* and *e.g.* are *eg*; *Doctor* and *Dr* are *dr*; units), and a gap where **both sides are only numbers** is the same number written another way (*three fifteen* and *three hundred fifteen*, *two point five* and *two and a half*). A number with words missing (*nineteen sixty-five* heard as *nineteen*) still fails, because nothing was heard in their place. Money said in full but written short by the recogniser (*five dollars and fifty cents* as *five fifty*) would still be a false alarm.
+3. **Align** with a minimum-edit (Levenshtein) table over words, not difflib's longest-block heuristic. Walking back from the end it keeps matches with the later copy of a repeated word, so a skip that jumps between two copies is reported where the jump began. Two words match when they're equal, or (both four letters or more, of similar length) at least 75% alike: *Lothlorien* and *Lothlorian*.
+4. **Gaps.** Every run of the chunk's words that didn't match is a gap, with what was heard in its place. A gap's **lost words are net**: expected words minus heard words. A gap loses nothing when it is only a **join or split** of the same letters (*daisy chain* heard as *daisychain*, *down stairs* as *downstairs*, at most one letter in ten different), or numbers on both sides. The join check is tight on purpose: *downstairs as I* heard as *down stairs* is two missing words, not a join. A misheard name (one word heard as one other word) loses nothing; *to her that she ought* heard as nothing loses five.
+5. **Names and respellings.** A name the user respelled in the Names step is sent to the voice as the respelling (*noo zee-lund*) but written by the recogniser as the name (*New Zealand*). `respellings` takes the spoken sides of the book's pronunciation lists: those words count as heard when **anything** was heard in their place, and are lost in full when nothing was.
+6. **Sentences.** The chunk's text is split into sentences (the chunker's own `split_sentences`). A sentence none of whose words was heard, with nothing that sounds like it in its place, is a **missing sentence**, however short (*Stop!*, a final *Never.*). *Yes.* heard as *Yeah.* is misheard, not missing.
+7. **Other scripts.** Only Latin-script words can be compared. A word in another script inside English text (*λόγος*) must be heard as *something*. Text where such words aren't outnumbered by Latin ones (Russian, Chinese, Greek, Hindi…) raises `UncheckableTextError` before anything is voiced: the check refuses rather than passing by default.
 
 Words the recogniser heard that weren't written (a repeated "oh dear", a filler) never count.
 
@@ -46,8 +48,10 @@ Words the recogniser heard that weren't written (a repeated "oh dear", a filler)
 
 `SkipRule` (defaults): a chunk has skipped words when
 
+- **nothing at all was heard** (always, whatever the settings), or
+- a **whole sentence** wasn't heard, however short, or
 - one gap **lost 2 or more words**, or
-- the chunk lost **3 or more words** in all (single words adding up), or
+- the chunk lost **3 or more words** in all (single words adding up, **across all the pieces of a split chunk**), or
 - **2 or more written words in a row were heard as something else entirely** (Ming slurring *sitting by her* into *Sidemiver's*: Moonshine heard three other words, so nothing is "lost" by count, but the words weren't said).
 
 A single missing word is not enough on its own. Recognisers drop or merge short words now and then (*I shall* heard as *she'll*), and Kokoro, which doesn't skip, shows exactly that noise. Ming's real skips are bigger: of the 86 below, 5 lost 2 words, 14 lost 3, 40 lost 4, 24 lost 5, 2 lost 6 and 1 lost 11. So there is a clear gap between the two.
@@ -73,6 +77,8 @@ The disagreements, read by hand:
 - *"…falling down a very deep well"* (US_James, guidance 4): Moonshine Tiny alone heard *out of* for *down a*. A real false alarm; it costs one regenerate.
 - *"…sitting by her sister…"* (US_James, three settings): Ming slurred it (Parakeet *Sidemiver's*, Moonshine *Sid and Myver's*), and Canary, whose decoder writes the most likely English, heard *sitting by her sister* or lost only single words. Canary's three misses.
 
+**What the measurement doesn't cover.** These chunks are all from *Alice* chapter I: almost no numbers, times, money or abbreviations, one one-word sentence, and few names. The rules for those (numbers, short forms, missing sentences, respellings, other scripts) were added after review and are covered by unit tests only; re-scoring the same 376 transcripts with them gave exactly the results above. Before Ming ships, a few chapters with dialogue, numbers and invented names should be voiced and scored the same way. A known false-alarm risk: a two-word name the recogniser always writes as two other words (*Minas Tirith* as *Meena's tears*) fails every retry. Adding the name to the pronunciation list fixes it, and so would the Kokoro fallback below.
+
 On the same chunks the old scoring script (`score.py`, net dropped words ≥ 2 from difflib) found the same 86, plus one false alarm on Kokoro (*I shall* heard as *she'll* and *down stairs* as *downstairs*), which the letter check here removes.
 
 ## Regenerating, and failing loudly
@@ -91,15 +97,20 @@ Skips depend on the text, so a new seed rarely helps, while the same words cut i
 
 1. Voice the chunk and check it. Most chunks stop here.
 2. **One new seed** (`RetryPlan.reseeds = 1`) for the whole chunk, which keeps the sentence's rhythm in one piece.
-3. **Split at 80 characters** with `chunking.split_long` (the same splitter as chunking: commas and semicolons first, and no text can be lost), and check each piece on its own, each with its own seed and one reseed.
+3. **Split at 80 characters** with `chunking.split_long` (the same splitter as chunking: commas and semicolons first, and no text can be lost), and check each piece on its own, each with its own seed and one reseed. Words lost by earlier pieces count against later ones (`SkipRule.skipped(..., already_lost=...)`), so a split chunk can't lose more in all than the whole chunk could.
 4. A piece that still fails is **split again at 40 characters**.
-5. If a piece at the smallest size still loses words, raise **`WordsSkippedError`**, naming the chunk ID, the missing words and the text. The conversion stops, as with any other gap: no audio missing words is ever kept.
+5. If a piece at the smallest size still loses words, it's **unfixable**: `speak_checked` builds a **`WordsSkippedError`** (the chunk ID, the failing text, the missing words, and how many times those words were voiced) and hands it to its `on_unfixable` strategy.
 
-Each attempt gets a new seed (never one already tried). The pieces come back in reading order, for the existing join step to concatenate with its short gaps, and the chunk's file gets its final name only after all of it has passed, so resume keeps working.
+No seed is used twice for one chunk, and seeds stay in a signed 32-bit range. The pieces come back in reading order, for the existing join step to concatenate with its short gaps, and the chunk's file gets its final name only after all of it has passed, so resume keeps working.
 
 Seed first or split first is a maintainer's call. A reseed fixes 1 in 4 and keeps the chunk whole; going straight to 80 characters fixes 11 in 12 and saves about one synthesis per failing chunk (about 6% of Ming's time on a book where 10% of chunks fail). The default keeps the reseed; `RetryPlan(reseeds=0)` is the other choice.
 
-**Open decision: what to do after the last retry.** Stopping is what AGENTS.md asks for, and is the default. Two softer options for later, both visible to the user, never silent: voice that one chunk with Kokoro and say so on the done screen, or show the chunk in the window to accept or edit. A chunk the recogniser can never hear right (an invented word heard as nothing) would otherwise stop a whole book.
+**When nothing fixes it** (`on_unfixable`, a decision pending with Ambrose):
+
+- **`stop`, the default:** raise the error and stop the conversion. That's what AGENTS.md asks for. `WordsSkippedError` is a `MissingAudioError`, so the command line and the window already handle it like any chunk without usable audio: the message, and "the audio made so far is kept".
+- **`UseOtherVoice(kokoro_synthesize, voice="Kokoro")`:** voice the whole chunk with Kokoro, so the voice changes only at a sentence boundary, and set `CheckedChunk.fallback` so the caller tells the user ("Kokoro read 2 sentences Ming kept skipping"). That matches the "carry on with Kokoro" choice already made for graphics-card failures. With `listener=...` Kokoro's audio is checked too, and the original error is raised if that also fails (for example a name the recogniser can never hear right).
+
+Switching is one line: the `on_unfixable=` argument where `speak_checked` is called.
 
 ## What it costs per book
 
@@ -130,12 +141,15 @@ Not done in this pull request. What it takes:
 - **In the voice loop,** for voices that need it (Ming; Kokoro doesn't), call `speak_checked` with a `Listener(transcriber, prepare_heard=TextPrep.for_language(lang).body, respellings=<spoken sides of the book's lists>)`. Join split pieces with the existing join step. Transcribe chunk *n* while Ming voices chunk *n + 1*, so the check stays off the critical path.
 - **The self-check** (`VoiceCheck` for Ming) should also run the recogniser once, so a broken ASR model is caught before a book starts and not by a book that "skips" every chunk.
 - **Language.** Moonshine Streaming is English-only. Ming speaks English and Chinese; for other languages, Parakeet TDT 0.6B v3 (25 European languages, same server) is the fallback, at its larger size.
-- **`WordsSkippedError`** stops the conversion with its message, on the command line and in the window, like the other "no usable audio" errors.
+- **Errors.** `WordsSkippedError` subclasses `convert.MissingAudioError`, so `cli.py` and `gui/worker.py` handle it today with no change: the message, and the audio so far is kept. Note that their `MissingAudioError` handling also rolls back a just-switched engine build; that's right if a new build starts skipping, but worth a look when wiring. Call it from the conversion loop, not inside an engine's `synthesize()`, or `_voice_chunk`'s own retry would swallow it and run the whole plan again. Check `uncheckable()` on the book's text before starting a Ming conversion, so a book in another script is refused at the start, not at its first chunk.
+- **Seeds per request.** `Synthesize` takes a seed per call, but today's engines fix the seed when they're built (and the work folder's key includes it). Reseeding needs a per-request seed in the engine interface.
+- **The other places text is voiced** only use `audio_problem`: the window's preview and the Names step's listen button, the command line's equivalent, and the engine's own split-and-join for over-long chunks. Decide whether Ming previews are checked too; otherwise a preview can play a skip the conversion would have regenerated.
+- **Cancel** is checked between chunks, so it waits for one chunk's whole retry plan (at most a few syntheses). Fine on a graphics card; consider checking it between attempts.
 
 ## How it was measured
 
 - **Audio:** 376 chunks already on disk from the Ming tests of 8 and 10 November (`ming-test/runs/`): the drop scan (24 chunks × 4 Ming voices × seeds 42 and 7, plus the same 24 chunks from Kokoro af_heart as a control), 60 fresh chunks at the default settings, and the 100 chunks of the mitigation test. 43 minutes of audio, from *Alice's Adventures in Wonderland* (public domain), each chunk at most 200 characters after Tomecast's text prep.
 - **Engines:** audio.cpp v0.9.4's official CPU build (the families above), whisper.cpp v1.9.5 built here for the CPU, sherpa-onnx 2.0.1 from PyPI. All with **4 threads, CPU only**: no graphics card was used.
 - **Load:** other jobs kept this laptop (16 threads, 31 GB) at a load average of 20–50, with memory full and swapping. So "wall" speeds are pessimistic, and "4 cores" (audio time ÷ the engine's own CPU time ÷ 4) is what the engine does with four free cores.
-- **Labels:** nobody has listened to these 376 chunks. A chunk counts as a real skip when most of the four strongest recognisers (Parakeet, Canary, Moonshine Small, Whisper base) flag it under the rule above, and every disagreement was read by hand (transcripts below). Each engine is then scored against those labels, so the numbers say how well an engine agrees with the consensus, not with a human ear.
+- **Labels:** nobody has listened to these 376 chunks. A chunk counts as a real skip when at least two of three recognisers that heard all of them (Parakeet, Canary, Moonshine Small) flag it under the rule above, and every disagreement was read by hand (the transcripts are quoted under "Measured accuracy"). Each engine is then scored against those labels, so the numbers say how well an engine agrees with the consensus, not with a human ear.
 - **Not committed:** the scripts and transcripts live outside the repo with the other Ming test files; no audio or model files are in the repo.
