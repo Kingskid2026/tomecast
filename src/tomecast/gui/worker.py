@@ -754,7 +754,7 @@ class ConversionWorker(QObject):
             again after that."""
             self.noticed.emit(job.job, engine.warning or "", engine.threads)
             if engine.gpu_description:
-                self.deviceChosen.emit(engine.gpu_description)
+                self.deviceChosen.emit(engine.gpu_description, job.use_gpu)
 
         # Which chapter the book is in, so a takeover's note says which are premium.
         position = ming.BookPosition(chunks)
