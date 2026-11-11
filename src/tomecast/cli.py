@@ -72,7 +72,7 @@ from tomecast.machine import (
 )
 from tomecast.manifest import ASSETS
 from tomecast.names import DEFAULT_MIN_COUNT, find_book_names
-from tomecast.packaging import PackagingError
+from tomecast.packaging import PackagingError, stretch_wav
 from tomecast.playback import PLAYERS, find_player, play
 from tomecast.readers import FORMATS, InvalidEbookError, read_book
 from tomecast.speed import (
@@ -799,6 +799,12 @@ def _preview(args: argparse.Namespace) -> int:
                 notes.say(sys.stderr)  # the card ran out of memory partway
             if problem := audio_problem(wav, spoken):
                 raise CliError(f"the voice made no usable audio: {problem}")
+            # Above 1.5x the voice speaks at 1.5x and the rest is a time-stretch, which the
+            # book gets when it's packaged: the preview gets it too, so it sounds the same.
+            if engine.tempo != 1.0:
+                stretched = Path(folder) / "stretched.wav"
+                stretch_wav(wav, stretched, engine.tempo)
+                wav = stretched
             if output is not None:
                 shutil.copyfile(wav, output)
                 print(f"Saved {output}")
@@ -949,28 +955,42 @@ def _download_printer(asset: Asset, number: int, count: int) -> ProgressCallback
 
 
 class _ProgressPrinter:
-    """Shows conversion progress on one updating line (or occasional lines in logs)."""
+    """Shows conversion progress on one updating line (or occasional lines in logs).
+
+    The time left is measured on the pieces voiced in this run, from the time between
+    reports: the engine's start and the speed test (before the first report) don't count,
+    and neither do pieces an earlier run made (reused in a moment, on a resumed book)."""
 
     def __init__(self, stream: TextIO) -> None:
         self._stream = stream
         self._interactive = stream.isatty()
-        self._started = time.monotonic()
-        self._counted_from = 0  # the time left is measured from this piece on
+        self._last: float | None = None  # when the last report came
+        self._done = self._reused = 0  # as of the last report
+        self._voiced = 0  # pieces voiced since the time left was last measured from scratch
+        self._voicing = 0.0  # the seconds they took
         self._last_percent = -1
         self._shown = False
 
     def restart(self, done: int) -> None:
-        """Measure the time left again from here (the engine moved to the CPU)."""
-        self._started = time.monotonic()
-        self._counted_from = done
+        """Measure the time left again from the next piece on (the engine moved to the
+        CPU while voicing piece ``done``, so the card's speed and that piece don't count)."""
+        self._last = time.monotonic()
+        self._done = done
+        self._voiced = 0
+        self._voicing = 0.0
 
     def update(self, progress: ConversionProgress) -> None:
-        measured = progress.chunks_done - self._counted_from
-        if measured <= 0 or progress.stage == "packaging":
+        now = time.monotonic()
+        finished = progress.chunks_done - self._done
+        voiced = finished - (progress.chunks_reused - self._reused)
+        if self._last is not None and voiced > 0:
+            self._voiced += voiced
+            self._voicing += now - self._last
+        self._last, self._done, self._reused = now, progress.chunks_done, progress.chunks_reused
+        if self._voiced <= 0 or progress.stage == "packaging":
             return
         percent = 100 * progress.chunks_done // max(1, progress.chunks_total)
-        elapsed = time.monotonic() - self._started
-        remaining = elapsed / measured * (progress.chunks_total - progress.chunks_done)
+        remaining = self._voicing / self._voiced * (progress.chunks_total - progress.chunks_done)
         line = (
             f"Chapter {progress.chapter_index + 1}/{progress.chapter_count} · "
             f"{progress.chunks_done:,}/{progress.chunks_total:,} pieces · {percent}% · "

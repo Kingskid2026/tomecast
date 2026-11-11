@@ -314,6 +314,24 @@ def test_an_interrupted_conversion_resumes_without_redoing_work(tmp_path: Path) 
     assert spoken == source  # together, the two runs voiced every character exactly once
 
 
+def test_progress_says_how_many_pieces_an_earlier_run_had_made(tmp_path: Path) -> None:
+    book = _book()
+    workdir = tmp_path / "work"
+    with pytest.raises(MissingAudioError, match="interrupted"):
+        convert_book(book, CountingEngine(limit=3), tmp_path / "b.m4b", workdir=workdir, retries=0)
+    seen: list[ConversionProgress] = []
+
+    engine = CountingEngine()
+    result = convert_book(book, engine, tmp_path / "b.m4b", workdir=workdir, progress=seen.append)
+
+    # Reused pieces take no voicing time, so whoever measures the speed must leave them out.
+    voicing = [p for p in seen if p.stage == "voicing"]
+    assert [p.chunks_reused for p in voicing[:5]] == [0, 1, 2, 3, 3]
+    assert all(p.chunks_reused == 3 for p in seen[4:])
+    assert voicing[-1].chunks_done - voicing[-1].chunks_reused == len(engine.texts)
+    assert result.reused_chunks == 3
+
+
 @pytest.mark.parametrize("damage", ["emptied", "cut short", "odd length"])
 @pytest.mark.parametrize("which", ["spoken", "scene break"])
 def test_a_chunk_damaged_on_disk_is_voiced_again_on_resume(

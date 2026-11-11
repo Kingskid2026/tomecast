@@ -20,6 +20,8 @@ from machine_factory import ON_BATTERY, PLUGGED_IN, pin_machine
 from pdf_factory import PageBuilder, build_pdf
 
 from tomecast import __version__, cli, machine
+from tomecast.audio import wav_info
+from tomecast.convert import ConversionProgress
 from tomecast.downloads import UPDATE_FAILED_NOTE, Asset, build_in_use, failure, roll_back
 from tomecast.engines import audiocpp
 from tomecast.engines.audiocpp import EngineError
@@ -48,6 +50,7 @@ class FakeKokoro:
         self, root: Path, *, voice: str, speed: float, use_gpu: bool = False, **kwargs: object
     ) -> None:
         self.kwargs = kwargs  # builds=..., as prepare() chose them
+        self.speed = speed
         self.label = f"Fake ({voice})"
         self.max_chars = 200
         self.sample_rate = 24000
@@ -58,6 +61,14 @@ class FakeKokoro:
         self.gpu_description = ""
         self.calls = 0
         FakeKokoro.made.append(self)
+
+    @property
+    def voice_speed(self) -> float:  # as KokoroServer: the voice speaks at most 1.5x...
+        return audiocpp.split_speed(self.speed)[0]
+
+    @property
+    def tempo(self) -> float:  # ...and the rest is a time-stretch, left to whoever plays it
+        return audiocpp.split_speed(self.speed)[1]
 
     def __enter__(self) -> "FakeKokoro":
         if self.use_gpu and FakeKokoro.gpu_warning:
@@ -90,7 +101,7 @@ class FakeKokoro:
         FakeKokoro.texts.append(text)
         if self.use_gpu and not self.fell_back:
             FakeKokoro.on_card.append(text)
-        frames = round(len(text) / 15 * 24000)
+        frames = round(len(text) / 15 * 24000 / self.voice_speed)
         samples = array.array("h", (round(8000 * math.sin(i / 8)) for i in range(frames)))
         with wave.open(str(output), "wb") as wav:
             wav.setnchannels(1)
@@ -670,6 +681,22 @@ def test_preview_passes_the_voice_and_speed_to_the_engine(
     assert seen == {"voice": "bm_george", "speed": 1.25}
 
 
+def test_preview_is_time_stretched_above_the_voices_own_top_speed_like_the_book(
+    tmp_path: Path, played: list[Path]
+) -> None:
+    text = "Galadriel went down to the river"
+    seconds: dict[str, float] = {}
+    for speed in ("1.0", "1.5", "2.0", "3.0"):
+        out = tmp_path / f"{speed}.wav"
+        assert cli.main(["preview", text, "--speed", speed, "-o", str(out)]) == 0
+        seconds[speed] = wav_info(out).seconds
+
+    # The voice speaks at most 1.5x; the rest is the time-stretch the book gets when packaged.
+    for speed in ("1.5", "2.0", "3.0"):
+        assert seconds[speed] == pytest.approx(seconds["1.0"] / float(speed), rel=0.05)
+    assert FakeKokoro.texts == [text] * 4  # every word, every time
+
+
 def test_preview_uses_the_graphics_card_when_there_is_one(
     played: list[Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -863,6 +890,73 @@ def test_the_estimate_line_rounds_like_the_window() -> None:
     assert cli._rough_minutes(0.4) == "under 1 min"
     assert cli._rough_minutes(9.5) == "about 10 min"
     assert cli._rough_minutes(167) == "about 2 h 47 min"
+
+
+class _Clock:
+    """Stands in for the ``time`` module in ``cli``: the test moves the time on."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+class _Terminal(io.StringIO):
+    def isatty(self) -> bool:
+        return True
+
+
+def _time_left(terminal: _Terminal) -> str:
+    """The progress line as it reads now: ``"… · about 4m 10s left"`` -> ``"4m 10s"``."""
+    line = terminal.getvalue().split("\r")[-1].removesuffix("\033[K")
+    return line.rsplit("about ", 1)[1].removesuffix(" left")
+
+
+def _piece(done: int, reused: int = 0, total: int = 2000) -> ConversionProgress:
+    return ConversionProgress(done, total, 0, 1, chunks_reused=reused)
+
+
+def test_time_left_on_a_resumed_book_counts_only_the_pieces_voiced_in_this_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _Clock()
+    monkeypatch.setattr(cli, "time", clock)
+    terminal = _Terminal()
+    progress = cli._ProgressPrinter(terminal)
+    clock.now += 10  # the engine starts and the speed test runs: not voicing
+    progress.update(_piece(0))  # convert_book's first report
+    for done in range(1, 1801):  # the last run made these: reused, no voicing
+        clock.now += 0.01
+        progress.update(_piece(done, reused=done))
+    assert terminal.getvalue() == ""  # nothing measured yet, so no time left to show
+
+    for done in range(1801, 1901):  # 100 pieces voiced now, 2.5 s each
+        clock.now += 2.5
+        progress.update(_piece(done, reused=1800))
+
+    assert _time_left(terminal) == "4m 10s"  # the 100 pieces left, at 2.5 s each
+
+
+def test_time_left_is_measured_again_after_the_move_to_the_cpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _Clock()
+    monkeypatch.setattr(cli, "time", clock)
+    terminal = _Terminal()
+    progress = cli._ProgressPrinter(terminal)
+    progress.update(_piece(0, total=100))
+    for done in range(1, 11):  # on the card, 1 s each
+        clock.now += 1
+        progress.update(_piece(done, total=100))
+    clock.now += 30  # the card ran out of memory: the CPU engine starts, then voices the piece
+    progress.restart(11)
+    progress.update(_piece(11, total=100))
+    for done in range(12, 15):  # on the CPU, 5 s each
+        clock.now += 5
+        progress.update(_piece(done, total=100))
+
+    assert _time_left(terminal) == "7m 10s"  # the 86 pieces left, at the CPU's 5 s each
 
 
 def test_an_update_isnt_downloaded_without_permission_and_the_old_build_is_used(
