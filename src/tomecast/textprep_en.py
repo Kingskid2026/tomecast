@@ -13,6 +13,8 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 
+from tomecast.chunking import ABBREVIATIONS
+
 # --- Number words ---------------------------------------------------------------------------
 
 _ONES = (
@@ -127,6 +129,9 @@ def roman_value(numeral: str) -> int:
 
 _CLOSERS = "\"')]\u201d\u2019»"
 _OPENERS = "\"'([\u201c\u2018«"
+# Put where a sentence starts while the rules run (see _mark_sentence_starts), and taken out
+# at the end. It's a private-use character, so it can't be mistaken for the book's text.
+_MARK = "\ue000"
 _NUMBER = r"\d{1,3}(?:,\d{3})+(?!\d)|\d+"
 # A letter, a currency sign, a slash or "1." directly before a number means it isn't a
 # free-standing one (it is part of a word, a price, a fraction or a decimal).
@@ -214,10 +219,66 @@ _MONTH_FIRST = re.compile(
 _MONTH_YEAR = re.compile(
     rf"\b(?P<month>{_MONTH_FULL}|(?:{_MONTH_SHORT})\b\.?)\s+(?P<year>\d{{4}})\b"
 )
+# Days listed before the last one: "2nd, 3rd and 4th May", "2 or 3 May", "3-4 May". At most
+# six, so a long run of small numbers (an index, a table) costs the same at every number.
+_LISTED_DAY = r"\d{1,2}(?:st|nd|rd|th)?"
+_DAY_SEPARATOR = r"\s*,\s*(?:(?:and|or|&)\s+)?|\s+(?:and|or|&)\s+|\s?[-\u2013]\s?"
 _DAY_FIRST = re.compile(
-    rf"{_NOT_AFTER}(?P<day>\d{{1,2}})(?:st|nd|rd|th)?(?:\s+of)?\s+"
+    rf"{_NOT_AFTER}(?P<days>(?:{_LISTED_DAY}(?:{_DAY_SEPARATOR})){{0,6}})"
+    rf"(?P<day>\d{{1,2}})(?P<suffix>st|nd|rd|th)?(?:\s+of)?\s+"
     rf"(?P<month>{_MONTH_FULL}|(?:{_MONTH_SHORT})\.)(?:,?\s+(?P<year>\d{{4}})\b(?![,.]\d))?"
 )
+_DAY_LIST_ITEM = re.compile(r"(\d{1,2}(?:st|nd|rd|th)?)")
+_DASHES = ("-", "\u2013")
+# Words that already give "21 May" its article. Only words that can't be anything else right
+# before a date count: "that" ("he said that 21 May was fine"), "her" ("I told her 21 May")
+# and "last" in "at last" are often something else, so those dates get their "the" as usual.
+_DATE_DETERMINERS = frozenset(
+    "the every each this next last same my your his our their its".split()
+)
+_WORDS_BEFORE = re.compile(r"(?:\b(?P<previous>[^\W\d_]+)\s+)?\b(?P<word>[^\W\d_]+)\s+$")
+
+
+def _has_determiner(text: str, start: int) -> bool:
+    """True if the word right before ``start`` already gives a date its article."""
+    found = _WORDS_BEFORE.search(text, max(0, start - 40), start)
+    if found is None:
+        return False
+    word, previous = found["word"].lower(), (found["previous"] or "").lower()
+    if word not in _DATE_DETERMINERS:
+        return False
+    return not (word == "last" and previous in {"at", "long"})
+
+
+def _spoken_day_list(days: str, last: int, last_suffixed: bool) -> str | None:
+    """The days listed before the last one, said as ordinals: ``"2nd and "`` -> ``"second and
+    "``, ``"3-"`` -> ``"third to "``. ``None`` if they aren't a list of days, as in "of the
+    12, 4 May have gone"."""
+    if not days:
+        return ""
+    parts = _DAY_LIST_ITEM.split(days)
+    items, separators = parts[1::2], parts[2::2]
+    numbers = [int(item.rstrip("stndrh")) for item in items]
+    if not all(_valid_day(number) for number in numbers):
+        return None
+    dashed = [separator.strip() in _DASHES for separator in separators]
+    if any(dashed):
+        if len(items) != 1 or numbers[0] >= last:
+            return None  # a range is two days, the first one earlier: "3-4 May"
+    else:
+        suffixed = [not item.isdigit() for item in items] + [last_suffixed]
+        joined = any(
+            word in {"and", "or", "&"}
+            for separator in separators
+            for word in separator.replace(",", " ").split()
+        )
+        # "2nd, 3rd May" and "2 and 3 May" are lists; "12, 4 May" is a count and a date.
+        if not (all(suffixed) or (joined and not any(suffixed))):
+            return None
+    spoken = []
+    for number, separator, dash in zip(numbers, separators, dashed, strict=True):
+        spoken.append(ordinal(number) + (" to " if dash else separator))
+    return "".join(spoken)
 
 
 def _iso_dates(text: str) -> str:
@@ -247,9 +308,17 @@ def _dates(text: str) -> str:
         day = int(match["day"])
         if not _valid_day(day):
             return match.group(0)
+        kept, start = "", match.start()
+        listed = _spoken_day_list(match["days"], day, bool(match["suffix"]))
+        if listed is None:  # only the last day is part of the date
+            kept, listed, start = match["days"], "", match.start("day")
         month = MONTHS[_month_number(match["month"]) - 1]
-        spoken = f"the {ordinal(day)} of {month}"
-        return spoken + (f", {_year_text(match['year'])}" if match["year"] else "")
+        spoken = f"{listed}{ordinal(day)} of {month}"
+        # "21 May" and "21st of May" are said "the twenty-first of May", but "the 21 May"
+        # and "every 4th of July" already have their article.
+        if not _has_determiner(match.string, start):
+            spoken = "the " + spoken
+        return kept + spoken + (f", {_year_text(match['year'])}" if match["year"] else "")
 
     text = _DAY_FIRST.sub(day_first, text)
     text = _MONTH_FIRST.sub(month_first, text)
@@ -750,6 +819,84 @@ def _numbers(text: str) -> str:
     return _PLAIN_NUMBER.sub(replace, text)
 
 
+# --- Sentence starts ------------------------------------------------------------------------
+
+# The chunker only ends a sentence before a word that doesn't start in lowercase, so "He
+# left. 5 men came." must become "He left. Five men came.", not "...left. five men came.",
+# or the two sentences run together. Sentence starts are found once, on the text as written,
+# and marked; after all the rules have run, a lowercase letter right after a mark (always
+# one the rules wrote: "five", "minus", "number", "the") is made a capital.
+#
+# Only a clear sentence end counts: "!" or "?", or a period after an ordinary lowercase word.
+# Anything else ("Rom. 8:28", "On Fri. 5 May", "the U.S. $5 billion", "vv. 3-5", "at 3 a.m.
+# 5 men", "He counted... 3", '"Stop!" 5 men cried') keeps the number in lowercase, so the
+# sentence stays whole, as it always was.
+
+# A run of marks is matched from its first mark only, so a long run costs the same as a short.
+_SENTENCE_END = re.compile(
+    rf"(?<![.!?\u2026])(?P<marks>[.!?\u2026]+)(?P<closers>[{re.escape(_CLOSERS)}]*)\s+"
+)
+# Signs that may come before the number a sentence starts with: "-5", "$5", "~5", "'70s".
+_SIGNS = "-\u2212+~\u00b1\u2248$£€¥#§\u2019"
+# Lowercase abbreviations that look like ordinary words (besides chunking.ABBREVIATIONS):
+# references, units and grammar terms.
+_NOT_SENTENCE_ENDS = frozenset(
+    (
+        "art arts sec secs sect sects para paras cap caps ver vers ref refs fol fols ibid cit "
+        "loc seq ser suppl supp app illus esp incl misc viz circ abt inst ult prox orig repr "
+        "trans lit abbr adj adv pron fem masc neut plur obs def min mins gal gals doz deg degs "
+        "lat bce"
+    ).split()
+)
+# At least three lowercase letters with a vowel ("y" counts after the first letter): "left",
+# "fly", "gym". Not "Rom", "vv", "lbs", "yds".
+_ORDINARY_WORD = re.compile(r"(?=[a-z]{3})(?:[a-z]*[aeiou][a-z]*|[a-z]+y[a-z]*)")
+_LOWERCASE_ROMAN = re.compile(ROMAN_PATTERN.lower())  # "iii.", "xiv."
+_MARKED = re.compile(rf"{_MARK}([^\w\s{_MARK}]*)([a-z]?)")
+
+
+def _clearly_ends_sentence(text: str, match: re.Match[str]) -> bool:
+    """True if the ``.``, ``!`` or ``?`` of ``match`` (from :data:`_SENTENCE_END`) ends a
+    sentence for sure."""
+    marks = match["marks"]
+    if set(marks) <= set("!?"):
+        return not match["closers"]  # '"Stop!" 5 men cried.' is one sentence
+    if marks != ".":
+        return False  # an ellipsis or a dot leader often doesn't end the sentence
+    before = text[max(0, match.start() - 40) : match.start()].split()
+    word = before[-1].strip(_OPENERS + _CLOSERS) if before else ""
+    if not _ORDINARY_WORD.fullmatch(word):
+        return False
+    if word in ABBREVIATIONS or word in _NOT_SENTENCE_ENDS or _LOWERCASE_ROMAN.fullmatch(word):
+        return False
+    return not (word == "long" and "lat." in before)  # "lat. 51 N, long. 0 W"
+
+
+def _mark_sentence_starts(text: str) -> str:
+    """Put :data:`_MARK` where a sentence clearly starts after another one, if it doesn't
+    start in lowercase. The paragraph's own start needs no mark: it is a sentence start
+    whatever its case."""
+    pieces: list[str] = []
+    cursor = 0
+    for match in _SENTENCE_END.finditer(text):
+        start = index = match.end()
+        while index < len(text) and text[index] in _OPENERS + _SIGNS:
+            index += 1
+        first = text[index : index + 1]
+        if not first.isalnum() or first.islower() or not _clearly_ends_sentence(text, match):
+            continue
+        pieces += [text[cursor:start], _MARK]
+        cursor = start
+    pieces.append(text[cursor:])
+    return "".join(pieces)
+
+
+def _capitalise_sentence_starts(text: str) -> str:
+    """Capitalise a lowercase letter right after each :data:`_MARK` (past any signs), and
+    take the marks out. Only ``a``-``z`` change, so the book's own letters never do."""
+    return _MARKED.sub(lambda match: match[1] + match[2].upper(), text)
+
+
 _STEPS: tuple[Callable[[str], str], ...] = (
     _iso_dates,
     _dates,
@@ -796,6 +943,9 @@ class EnglishRules:
 
     def body(self, text: str) -> str:
         """Prepare running text."""
+        marked = _MARK not in text  # it never is in a real book; if so, nothing is marked
+        if marked:
+            text = _mark_sentence_starts(text)
         for step in _STEPS:
             text = step(text)
-        return text
+        return _capitalise_sentence_starts(text) if marked else text

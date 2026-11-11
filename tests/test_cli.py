@@ -941,6 +941,11 @@ def test_convert_cleanup_options(tmp_path: Path, capsys: pytest.CaptureFixture[s
         "A STORY Chapter One It began. It went on. one A STORY As stories do. Chapter Two "
         "It ended without a two A STORY period three"
     )
+    # A dot leader may not end a sentence, so a page number after one stays lowercase and
+    # the contents page stays one sentence: it isn't split before each page number.
+    assert FakeKokoro.texts[1] == (
+        "Chapter One ........ one Chapter Two ........ two Afterword ........ three"
+    )
 
 
 def test_convert_rejects_an_unknown_footnote_choice(
