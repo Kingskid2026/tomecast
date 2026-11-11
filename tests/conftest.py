@@ -1,8 +1,10 @@
-"""Run every GUI test headless, on the same machine whatever runs it, and never leave a
-window's worker thread running.
+"""Set-up shared by every test: the window runs headless, the hardware scan reads nothing
+from this machine, and no GUI test leaves a window's worker thread running.
 
-The environment is assigned, not defaulted: a desktop session sets QT_QPA_PLATFORM (for
-example to "wayland;xcb"), and the tests would then open real windows.
+The Qt variables are assigned, not defaulted: a desktop session sets QT_QPA_PLATFORM (for
+example to "wayland;xcb"), and the GUI tests would then open real windows. They live here
+rather than in tests/gui so there is one conftest module (mypy checks tests/ as top-level
+modules, and two files named conftest would collide).
 """
 
 import os
@@ -19,6 +21,7 @@ os.environ["QT_QUICK_BACKEND"] = "software"
 # The desktop's Qt theme plugin could otherwise leak its colour scheme into the tests.
 os.environ["QT_QPA_PLATFORMTHEME"] = ""
 
+GUI_TESTS = Path(__file__).parent / "gui"
 # How long a test's leftover worker may take to finish after shutdown() (which is bounded,
 # and a test may leave a fake engine blocked for a while).
 WORKER_STOP_MS = 60_000
@@ -28,12 +31,26 @@ _STUCK: list[Any] = []
 
 
 @pytest.fixture(autouse=True)
-def every_backend_is_shut_down(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """Shut down every ``Backend`` a test makes, and wait for its worker thread to finish,
+def _unknown_memory_and_power(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The scan finds no /proc/meminfo or /sys/class/power_supply, so it never picks fewer
+    threads or warns about memory: pulling the charger mid-run, or a busy machine, can't
+    change a test. Tests of the scan itself point it at fake files instead."""
+    monkeypatch.setattr(machine, "MEMINFO", tmp_path / "no-meminfo")
+    monkeypatch.setattr(machine, "POWER_SUPPLY", tmp_path / "no-power-supply")
+
+
+@pytest.fixture(autouse=True)
+def every_backend_is_shut_down(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[None]:
+    """Shut down every ``Backend`` a GUI test makes, and wait for its worker thread to finish,
     whatever the test does (a test that fails part-way never reaches its own shutdown()).
     Otherwise the backend is freed later, by the garbage collector or with an old traceback,
     while its thread still runs: "QThread: Destroyed while thread 'tomecast-worker' is still
-    running", then SIGABRT and a core dump of the test run."""
+    running", then SIGABRT and a core dump of the test run. Other tests don't import Qt."""
+    if not request.node.path.is_relative_to(GUI_TESTS):
+        yield
+        return
     from tomecast.gui import backend as backend_module
 
     made: list[Any] = []
@@ -53,11 +70,3 @@ def every_backend_is_shut_down(monkeypatch: pytest.MonkeyPatch) -> Iterator[None
             stuck.append(backend)
     if stuck:
         pytest.fail(f"{len(stuck)} backend worker(s) still running after shutdown()")
-
-
-@pytest.fixture(autouse=True)
-def _unknown_memory_and_power(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """The hardware scan finds nothing to read, so it never picks fewer threads: a laptop on
-    battery would otherwise change the hardware label."""
-    monkeypatch.setattr(machine, "MEMINFO", tmp_path / "no-meminfo")
-    monkeypatch.setattr(machine, "POWER_SUPPLY", tmp_path / "no-power-supply")

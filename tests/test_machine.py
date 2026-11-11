@@ -155,6 +155,66 @@ def test_without_a_charger_listed_the_battery_status_decides(
     assert _power(tmp_path, supplies) == Power(battery=True, on_battery=on_battery)
 
 
+def test_a_charging_battery_beats_an_ac_entry_that_says_offline(tmp_path: Path) -> None:
+    # The AC entry follows only the barrel jack while the laptop charges over USB-C (or its
+    # update lands a moment after the battery's).
+    assert _power(tmp_path, {**AC_OFFLINE, **CHARGING}) == Power(battery=True, on_battery=False)
+
+
+def test_a_charging_battery_beats_an_idle_usb_c_port(tmp_path: Path) -> None:
+    supplies = {
+        **CHARGING,
+        "ucsi-source-psy-USBC000:001": {"type": "USB", "scope": "System", "online": "0"},
+    }
+
+    assert _power(tmp_path, supplies) == Power(battery=True, on_battery=False)
+
+
+def test_a_full_battery_with_the_charger_offline_is_on_battery(tmp_path: Path) -> None:
+    supplies = {**AC_OFFLINE, "BAT0": {"type": "Battery", "status": "Full"}}
+
+    assert _power(tmp_path, supplies).on_battery is True
+
+
+def _on_hid_bus(entry: Path, subsystem: str = "hid") -> None:
+    (entry / "device").mkdir()
+    (entry / "device" / "subsystem").symlink_to(f"../../../../bus/{subsystem}")
+
+
+@pytest.mark.parametrize(
+    "name", ["hid-00:11:22:33:44:55-battery", "hidpp_battery_0", "HID-046d:c52b-battery"]
+)
+def test_an_input_drivers_battery_with_no_scope_doesnt_count(tmp_path: Path, name: str) -> None:
+    supplies = {name: {"type": "Battery", "status": "Discharging"}}
+
+    assert _power(tmp_path, supplies) == DESKTOP
+
+
+def test_a_battery_on_the_hid_bus_with_no_scope_doesnt_count(tmp_path: Path) -> None:
+    folder = power_supply(
+        tmp_path / "power_supply",
+        {"keyboard_battery": {"type": "Battery", "status": "Discharging"}},
+    )
+    _on_hid_bus(folder / "keyboard_battery")
+
+    assert read_power(folder) == DESKTOP
+
+
+def test_a_laptops_own_battery_with_no_scope_still_counts(tmp_path: Path) -> None:
+    folder = power_supply(tmp_path / "power_supply", ON_BATTERY)
+    _on_hid_bus(folder / "BAT0", subsystem="acpi")
+
+    assert read_power(folder) == Power(battery=True, on_battery=True)
+
+
+def test_a_scope_of_system_wins_over_the_name(tmp_path: Path) -> None:
+    supplies = {
+        "hid-tablet-battery": {"type": "Battery", "scope": "System", "status": "Discharging"}
+    }
+
+    assert _power(tmp_path, supplies) == Power(battery=True, on_battery=True)
+
+
 def test_a_mouse_battery_doesnt_make_a_desktop_a_laptop(tmp_path: Path) -> None:
     supplies = {
         "hidpp_battery_0": {

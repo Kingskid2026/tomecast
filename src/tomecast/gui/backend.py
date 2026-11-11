@@ -39,7 +39,6 @@ from tomecast.engines.audiocpp import (
     DEFAULT_VOICE,
     VOICES,
     check_system,
-    default_threads,
     required_assets,
     stop_all_engines,
 )
@@ -66,7 +65,7 @@ from tomecast.gui.worker import (
     scan_devices,
 )
 from tomecast.hardware import short_name, vulkan_possible
-from tomecast.machine import scan_machine
+from tomecast.machine import recommend, scan_machine
 from tomecast.names import Name
 from tomecast.packaging import portable_name
 from tomecast.pronunciations import book_list_path
@@ -222,17 +221,14 @@ def _took(seconds: float) -> str:
     return f"{hours} H {rest:02d} MIN" if hours else f"{rest} MIN"
 
 
-def cpu_label(speedup: float | None = None) -> str:
+def cpu_label(threads: int, *, on_battery: bool = False, speedup: float | None = None) -> str:
     """The corner's hardware label for the CPU: ``"CPU · 8 THREADS"``, or ``"CPU · ABOUT 4.7x
-    REAL TIME"`` once measured, with ``"ON BATTERY"`` after ``"CPU"`` while the computer runs
-    on its battery (it voices with fewer threads then). Reads the power state now."""
-    parts = ["CPU"]
-    if scan_machine().power.on_battery:
-        parts.append("ON BATTERY")
+    REAL TIME"`` once measured with that many threads, with ``"ON BATTERY"`` after ``"CPU"``
+    while the computer runs on its battery (it voices with fewer threads then)."""
+    parts = ["CPU", "ON BATTERY"] if on_battery else ["CPU"]
     if speedup is not None:
         parts.append(f"ABOUT {speedup:.1f}\u00d7 REAL TIME")
     else:
-        threads = default_threads()
         parts.append(f"{threads} THREAD{'' if threads == 1 else 'S'}")
     return " \u00b7 ".join(parts)
 
@@ -356,8 +352,8 @@ class Backend(QObject):
         self._convert_job: int | None = None
         self._control: TimedControl | None = None
         self._chapter_labels: list[str] = []
-        # Times real time per device label ("CPU" or the card's short name): from the speed test
-        # at start-up, then from what this session's conversions measured.
+        # Times real time per device ("CPU/<threads>" or the card's short name, see _speed_key):
+        # from the speed test at start-up, then from what this session's conversions measured.
         self._speeds: dict[str, float] = {}
         self._raw_book: Book | None = None  # as read, before cleanup
         self._book: Book | None = None  # cleaned with the skip switches
@@ -382,7 +378,10 @@ class Backend(QObject):
         self._themeSetting = saved_theme if saved_theme in THEME_SETTINGS else "system"
         self._theme = self._effective_theme()
         self._reduceMotion = system_reduce_motion()
-        self._hardwareLabel = cpu_label()
+        # The CPU's thread count and the power state, as last read (see _rescan_machine).
+        self._cpu_threads, self._on_battery = 0, False
+        self._rescan_machine()
+        self._hardwareLabel = cpu_label(self._cpu_threads, on_battery=self._on_battery)
         self._gpuAvailable = gpu_check()
         self._useGpu = _as_bool(self._settings.value("useGpu", True), default=True)
         self._gpuName = ""
@@ -514,7 +513,7 @@ class Backend(QObject):
     footnotesAtEnd: bool = _field(bool, "footnotesAtEnd", footnotesAtEndChanged)
 
     def _get_selection_summary(self) -> dict[str, str]:
-        speedup = self._speeds.get(self._device_label(), DEFAULT_SPEEDUP)
+        speedup = self._speeds.get(self._speed_key(self._device_label()), DEFAULT_SPEEDUP)
         return self._chapters.summary(speedup, self._speed)
 
     selectionSummary = _property(dict, _get_selection_summary, selectionSummaryChanged)
@@ -589,6 +588,7 @@ class Backend(QObject):
         if on == self._useGpu:
             return
         self._stop_preview()  # a preview made on the other hardware shouldn't keep playing
+        self._rescan_machine()
         self._update("useGpu", on)
         self._settings.setValue("useGpu", on)
         self._settings.sync()
@@ -949,6 +949,7 @@ class Backend(QObject):
     @Slot(str)
     def _on_device(self, description: str) -> None:
         """The worker found out (or started the engine on) which graphics card is in use."""
+        self._rescan_machine()  # what the engine just read too
         self._update("gpuName", description)
         self._refresh_hardware_label()
         self.selectionSummaryChanged.emit()
@@ -957,8 +958,11 @@ class Backend(QObject):
     def _on_speeds(self, speeds: Speeds) -> None:
         """The start-up scan's speeds. A speed this session measured converting is better,
         so it isn't replaced."""
+        # The CPU was measured with the thread count of a moment ago (the probe reads it
+        # itself), so it's kept under the count read now.
+        self._rescan_machine()
         if speeds.cpu is not None:
-            self._speeds.setdefault("CPU", speeds.cpu)
+            self._speeds.setdefault(self._speed_key("CPU"), speeds.cpu)
         if speeds.gpu is not None and speeds.gpu_description:
             self._speeds.setdefault(short_name(speeds.gpu_description), speeds.gpu)
             if not self._gpuName and self._gpuAvailable:
@@ -1070,6 +1074,9 @@ class Backend(QObject):
             getattr(self, f"{name}Changed").emit()
 
     def _show(self, screen: str) -> None:
+        if self._rescan_machine():  # the charger was plugged in or pulled
+            self._refresh_hardware_label()
+            self.selectionSummaryChanged.emit()
         if screen != self._screen:
             self._stop_preview()  # whatever played belonged to the screen being left
         if screen in ("voice", "names"):
@@ -1178,11 +1185,28 @@ class Backend(QObject):
             return short_name(self._gpuName)
         return "CPU"
 
+    def _speed_key(self, device: str) -> str:
+        """Where a device's speed is kept: the card's short name, or ``"CPU/<threads>"``, since
+        the CPU's speed depends on how many threads it voices with (fewer on battery)."""
+        return f"CPU/{self._cpu_threads}" if device == "CPU" else device
+
+    def _rescan_machine(self) -> bool:
+        """Read the thread count the voice would use now and whether the computer runs on
+        battery (a few small file reads); True if either changed. Done when the screen changes,
+        the switch flips, an engine starts and the speed test ends, never on progress updates,
+        so a conversion's speed is kept under the thread count its engine started with."""
+        machine = scan_machine()
+        now = (recommend(machine).threads, machine.power.on_battery is True)
+        changed = now != (self._cpu_threads, self._on_battery)
+        self._cpu_threads, self._on_battery = now
+        return changed
+
     def _refresh_hardware_label(self) -> None:
         device = self._device_label()
-        speedup = self._speeds.get(device)
+        speedup = self._speeds.get(self._speed_key(device))
         if device == "CPU":
-            self._update("hardwareLabel", cpu_label(speedup))
+            label = cpu_label(self._cpu_threads, on_battery=self._on_battery, speedup=speedup)
+            self._update("hardwareLabel", label)
         elif speedup is not None:
             self._update("hardwareLabel", f"{device} \u00b7 ABOUT {speedup:.1f}\u00d7 REAL TIME")
         else:
@@ -1192,7 +1216,7 @@ class Backend(QObject):
     def _gpu_note(self) -> str:
         """The note under "Use graphics card": the card's measured speed-up over the CPU
         once both have been measured, else the general one."""
-        cpu = self._speeds.get("CPU")
+        cpu = self._speeds.get(self._speed_key("CPU"))
         card = self._speeds.get(short_name(self._gpuName)) if self._gpuName else None
         if not cpu or not card:
             return GPU_NOTE_ON if self._useGpu else GPU_NOTE_OFF
@@ -1204,7 +1228,7 @@ class Backend(QObject):
 
     def _measured(self, speedup: float) -> None:
         """A conversion measured the speed on what it ran on (the CPU if the card fell back)."""
-        self._speeds[self._device_label()] = speedup
+        self._speeds[self._speed_key(self._device_label())] = speedup
         self._refresh_hardware_label()
         self.selectionSummaryChanged.emit()
 

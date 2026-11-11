@@ -119,10 +119,11 @@ def read_power(power_supply: Path | None = None) -> Power:
     """Whether this is a laptop, and on battery now, from ``/sys/class/power_supply``.
 
     Only the system's own batteries count: one whose ``scope`` is ``Device`` (a mouse,
-    keyboard, headset or game controller) is left out, and so is a ``UPS``. No battery means a
-    desktop. A laptop is plugged in if a charger (``Mains``, ``USB``, ``Wireless``) is online;
-    otherwise it's on battery if a battery is discharging or every charger says it's offline.
-    Never raises.
+    keyboard, headset or game controller) is left out, and so is one with no ``scope`` that is
+    plainly an input device's (see :func:`_peripheral`), and a ``UPS``. No battery means a
+    desktop. A laptop is plugged in if a charger (``Mains``, ``USB``, ``Wireless``) is online
+    or a battery is charging; otherwise it's on battery if a battery is discharging or every
+    charger says it's offline. Never raises.
     """
     folder = power_supply or POWER_SUPPLY
     try:
@@ -133,7 +134,10 @@ def read_power(power_supply: Path | None = None) -> Power:
     charger_online: bool | None = None  # True if any charger is online, False if all are off
     for entry in entries:
         kind = _attribute(entry, "type")
-        if kind is None or _attribute(entry, "scope") == "Device":
+        scope = _attribute(entry, "scope")
+        if kind is None or scope == "Device":
+            continue
+        if kind == "Battery" and scope is None and _peripheral(entry):
             continue
         if kind == "Battery":
             if _attribute(entry, "present") != "0":
@@ -145,15 +149,31 @@ def read_power(power_supply: Path | None = None) -> Power:
     if not statuses:
         return Power(battery=False, on_battery=False)
     on_battery: bool | None
-    if charger_online:
+    if charger_online or "Charging" in statuses:
+        # A charging battery is plugged in, whatever an AC entry says: some laptops' AC entry
+        # only follows the barrel jack while they charge over USB-C, and the two updates can
+        # arrive a moment apart.
         on_battery = False
     elif "Discharging" in statuses or charger_online is False:
         on_battery = True
-    elif any(status in ("Charging", "Full") for status in statuses):
+    elif "Full" in statuses:
         on_battery = False
     else:
         on_battery = None  # e.g. only "Unknown" or "Not charging", and no charger listed
     return Power(battery=True, on_battery=on_battery)
+
+
+def _peripheral(entry: Path) -> bool:
+    """A battery with no ``scope`` that is still an input device's: named by an input driver
+    (``hid-…-battery``, ``hidpp_battery_0``), or belonging to a device on the HID bus (a USB
+    or Bluetooth mouse, keyboard or controller). A laptop's own battery is an ACPI or platform
+    device."""
+    if entry.name.lower().startswith("hid"):
+        return True
+    try:
+        return os.path.basename(os.readlink(entry / "device" / "subsystem")) == "hid"
+    except (OSError, ValueError):
+        return False
 
 
 def _attribute(entry: Path, name: str) -> str | None:

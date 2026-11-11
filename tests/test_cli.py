@@ -94,9 +94,6 @@ def no_real_engine(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(cli, "engine_speed", lambda root, engine, measuring=None: None)
     monkeypatch.setattr(cli, "vulkan_possible", lambda: False)
     monkeypatch.setattr(cli, "data_dir", lambda: tmp_path / "data")
-    # The scan finds nothing to read, so a laptop on battery runs these like any machine.
-    monkeypatch.setattr(machine, "MEMINFO", tmp_path / "no-meminfo")
-    monkeypatch.setattr(machine, "POWER_SUPPLY", tmp_path / "no-power-supply")
     FakeKokoro.fail_with = None
     FakeKokoro.fail_after = None
     FakeKokoro.voiced = 0

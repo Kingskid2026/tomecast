@@ -23,7 +23,7 @@ import pytest
 from PySide6.QtCore import QSettings, QUrl
 from pytestqt.qtbot import QtBot
 
-from tomecast import pronunciations
+from tomecast import machine, pronunciations
 from tomecast.audio import wav_info
 from tomecast.book import Book, Chapter
 from tomecast.cleanup import is_numbered_chapter
@@ -675,7 +675,7 @@ def test_reduce_motion_and_the_hardware_label(
     make_backend: MakeBackend, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("TOMECAST_REDUCE_MOTION", "1")
-    monkeypatch.setattr(backend_module, "default_threads", lambda: 8)
+    monkeypatch.setattr(machine, "cpu_count", lambda: 16)
 
     backend = make_backend()
 
@@ -686,7 +686,7 @@ def test_reduce_motion_and_the_hardware_label(
 def test_the_hardware_label_says_when_the_cpu_runs_on_battery(
     qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(backend_module, "default_threads", lambda: 4)
+    monkeypatch.setattr(machine, "cpu_count", lambda: 16)
     pin_machine(monkeypatch, tmp_path / "laptop", supplies=ON_BATTERY)
 
     backend = make_backend(speeds=Speeds(cpu=2.6))
@@ -694,10 +694,39 @@ def test_the_hardware_label_says_when_the_cpu_runs_on_battery(
     assert backend.hardwareLabel == "CPU · ON BATTERY · 4 THREADS"
     qtbot.waitUntil(lambda: "REAL TIME" in backend.hardwareLabel)
     assert backend.hardwareLabel == "CPU · ON BATTERY · ABOUT 2.6× REAL TIME"
-    # Plugged in again: the label says so the next time it's refreshed.
+    # Plugged in again: 2.6x was measured with 4 threads, and the voice now uses 8, so the
+    # label and the estimate go back to the thread count until 8 threads are measured.
     pin_machine(monkeypatch, tmp_path / "plugged", supplies=PLUGGED_IN)
     backend.setUseGpu(not backend.useGpu)
-    assert backend.hardwareLabel == "CPU · ABOUT 2.6× REAL TIME"
+    assert backend.hardwareLabel == "CPU · 8 THREADS"
+    assert backend._speeds == {"CPU/4": 2.6}
+    _open(qtbot, backend, _short_book(tmp_path))
+    assert backend.selectionSummary == backend.chapters.summary(DEFAULT_SPEEDUP)
+
+
+def test_each_thread_count_keeps_its_own_cpu_speed(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(machine, "cpu_count", lambda: 16)
+    pin_machine(monkeypatch, tmp_path / "plugged", supplies=PLUGGED_IN)
+    backend = make_backend(speeds=Speeds(cpu=4.7))
+    qtbot.waitUntil(lambda: "REAL TIME" in backend.hardwareLabel)
+    _open(qtbot, backend, _short_book(tmp_path))
+    assert backend.selectionSummary == backend.chapters.summary(4.7)
+
+    # Unplugged, then a conversion measures the CPU with 4 threads.
+    pin_machine(monkeypatch, tmp_path / "laptop", supplies=ON_BATTERY)
+    backend.goTo("drop")
+    assert backend.hardwareLabel == "CPU · ON BATTERY · 4 THREADS"
+    _open(qtbot, backend, _short_book(tmp_path))
+    _convert(qtbot, backend)
+    on_battery = backend._speeds["CPU/4"]
+    assert backend._speeds["CPU/8"] == 4.7  # still there for when it's plugged in again
+    assert backend.hardwareLabel == f"CPU · ON BATTERY · ABOUT {on_battery:.1f}× REAL TIME"
+
+    pin_machine(monkeypatch, tmp_path / "plugged-again", supplies=PLUGGED_IN)
+    backend.goTo("drop")
+    assert backend.hardwareLabel == "CPU · ABOUT 4.7× REAL TIME"
 
 
 # --- Converting ------------------------------------------------------------------------------
@@ -780,7 +809,7 @@ def test_the_selection_estimate_uses_the_measured_speed(
 
     _convert(qtbot, backend)
 
-    speedup = backend._speeds["CPU"]
+    speedup = backend._speeds[f"CPU/{machine.voice_threads()}"]
     assert speedup > 0
     assert backend.selectionSummary == backend.chapters.summary(speedup)
 
@@ -2269,7 +2298,7 @@ def test_a_conversion_measures_better_than_the_speed_test(
 
     _convert(qtbot, backend)
 
-    assert backend._speeds["CPU"] != 4.6  # the fake engine is far faster than that
+    assert backend._speeds[f"CPU/{machine.voice_threads()}"] != 4.6  # the fake engine is faster
     assert "4.6×" not in backend.hardwareLabel
 
 
