@@ -5,9 +5,9 @@ audio.cpp (https://github.com/0xShug0/audio.cpp) runs the Kokoro voice model. To
 its HTTP server once per conversion, so the model is loaded a single time, and sends it one
 small chunk of text per request. Facts this module relies on were checked against v0.9.4:
 
-* upstream's prebuilt Linux binaries need glibc 2.43, so Tomecast uses its own unmodified
-  build of the same release (.github/workflows/engine-build.yml), which needs glibc 2.28 and
-  a CPU with AVX2;
+* upstream's prebuilt Linux binaries need glibc 2.43, so Tomecast uses its own build of the
+  same release (.github/workflows/engine-build.yml), which needs glibc 2.28 and a CPU with
+  AVX2, and changes nothing else unless one of its opt-in patches is turned on;
 * Kokoro needs eSpeak NG at runtime for every sentence (found via environment variables);
 * eSpeak's data path must be shorter than 160 bytes;
 * more than 510 phonemes in one request is a hard error, not a silent cut;

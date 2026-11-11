@@ -1,0 +1,156 @@
+Tomecast's patch to audio.cpp v0.9.4: an opt-in, faster flow sampler for Ming-3.0-tts.
+
+This is Tomecast's own change, not upstream's (https://github.com/0xShug0/audio.cpp).
+.github/scripts/build-audiocpp.sh applies it with `git apply` to both engine builds (CPU and
+Vulkan), and the build fails if it doesn't apply cleanly.
+
+What it does
+  Ming-3.0-tts spends about 70% of its time in its flow-matching head. Upstream runs that as
+  10 Euler steps per audio patch on a fixed, sway-warped time table (MingFlowRuntime::sample
+  in src/framework/modules/speech_decoders/ming_flow_runtime.cpp). Two environment variables,
+  read once per server process when it first voices with Ming, change the steps:
+
+    AUDIOCPP_MING_FLOW_STEPS=N           solver steps, 1 to 10 (default 10)
+    AUDIOCPP_MING_FLOW_SCHEDULE=default  the official table; with N < 10, its points round(10k/N)
+                               =uniform  k/N, no warp
+                               =sway     k/N, then the official warp t' = 1 - cos(pi/2 t)
+
+  The solver (Euler), the guidance, the SDE term and every bf16 rounding step stay upstream's.
+
+Defaults
+  Unset or empty, both give upstream's sampler unchanged: the same 10 steps on the same time
+  table, with the same arithmetic, so the audio is byte-identical to an unpatched build. The
+  loop body is upstream's, untouched; the local experiment this patch was cut from was checked
+  byte for byte on 20 of 20 chunks. An invalid value prints one warning and is ignored. Ming
+  models use this code: Ming-3.0-tts, and also upstream's Ming3 Audio talker
+  (src/models/ming3_audio/talker.cpp), which Tomecast doesn't load. Kokoro doesn't.
+
+Measured (2026-11-10)
+  RTX PRO 1000 Blackwell Laptop (8 GB), a CUDA build for sm_120, one server, guidance 2.0,
+  voice UK_George, seed 42, 60 chunks of Alice's Adventures in Wonderland, chapter I. "Words
+  lost" compares a Parakeet TDT 0.6B v3 transcript with the text.
+
+    Setting                      x real time   Words lost
+    upstream (10 steps)          4.16          0.9% (11 of 1,166)
+    STEPS=7                      5.33          1.5% (17 of 1,166)
+    STEPS=5 SCHEDULE=uniform     6.54          1.7% (20 of 1,166)   <- recommended
+
+  5 uniform steps run about 1.55x faster with nearly the same quality: every frequency band
+  stays within 0.5 dB of 10 steps, with the same length and no new tones, and on a separate
+  20-chunk run it lost exactly the words upstream did (1.8% each). At 5 steps the other
+  schedules lose more words: sway 4.1%, default 3.9% (20 chunks).
+  6 uniform steps (5.9x) is the fallback if 5 proves too rough. Only CUDA was measured.
+
+Cut from the local experiment this came from: midpoint and Heun solvers (worse than Euler for
+the same number of network passes), and skipping the unguided pass at guidance 0 (6% faster,
+but guidance 0 sounds worse).
+
+License: Apache 2.0, the same as audio.cpp. The changed lines are marked "Tomecast patch" in
+the code, as section 4(b) of the license asks of modified files.
+
+The build checks that the server it made contains these strings, so the patch is compiled in:
+Binary-contains: AUDIOCPP_MING_FLOW_STEPS AUDIOCPP_MING_FLOW_SCHEDULE
+
+diff --git a/src/framework/modules/speech_decoders/ming_flow_runtime.cpp b/src/framework/modules/speech_decoders/ming_flow_runtime.cpp
+index fef2d70..9747f13 100644
+--- a/src/framework/modules/speech_decoders/ming_flow_runtime.cpp
++++ b/src/framework/modules/speech_decoders/ming_flow_runtime.cpp
+@@ -15,7 +15,10 @@
+ 
+ #include <array>
+ #include <cmath>
++#include <cstdio>
++#include <cstdlib>
+ #include <stdexcept>
++#include <string>
+ 
+ namespace engine::modules {
+ namespace {
+@@ -297,15 +300,85 @@ std::vector<float> MingFlowRuntime::aggregate(const std::vector<float> & latent)
+     return impl_->aggregator.run(latent, {}, {}, 0.0f);
+ }
+ 
++namespace {
++
++// Tomecast patch, not upstream: the number of flow steps and their schedule, read once per
++// process from the environment. Unset or empty, the sampler is exactly upstream's: Euler,
++// 10 steps on the official sway-warped table. An invalid value is reported and ignored.
++//   AUDIOCPP_MING_FLOW_STEPS=N            solver steps, 1 to 10 (default 10)
++//   AUDIOCPP_MING_FLOW_SCHEDULE=default   the official table; with N < 10, its points round(10k/N)
++//                              =uniform   k/N, no warp
++//                              =sway      k/N, then the official warp t' = 1 - cos(pi/2 t)
++int tomecast_flow_steps() {
++    static const int steps = [] {
++        const char * value = std::getenv("AUDIOCPP_MING_FLOW_STEPS");
++        if (value == nullptr || value[0] == '\0') return 10;
++        char * end = nullptr;
++        const long n = std::strtol(value, &end, 10);
++        if (*end != '\0' || n < 1 || n > 10) {
++            std::fprintf(stderr, "Ignoring AUDIOCPP_MING_FLOW_STEPS=%s: it must be a whole number "
++                "from 1 to 10. Using 10.\n", value);
++            return 10;
++        }
++        return static_cast<int>(n);
++    }();
++    return steps;
++}
++
++const std::string & tomecast_flow_schedule_name() {
++    static const std::string schedule = [] {
++        const char * value = std::getenv("AUDIOCPP_MING_FLOW_SCHEDULE");
++        if (value == nullptr || value[0] == '\0') return std::string("default");
++        const std::string name(value);
++        if (name != "default" && name != "uniform" && name != "sway") {
++            std::fprintf(stderr, "Ignoring AUDIOCPP_MING_FLOW_SCHEDULE=%s: it must be default, "
++                "uniform or sway. Using default.\n", value);
++            return std::string("default");
++        }
++        return name;
++    }();
++    return schedule;
++}
++
++// The flow's time points, from 0 to 1, one more than the steps. With the defaults, `official`.
++std::vector<float> tomecast_flow_schedule(const std::vector<float> & official) {
++    const int steps = tomecast_flow_steps();
++    const std::string & schedule = tomecast_flow_schedule_name();
++    std::vector<float> time;
++    if (schedule == "default") {
++        const double last = static_cast<double>(official.size() - 1);
++        for (int k = 0; k <= steps; ++k) time.push_back(official[static_cast<size_t>(std::lround(last * k / steps))]);
++        return time;
++    }
++    for (int k = 0; k <= steps; ++k) time.push_back(static_cast<float>(k) / static_cast<float>(steps));
++    core::round_f32_to_bf16_in_place(time);
++    if (schedule == "sway") {  // the same rounding sequence as the official table's warp
++        auto phase = time;
++        for (auto & t : phase) t *= 1.5707963267948966f;
++        core::round_f32_to_bf16_in_place(phase);
++        for (auto & t : phase) t = std::cos(t);
++        core::round_f32_to_bf16_in_place(phase);
++        for (auto & t : phase) t -= 1.0f;
++        core::round_f32_to_bf16_in_place(phase);
++        for (size_t i = 0; i < time.size(); ++i) phase[i] += time[i];
++        core::round_f32_to_bf16_in_place(phase);
++        for (size_t i = 0; i < time.size(); ++i) time[i] -= phase[i];
++        core::round_f32_to_bf16_in_place(time);
++    }
++    return time;
++}
++
++}  // namespace
++
+ std::vector<float> MingFlowRuntime::sample(const std::vector<float> & conditioning,
+     const std::vector<float> & history, const std::vector<float> & noise, const std::vector<float> & sde_noise,
+     float cfg, float sigma, float temperature) {
+     if (sde_noise.size() != noise.size() * 10 || temperature < 0) {
+         throw std::runtime_error("Ming flow requires ten SDE-noise frames and a nonnegative temperature");
+     }
+-    const auto & time = impl_->time;
++    const auto time = tomecast_flow_schedule(impl_->time);  // Tomecast patch: upstream uses impl_->time
+     auto y = noise;
+-    for (size_t step = 0; step < 10; ++step) {
++    for (size_t step = 0; step + 1 < time.size(); ++step) {  // Tomecast patch: upstream runs 10 steps
+         auto prediction = impl_->flow.run(y, conditioning, history, time[step]);
+         std::vector<float> guided(noise.size());
+         for (size_t i = 0; i < guided.size(); ++i) guided[i] = prediction[i] - prediction[guided.size() + i];
