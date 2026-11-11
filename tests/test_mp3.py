@@ -238,6 +238,9 @@ def test_special_characters_in_titles_and_tags(tmp_path: Path) -> None:
     assert tags["album"] == "Dune: Messiah"
 
 
+# On Windows a folder can't be renamed over the empty folder that claims its name, so
+# _publish_folder_without_overwriting tries "(2)", "(3)"... forever (#39).
+@pytest.mark.posix_only
 def test_never_overwrite_numbers_the_folder(tmp_path: Path) -> None:
     chapters = [chapter(tmp_path, "A", [(0.3, 0.1)])]
     out = tmp_path / "out"
@@ -261,6 +264,9 @@ def test_never_overwrite_numbers_the_folder(tmp_path: Path) -> None:
     ]
 
 
+# On Windows a folder can't be renamed over the empty folder that claims its name, so
+# _publish_folder_without_overwriting tries "(2)", "(3)"... forever (#39).
+@pytest.mark.posix_only
 def test_never_overwrite_survives_a_folder_appearing_while_encoding(tmp_path: Path) -> None:
     out = tmp_path / "out"
     out.mkdir()
