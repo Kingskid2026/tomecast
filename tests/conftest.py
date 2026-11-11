@@ -28,6 +28,7 @@ if sys.platform == "win32":
         "test_audiocpp.py",
         "test_cli.py",
         "test_machine.py",
+        "test_out_of_memory.py",
         "test_speed.py",
         "test_workdirs.py",
     ]
