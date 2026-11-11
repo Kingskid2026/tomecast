@@ -2396,7 +2396,7 @@ def test_a_conversion_measures_better_than_the_speed_test(
     _convert(qtbot, backend)
 
     assert backend._speeds[f"CPU/{machine.voice_threads()}"] != 4.6  # the fake engine is faster
-    assert "4.6×" not in backend.hardwareLabel
+    assert "ABOUT 4.6×" not in backend.hardwareLabel  # so a measured 84.6x is no match
 
 
 def test_packaging_time_doesnt_count_towards_the_measured_speed(
