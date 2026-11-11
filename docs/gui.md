@@ -187,7 +187,7 @@ A book that finishes reading while a conversion runs (a drop that started before
 
 ### Ticked sections and resuming
 
-`convert_book(book, engine, output, *, workdir, chapters=None, overwrite=True, ...)` takes the **whole** book and `chapters`, the indices into `book.chapters` to voice (`None`: all). Chunk IDs (`cNNN-…`) always use the chapter's index in the whole book, so the same chapter has the same chunk files whichever sections are ticked, and a run from the command line and a run from the window reuse each other's work. The M4B gets only the chosen chapters, in book order. Progress reports `chapter_index` as the position among the chosen chapters (so it indexes the converting screen's labels), and `chunks_total` counts only their chunks.
+`convert_book(book, engine, output, *, workdir, chapters=None, overwrite=True, ...)` takes the **whole** book and `chapters`, the indices into `book.chapters` to voice (`None`: all). Chunk IDs (`cNNN-…`) always use the chapter's index in the whole book, so the same chapter has the same chunk files whichever sections are ticked, and a run from the command line and a run from the window reuse each other's work. The M4B gets only the chosen chapters, in book order. Progress reports `chapter_index` as the position among the chosen chapters (so it indexes the converting screen's labels), and `chunks_total` counts only their chunks. The worker hands `convert_book` its speed meter (`_Meter`) wrapped around the engine, and the meter passes the engine's `voice_speed` and `tempo` on, so a book from the window above 1.5× gets the same time-stretch as one from the command line (and the same length check).
 
 ### Where the book is written
 

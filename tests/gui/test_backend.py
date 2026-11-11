@@ -23,7 +23,8 @@ import pytest
 from PySide6.QtCore import QSettings, QUrl
 from pytestqt.qtbot import QtBot
 
-from tomecast import machine, pronunciations
+from tomecast import convert as convert_module
+from tomecast import machine, packaging, pronunciations
 from tomecast.audio import wav_info
 from tomecast.book import Book, Chapter
 from tomecast.cleanup import is_numbered_chapter
@@ -1017,6 +1018,37 @@ def test_previews_need_an_audio_player(
 
     assert backend.previewPlaying is False
     assert engines.made == []
+
+
+@pytest.mark.parametrize("speed", [1.75, 2.0])
+def test_a_fast_book_from_the_window_keeps_its_time_stretch(
+    qtbot: QtBot,
+    make_backend: MakeBackend,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    speed: float,
+) -> None:
+    """Above 1.5x the voice speaks at 1.5x and the packager stretches the rest, as the command
+    line does. The worker wraps the engine to measure it, and the wrapper must pass the speed
+    split on, or the book comes out at 1.5x whatever was chosen."""
+    packaged: list[float] = []
+    write_m4b = packaging.write_m4b  # what convert_book calls
+
+    def recording(*args: Any, tempo: float = 1.0, **kwargs: Any) -> Any:
+        packaged.append(tempo)
+        return write_m4b(*args, tempo=tempo, **kwargs)
+
+    monkeypatch.setattr(convert_module, "write_m4b", recording)
+    backend = make_backend(Engines())
+    _open(qtbot, backend, _short_book(tmp_path))
+    backend.setSpeed(speed)
+    _convert(qtbot, backend)
+
+    assert backend.screen == "done"
+    voice_speed, tempo = split_speed(speed)
+    assert voice_speed == 1.5
+    assert packaged == [pytest.approx(tempo)]
+    assert tempo > 1.0
 
 
 def test_a_fast_preview_is_time_stretched_like_the_book(
