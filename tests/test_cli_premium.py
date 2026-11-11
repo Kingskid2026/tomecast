@@ -32,11 +32,18 @@ def no_real_engine(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(audiocpp, "required_assets", lambda use_gpu: ())
     monkeypatch.setattr(ming, "required_assets", lambda use_gpu: ())
     monkeypatch.setattr(cli, "engine_speed", lambda root, engine, measuring=None: None)
+    monkeypatch.setattr(cli, "known_cpu_speed", lambda root, engine: None)
     monkeypatch.setattr(cli, "vulkan_possible", lambda: True)
     monkeypatch.setattr(cli, "data_dir", lambda: tmp_path / "data")
+    FakeKokoro.fail_with = None
+    FakeKokoro.fail_after = None
+    FakeKokoro.voiced = 0
     FakeKokoro.made = []
     FakeKokoro.texts = []
     FakeKokoro.gpu_warning = None
+    FakeKokoro.oom_at = None
+    FakeKokoro.on_card = []
+    FakeKokoro.on_exit = None
     FakeMing.languages = []
 
 
