@@ -1,5 +1,5 @@
+import contextlib
 import dataclasses
-import fcntl
 import hashlib
 import http.client
 import io
@@ -10,7 +10,7 @@ import tarfile
 import threading
 import time
 import zipfile
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Literal
 
@@ -48,10 +48,27 @@ from tomecast.downloads import (
     waiting_check,
 )
 from tomecast.manifest import AUDIOCPP_VULKAN, ESPEAK_NG
+from tomecast.oslayer import FileLock
 
 
 def _relative(path: Path, root: Path) -> str:
     return path.relative_to(root).as_posix()
+
+
+def _install_lock_held(root: Path) -> FileLock:
+    """The install lock, held as another Tomecast would hold it (release it when done)."""
+    lock = FileLock(root / ".install.lock")
+    assert lock.acquire()
+    return lock
+
+
+@contextlib.contextmanager
+def _another_tomecast_installing(root: Path) -> Iterator[None]:
+    lock = _install_lock_held(root)
+    try:
+        yield
+    finally:
+        lock.release()
 
 
 def _file_asset(
@@ -889,8 +906,7 @@ def test_waiting_for_another_tomecast_can_be_cancelled(tmp_path: Path) -> None:
     root = tmp_path / "data"
     root.mkdir()
     asset = _build(tmp_path, "v1")
-    with (root / ".install.lock").open("w") as other:  # another Tomecast is installing
-        fcntl.flock(other, fcntl.LOCK_EX)
+    with _another_tomecast_installing(root):
         started = time.monotonic()
         with pytest.raises(Cancelled):
             prepare(
@@ -904,9 +920,8 @@ def test_waiting_for_another_tomecast_goes_on_once_it_is_done(tmp_path: Path) ->
     root = tmp_path / "data"
     root.mkdir()
     asset = _build(tmp_path, "v1")
-    other = (root / ".install.lock").open("w")
-    fcntl.flock(other, fcntl.LOCK_EX)
-    threading.Timer(0.4, other.close).start()  # it finishes and lets go
+    other = _install_lock_held(root)
+    threading.Timer(0.4, other.release).start()  # it finishes and lets go
 
     prepare([asset], root, check=Check())
 
@@ -980,14 +995,13 @@ def test_the_gui_check_never_hashes(tmp_path: Path, monkeypatch: pytest.MonkeyPa
 def test_proving_a_build_never_waits_long_for_another_install(tmp_path: Path) -> None:
     root = tmp_path / "data"
     _, _, prepared = _switched(tmp_path, root)
-    other = (root / ".install.lock").open("w")
-    fcntl.flock(other, fcntl.LOCK_EX)  # another Tomecast is in the middle of a long download
+    other = _install_lock_held(root)  # another Tomecast is in the middle of a long download
     done: list[bool] = []
     thread = threading.Thread(target=lambda: done.append(mark_proven(root, prepared.builds)))
     started = time.monotonic()
     thread.start()
     thread.join(timeout=8)
-    other.close()
+    other.release()
     thread.join()
 
     assert time.monotonic() - started < 6  # it gave up after a couple of seconds
@@ -998,8 +1012,7 @@ def test_proving_a_build_never_waits_long_for_another_install(tmp_path: Path) ->
 def test_rolling_back_never_waits_for_good_either(tmp_path: Path) -> None:
     root = tmp_path / "data"
     _, new, prepared = _switched(tmp_path, root)
-    with (root / ".install.lock").open("w") as other:
-        fcntl.flock(other, fcntl.LOCK_EX)
+    with _another_tomecast_installing(root):
         started = time.monotonic()
         assert not roll_back(root, prepared.builds, "crashed", wait=0.5)
         assert time.monotonic() - started < 3

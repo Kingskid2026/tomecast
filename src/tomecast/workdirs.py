@@ -11,7 +11,6 @@ Folders left unused for :data:`STALE_WORK_DAYS` are removed.
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import hashlib
 import shutil
 import time
@@ -20,6 +19,7 @@ from pathlib import Path
 
 from tomecast.downloads import Asset, build_sha256, installed_sha256
 from tomecast.engines.audiocpp import AUDIOCPP_VERSION, DEFAULT_SEED, required_assets
+from tomecast.oslayer import FileLock
 
 # Unfinished conversions are kept so they can be resumed; after this long they're removed.
 STALE_WORK_DAYS = 14
@@ -79,12 +79,13 @@ def exclusive(folder: Path) -> Iterator[None]:
     Raises:
         WorkFolderBusy: if another run (in this process or another one) holds the lock.
     """
-    with (folder / ".lock").open("w") as handle:
-        try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise WorkFolderBusy(
-                "this book is already being converted with the same settings "
-                "(in another window or terminal?)"
-            ) from None
+    lock = FileLock(folder / ".lock")
+    if not lock.acquire():
+        raise WorkFolderBusy(
+            "this book is already being converted with the same settings "
+            "(in another window or terminal?)"
+        )
+    try:
         yield
+    finally:
+        lock.release()

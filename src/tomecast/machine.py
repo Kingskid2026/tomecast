@@ -17,6 +17,7 @@ threads.
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -94,6 +95,8 @@ def scan_machine(*, meminfo: Path | None = None, power_supply: Path | None = Non
 
 def cpu_count() -> int:
     """The logical CPUs this process may run on (2 if that can't be told)."""
+    if sys.platform == "win32":  # no sched_getaffinity there
+        return os.cpu_count() or 2
     try:
         return len(os.sched_getaffinity(0)) or 2
     except (AttributeError, OSError):

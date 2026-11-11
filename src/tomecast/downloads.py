@@ -29,7 +29,6 @@ the new build has passed its check.
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import hashlib
 import http.client
 import json
@@ -47,7 +46,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-from tomecast import __version__
+from tomecast import __version__, oslayer
 
 ProgressCallback = Callable[[int, int], None]  # (bytes done, total bytes)
 IsCancelled = Callable[[], bool]  # True once the user has stopped the run
@@ -177,9 +176,9 @@ class _Slot:
 
 
 def data_dir() -> Path:
-    """Tomecast's data folder: ``$XDG_DATA_HOME/tomecast`` or ``~/.local/share/tomecast``."""
-    base = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
-    return Path(base) / "tomecast"
+    """Tomecast's data folder: ``$XDG_DATA_HOME/tomecast`` or ``~/.local/share/tomecast``
+    (``%LOCALAPPDATA%\\Tomecast`` on Windows; see :func:`tomecast.oslayer.data_dir`)."""
+    return oslayer.data_dir()
 
 
 # --- Where things are ---------------------------------------------------------------------
@@ -922,18 +921,17 @@ def _locked(
     after ``wait`` seconds if that's set (raising :class:`_Busy`)."""
     root.mkdir(parents=True, exist_ok=True)
     deadline = None if wait is None else time.monotonic() + wait
-    with (root / _LOCK).open("w") as handle:
-        while True:
-            try:
-                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                if cancelled is not None and cancelled():
-                    raise Cancelled from None
-                if deadline is not None and time.monotonic() >= deadline:
-                    raise _Busy from None
-                time.sleep(_LOCK_POLL)
+    lock = oslayer.FileLock(root / _LOCK)
+    while not lock.acquire():
+        if cancelled is not None and cancelled():
+            raise Cancelled
+        if deadline is not None and time.monotonic() >= deadline:
+            raise _Busy
+        time.sleep(_LOCK_POLL)
+    try:
         yield
+    finally:
+        lock.release()
 
 
 # --- Downloading and extracting -----------------------------------------------------------
