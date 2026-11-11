@@ -73,6 +73,10 @@ select = [
 [tool.ruff.lint.per-file-ignores]
 # Tests use real Chinese/Japanese text, whose fullwidth punctuation looks like ASCII.
 "tests/**" = ["RUF001"]
+# The pronunciation lists refuse IPA, so this file names IPA symbols that look like ASCII.
+"src/tomecast/pronunciations.py" = ["RUF001", "RUF002", "RUF003"]
+# The marks module is about apostrophe look-alikes, so it names them.
+"src/tomecast/marks.py" = ["RUF001", "RUF002", "RUF003"]
 # Long word lists read better as one string than as a list of strings.
 "src/tomecast/textprep_en.py" = ["SIM905"]
 
@@ -83,7 +87,11 @@ files = ["src", "tests"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = ["-ra", "--strict-markers", "--strict-config"]
+# Integration tests need things from outside the repo; run them with `pytest -m integration`.
+addopts = ["-ra", "--strict-markers", "--strict-config", "-m", "not integration"]
+markers = [
+    "integration: needs something from outside the repo, such as Tomecast's downloaded engines (opt-in: -m integration)",
+]
 
 [[tool.mypy.overrides]]
 # pypdfium2 ships no type information; its values are checked where they enter our code.

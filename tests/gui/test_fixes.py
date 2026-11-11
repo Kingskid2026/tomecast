@@ -10,7 +10,15 @@ from pathlib import Path
 import pytest
 
 from tomecast import pronunciations
-from tomecast.gui.fixes import SLASHES, BadFix, Fix, FixLists, FixNotSaved, ListFile
+from tomecast.gui.fixes import (
+    MARKUP,
+    PHONETIC,
+    BadFix,
+    Fix,
+    FixLists,
+    FixNotSaved,
+    ListFile,
+)
 
 BOOK_LIST = """\
 # Alice: checked by ear
@@ -110,7 +118,20 @@ def test_an_unchanged_fix_is_not_written_again(folders: tuple[Path, Path]) -> No
 
 @pytest.mark.parametrize(
     ("say", "message"),
-    [("/ˈɡrɪfən/", SLASHES), ("griff #on", "Leave out the “#”"), ("#griff", "Leave out the “#”")],
+    [
+        ("/ˈɡrɪfən/", PHONETIC),
+        ("ˈdaɪnə", PHONETIC),  # plain IPA
+        ("[ˈdaɪnə]", PHONETIC),  # as Wikipedia writes it
+        ("DIE-nˈuh", PHONETIC),  # a stress mark is enough
+        ("die-nuː", PHONETIC),  # and so is a length mark
+        ("DIE-nuθ", PHONETIC),  # and a Greek letter IPA uses
+        ("[[d'aIn@]]", MARKUP),  # eSpeak's phoneme markup
+        ("die-[[n@]]", MARKUP),
+        ("/DIE-nuh/", "Leave out the slashes: type just the way the word sounds"),
+        ("[DIE-nuh]", "Leave out the brackets: type just the way the word sounds"),
+        ("griff #on", "Leave out the “#”"),
+        ("#griff", "Leave out the “#”"),
+    ],
 )
 def test_a_fix_the_list_cant_hold_is_refused(
     folders: tuple[Path, Path], say: str, message: str
@@ -121,6 +142,109 @@ def test_a_fix_the_list_cant_hold_is_refused(
         lists.set_for_name("Dinah", say)
     assert _book_text(book) == BOOK_LIST
     assert lists.fix_for("Dinah") is None
+
+
+@pytest.mark.parametrize(
+    "say",
+    ["ha-WAI-ʻee", "Hawaiʼi", "Hawai'i", "Ilʹich", "DEE-nah", "Dína", "Ðina", "[die] nuh [ah]"],
+)
+def test_names_marks_and_accents_are_saved(folders: tuple[Path, Path], say: str) -> None:
+    book, data = folders
+    lists = _lists(book, data)
+    lists.set_for_name("Dinah", say)
+    assert lists.fix_for("Dinah") == Fix("Dinah", say, "book")
+    assert _book_text(book) == f"{BOOK_LIST}Dinah → {say}\n"
+
+
+def test_an_ipa_line_already_in_a_list_is_skipped_and_a_new_fix_replaces_it(
+    folders: tuple[Path, Path],
+) -> None:
+    book, data = folders
+    path = pronunciations.book_list_path(book)
+    path.write_text(f"{BOOK_LIST}Dinah → ˈdaɪnə   # from Wikipedia\n", encoding="utf-8")
+    lists = _lists(book, data)
+    assert lists.fix_for("Dinah") is None  # no fix: said as written, as when converting
+    assert lists.combined().apply("Dinah") == "Dinah"
+    lists.set_for_name("Dinah", "DIE-nuh")
+    assert _book_text(book) == f"{BOOK_LIST}Dinah → DIE-nuh   # from Wikipedia\n"
+    assert lists.fix_for("Dinah") == Fix("Dinah", "DIE-nuh", "book")
+
+
+def test_an_ipa_line_in_the_global_list_is_replaced_there(folders: tuple[Path, Path]) -> None:
+    """Saved in the book's list instead, the global line would stay, and so would its note on
+    every conversion of every book."""
+    book, data = folders
+    pronunciations.global_list_path(data).write_text(
+        f"{GLOBAL_LIST}Dinah → ˈdaɪnə  # wiki\n", encoding="utf-8"
+    )
+    lists = _lists(book, data)
+    assert lists.fix_for("Dinah") is None
+    lists.set_for_name("Dinah", "DIE-nuh")
+    assert _global_text(data) == f"{GLOBAL_LIST}Dinah → DIE-nuh  # wiki\n"
+    assert _book_text(book) == BOOK_LIST
+    assert lists.fix_for("Dinah") == Fix("Dinah", "DIE-nuh", "all")
+    assert pronunciations.load_for_book(data, book)[1] == []  # the note is gone
+
+
+def test_an_ipa_line_matching_in_another_case_is_replaced(folders: tuple[Path, Path]) -> None:
+    book, data = folders
+    path = pronunciations.book_list_path(book)
+    path.write_text(f"{BOOK_LIST}dinah → [ˈdaɪnə]\n", encoding="utf-8")
+    lists = _lists(book, data)
+    lists.set_for_name("Dinah", "DIE-nuh")
+    assert _book_text(book) == f"{BOOK_LIST}dinah → DIE-nuh\n"  # its own left side kept
+    assert lists.fix_for("Dinah") == Fix("dinah", "DIE-nuh", "book")
+    assert pronunciations.load_for_book(data, book)[1] == []
+
+
+def test_the_books_ipa_line_is_replaced_before_the_global_one(folders: tuple[Path, Path]) -> None:
+    book, data = folders
+    pronunciations.global_list_path(data).write_text("Dinah → ˈdaɪnə\n", encoding="utf-8")
+    path = pronunciations.book_list_path(book)
+    path.write_text(f"{BOOK_LIST}Dinah → /ˈdiːnə/\n", encoding="utf-8")
+    lists = _lists(book, data)
+    lists.set_for_name("Dinah", "DEE-nuh")
+    assert _book_text(book) == f"{BOOK_LIST}Dinah → DEE-nuh\n"
+    assert _global_text(data) == "Dinah → ˈdaɪnə\n"  # another book's business
+
+
+def test_every_skipped_line_for_the_name_goes_and_the_one_that_wins_is_replaced(
+    folders: tuple[Path, Path],
+) -> None:
+    """Two IPA lines for Dinah: the later one (which would win) gets the respelling, in place,
+    and the earlier one goes, so no note is left."""
+    book, data = folders
+    path = pronunciations.book_list_path(book)
+    path.write_text(
+        f"{BOOK_LIST}dinah → /ˈdaɪnə/  # first try\nDinah → ˈdiːnə  # second\n", encoding="utf-8"
+    )
+    lists = _lists(book, data)
+    lists.set_for_name("Dinah", "DIE-nuh")
+    assert _book_text(book) == f"{BOOK_LIST}Dinah → DIE-nuh  # second\n"
+    assert lists.fix_for("Dinah") == Fix("Dinah", "DIE-nuh", "book")
+    assert pronunciations.load_for_book(data, book)[1] == []
+
+
+def test_a_fix_typed_with_either_apostrophe_is_the_names_fix(folders: tuple[Path, Path]) -> None:
+    book, data = folders
+    path = pronunciations.book_list_path(book)
+    path.write_text(f"{BOOK_LIST}Qur'an → kur-AHN\n", encoding="utf-8")
+    lists = _lists(book, data)
+    assert lists.fix_for("Qurʾan") == Fix("Qur'an", "kur-AHN", "book")  # the book's spelling
+    lists.set_for_name("Qurʾan", "kur-AAN")  # changed on its own line, not added again
+    assert _book_text(book) == f"{BOOK_LIST}Qur'an → kur-AAN\n"
+
+
+def test_a_list_with_a_byte_order_mark_shows_and_keeps_its_first_fix(tmp_path: Path) -> None:
+    path = tmp_path / "book.pronunciations.txt"
+    path.write_bytes(b"\xef\xbb\xbf" + "Zorp → zawrp\nAda -> ay-da\n".encode())
+    file = ListFile.read(path)
+    assert file.latest() == {"Zorp": "zawrp", "Ada": "ay-da"}
+    lists = FixLists(file, ListFile(tmp_path / "pronunciations.txt"))
+    assert lists.fix_for("Zorp") == Fix("Zorp", "zawrp", "book")
+    lists.set_for_name("Zorp", "ZAWRP")
+    assert path.read_bytes() == "Zorp → ZAWRP\nAda -> ay-da\n".encode()  # written without one
+    assert [f.word for f in lists.fixes()] == ["Zorp", "Ada"]
 
 
 def test_a_respelling_with_a_hash_inside_a_word_is_fine(folders: tuple[Path, Path]) -> None:

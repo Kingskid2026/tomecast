@@ -17,22 +17,38 @@ from pathlib import Path
 from typing import Literal
 
 from tomecast.pronunciations import (
+    Notation,
     Pronunciation,
     Pronunciations,
     edit,
     matches,
     parse,
+    phonetic_lines,
+    phonetic_notation,
+    read_list,
     same_written,
     save,
+    without_phonetic,
 )
 
 Scope = Literal["book", "all"]  # this book's list, or the one for every book
 SCOPES: tuple[Scope, ...] = ("book", "all")
 
-SLASHES = (
-    "Type the word the way it sounds, like her-MY-oh-nee. This voice can't use phonetic "
-    "symbols in /slashes/."
+PHONETIC = (
+    "That looks like IPA. This voice can't use phonetic symbols, so type the word the way it "
+    "sounds in plain letters, like shi-vawn."
 )
+MARKUP = (
+    "This voice can't use eSpeak's [[ ]] phoneme markup, so type the word the way it sounds "
+    "in plain letters, like shi-vawn."
+)
+LEAVE_OUT = "Leave out the {}: type just the way the word sounds, in plain letters, like shi-vawn."
+NOTATIONS: dict[Notation, str] = {
+    "IPA": PHONETIC,
+    "markup": MARKUP,
+    "slashes": LEAVE_OUT.format("slashes"),
+    "brackets": LEAVE_OUT.format("brackets"),
+}
 COMMENT = "Leave out the “#”: in a pronunciation list it starts a comment."
 
 
@@ -60,7 +76,7 @@ def _read(path: Path) -> str:
         OSError, UnicodeDecodeError: if it exists but can't be read.
     """
     try:
-        return path.read_text(encoding="utf-8")
+        return read_list(path)
     except FileNotFoundError:
         return ""
 
@@ -92,6 +108,10 @@ class ListFile:
     def entries(self) -> tuple[Pronunciation, ...]:
         return parse(self.text)[0].entries
 
+    def phonetic(self) -> tuple[Pronunciation, ...]:
+        """The lines skipped because they are phonetic spellings (they show as no fix)."""
+        return phonetic_lines(self.text)
+
     def latest(self) -> dict[str, str]:
         """Left side -> right side, one per left side (a later line wins, as when converting)."""
         found: dict[str, str] = {}
@@ -101,8 +121,17 @@ class ListFile:
             found[key] = entry.spoken
         return found
 
-    def change(self, written: str, spoken: str | None, *, keep_on_failure: bool = True) -> None:
-        """Set the fix for ``written`` (or remove it, with ``None``) and save the file.
+    def change(
+        self,
+        written: str,
+        spoken: str | None,
+        *,
+        keep_on_failure: bool = True,
+        replacing_phonetic: str | None = None,
+    ) -> None:
+        """Set the fix for ``written`` (or remove it, with ``None``) and save the file. With
+        ``replacing_phonetic`` (a word), the other lines for that word that are skipped as
+        phonetic spellings go too, so none of their warnings is left.
 
         Raises:
             FixNotSaved: if the file couldn't be read or written. With ``keep_on_failure``
@@ -116,6 +145,8 @@ class ListFile:
             except (OSError, UnicodeDecodeError) as error:
                 self.problem = _reason(error)
         self.text = edit(base, written, spoken)
+        if replacing_phonetic is not None:
+            self.text = without_phonetic(self.text, replacing_phonetic)
         failure: str | None = None
         if self.problem is not None:
             failure = f"Tomecast couldn't read {self.path} ({self.problem}), so it won't change it."
@@ -141,11 +172,13 @@ def check(written: str, say: str) -> None:
     """Make sure ``written → say`` can be saved as a line and read back the same.
 
     Raises:
-        BadFix: for a phonetic spelling in /slashes/, a "#" that would start a comment, or
-            anything else that wouldn't read back as typed.
+        BadFix: for a phonetic spelling (IPA, eSpeak markup, or a value in slashes or
+            brackets: see :func:`tomecast.pronunciations.phonetic_notation`), a "#" that
+            would start a comment, or anything else that wouldn't read back as typed.
     """
-    if len(say) > 2 and say.startswith("/") and say.endswith("/"):
-        raise BadFix(SLASHES)
+    notation = phonetic_notation(say)
+    if notation is not None:
+        raise BadFix(NOTATIONS[notation])
     fixes, warnings = parse(f"{written} → {say}")
     if warnings or fixes.entries != (Pronunciation(written, say),):
         raise BadFix(COMMENT if "#" in say else f"Tomecast can't save “{say}” as a fix.")
@@ -198,8 +231,11 @@ class FixLists:
 
     def set_for_name(self, word: str, say: str) -> None:
         """Save ``say`` as the fix for ``word`` (a name the finder listed); an empty ``say``
-        removes its fix. A fix that exists is changed in its own list; a new one goes in
-        the book's.
+        removes its fix. A fix that exists is changed in its own list. Otherwise a line
+        for ``word`` that is skipped as a phonetic spelling (IPA saved before Tomecast
+        refused it, say) is given the respelling, in whichever list has it (its last such
+        line, the one that would win), and that list's other skipped lines for ``word`` are
+        removed, so no warning is left; failing that, the new fix goes in the book's list.
 
         Raises:
             BadFix: if ``say`` can't be saved (nothing changes).
@@ -213,11 +249,24 @@ class FixLists:
             return
         if current is not None and current.say == say:
             return
-        check(current.word if current else word, say)
-        if current is not None:
-            self._change(current.scope, current.word, say)
+        target = current or self._phonetic_for(word)
+        check(target.word if target else word, say)
+        if target is not None:
+            # A skipped line gets the respelling, and any other skipped line for the word in
+            # that list goes, so no warning is left behind.
+            replacing = None if current is not None else word
+            self._change(target.scope, target.word, say, replacing_phonetic=replacing)
         else:
             self._change("book", word, say)
+
+    def _phonetic_for(self, word: str) -> Fix | None:
+        """A line for ``word`` skipped as a phonetic spelling: the book's list first, then the
+        global one, matched the way a fix matches a word (so ``siobhan`` covers *Siobhan*)."""
+        for scope in SCOPES:
+            for entry in reversed(self._files[scope].phonetic()):
+                if matches(entry.written, word):
+                    return Fix(entry.written, entry.spoken, scope)
+        return None
 
     def remove(self, scope: Scope, word: str) -> None:
         """Remove the fix for ``word`` from one list.
@@ -250,7 +299,18 @@ class FixLists:
         return None
 
     def _change(
-        self, scope: Scope, written: str, spoken: str | None, *, keep_on_failure: bool = True
+        self,
+        scope: Scope,
+        written: str,
+        spoken: str | None,
+        *,
+        keep_on_failure: bool = True,
+        replacing_phonetic: str | None = None,
     ) -> None:
         self._combined = None
-        self._files[scope].change(written, spoken, keep_on_failure=keep_on_failure)
+        self._files[scope].change(
+            written,
+            spoken,
+            keep_on_failure=keep_on_failure,
+            replacing_phonetic=replacing_phonetic,
+        )

@@ -396,10 +396,33 @@ def test_latin_and_references(written: str, spoken: str) -> None:
         ("as I act I can", "as I act I can"),
         ("the MIX CD", "the MIX CD"),
         ("Super Mario MD", "Super Mario MD"),
+        # A numeral's letter starting a contraction or a name is not a numeral...
+        ("Chapter L'vov", "Chapter L'vov"),
+        ("Prince L\u2019vov came", "Prince L\u2019vov came"),
+        ("Book I'm here", "Book I'm here"),
+        ("Act I'll go", "Act I'll go"),
+        ("Louis XIV'd", "Louis XIV'd"),
+        # ...but a possessive is still one, with a straight or a curly apostrophe.
+        ("Henry VIII\u2019s wives", "Henry the eighth\u2019s wives"),
+        ("Chapter XII's end", "Chapter twelve's end"),
     ],
 )
 def test_roman_numerals(written: str, spoken: str) -> None:
     assert say(written) == spoken
+
+
+@pytest.mark.parametrize(
+    ("written", "spoken"),
+    [
+        ("Chapter L\u02b9vov", "Chapter L'vov"),
+        ("Book I\u02bcm here", "Book I'm here"),
+        ("Henry V\u02bcs army", "Henry the fifth's army"),
+        ("Part D\u02bc", "Part D\u02bc"),  # a label: the mark stays, so it's no "five hundred"
+        ("Volume C\u02b9", "Volume C\u02b9"),
+    ],
+)
+def test_marks_made_apostrophes_dont_make_roman_numerals(written: str, spoken: str) -> None:
+    assert TextPrep.for_language("en").body(written) == spoken
 
 
 @pytest.mark.parametrize(
