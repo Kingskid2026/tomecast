@@ -311,6 +311,7 @@ class _Meter:
         self._audio_seconds = 0.0
         self._started: float | None = None
         self._paused_before = 0.0
+        self._voicing_seconds = 0.0  # see _elapsed
         self._cpu_speedup = cpu_speedup
         self._on_fallback = on_fallback
         self._expected: float | None = None  # the speed to show until it's measured again
@@ -339,6 +340,8 @@ class _Meter:
             self._voiced_chars += len(text)
             with contextlib.suppress(wave.Error, EOFError, OSError):
                 self._audio_seconds += wav_info(output).seconds
+            paused = self._control.paused_seconds - self._paused_before
+            self._voicing_seconds = time.monotonic() - self._started - paused
         finally:
             # Moved to the CPU during this call: said even if the CPU's first try then failed
             # (the retry would find it on the CPU already, and nobody would know it moved).
@@ -351,15 +354,16 @@ class _Meter:
         if self._voiced_chars and self._audio_seconds > 0:
             self._audio_per_char = self._audio_seconds / self._voiced_chars
         self.voiced = self._voiced_chars = 0
-        self._audio_seconds = 0.0
+        self._audio_seconds = self._voicing_seconds = 0.0
         self._started = None
         self._expected = self._cpu_speedup
 
     def _elapsed(self) -> float:
-        if self._started is None:
-            return 0.0
-        paused = self._control.paused_seconds - self._paused_before
-        return time.monotonic() - self._started - paused
+        """The time this run spent voicing: from the start of the first piece it voiced to
+        the end of the last one, minus pauses. Packaging comes after the last piece, so it
+        never counts (minutes for a long book, which would swamp a resumed book's few new
+        pieces): the speed is the voice's, as the speed test measures it."""
+        return self._voicing_seconds
 
     def _measured(self) -> bool:
         return (
@@ -418,7 +422,10 @@ class ConversionWorker(QObject):
     # A sentence for the banner while the book goes on: the graphics card ran out of memory,
     # so the engine uses the CPU (with the threads it was given when it was made).
     noticed = Signal(int, str, int)  # job, the sentence, the CPU threads the engine uses
-    deviceChosen = Signal(str)  # the graphics card's description, or "" for the CPU
+    # The graphics card's description ("" for the CPU), and whether the card was looked for
+    # (or the engine asked for it): an engine started on the CPU because the card is switched
+    # off says nothing about the card.
+    deviceChosen = Signal(str, bool)
     speedsKnown = Signal(object)  # Speeds, from the start-up scan
 
     def __init__(
@@ -481,7 +488,7 @@ class ConversionWorker(QObject):
         devices = self._device_scanner(self._root, self._stopping.is_set) if job.gpu else None
         if job.gpu:
             device = pick_device(devices or [])
-            self.deviceChosen.emit(device.description if device else "")
+            self.deviceChosen.emit(device.description if device else "", True)
         self._close_preview_engine()  # one model in memory at a time
         try:
             speeds = self._speed_probe(self._root, job.gpu, self._stopping.is_set, devices)
@@ -546,7 +553,7 @@ class ConversionWorker(QObject):
             engine.start()
             self._preview_engine = engine
             self._preview_gpu = use_gpu
-            self.deviceChosen.emit(engine.gpu_description)
+            self.deviceChosen.emit(engine.gpu_description, use_gpu)
         self._preview_engine.voice = voice
         self._preview_engine.speed = speed
         return self._preview_engine
@@ -684,7 +691,7 @@ class ConversionWorker(QObject):
             if engine.out_of_memory:
                 tell_out_of_memory()
             else:
-                self.deviceChosen.emit(engine.gpu_description)
+                self.deviceChosen.emit(engine.gpu_description, job.use_gpu)
             started = time.monotonic()
             paused_before = control.paused_seconds
             meter = _Meter(

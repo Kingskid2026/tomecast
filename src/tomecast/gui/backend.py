@@ -950,11 +950,15 @@ class Backend(QObject):
         self._update("loading", False)
         self._show("chapters")
 
-    @Slot(str)
-    def _on_device(self, description: str) -> None:
-        """The worker found out (or started the engine on) which graphics card is in use."""
+    @Slot(str, bool)
+    def _on_device(self, description: str, asked: bool) -> None:
+        """The worker found out (or started the engine on) which graphics card is in use.
+        Only when the card was ``asked`` for does an empty description mean it isn't there or
+        didn't work: an engine started on the CPU because the card is switched off says
+        nothing about it, so its name stays, and with it the measured note."""
         self._rescan_machine()  # what the engine just read too
-        self._update("gpuName", description)
+        if asked:
+            self._update("gpuName", description)
         self._refresh_hardware_label()
         self.selectionSummaryChanged.emit()
 
