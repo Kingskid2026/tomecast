@@ -17,9 +17,9 @@ import time
 from collections.abc import Iterator, Mapping
 from pathlib import Path
 
+from tomecast import oslayer
 from tomecast.downloads import Asset, build_sha256, installed_sha256
 from tomecast.engines.audiocpp import AUDIOCPP_VERSION, DEFAULT_SEED, required_assets
-from tomecast.oslayer import FileLock
 
 # Unfinished conversions are kept so they can be resumed; after this long they're removed.
 STALE_WORK_DAYS = 14
@@ -79,7 +79,7 @@ def exclusive(folder: Path) -> Iterator[None]:
     Raises:
         WorkFolderBusy: if another run (in this process or another one) holds the lock.
     """
-    lock = FileLock(folder / ".lock")
+    lock = oslayer.FileLock(folder / ".lock")
     if not lock.acquire():
         raise WorkFolderBusy(
             "this book is already being converted with the same settings "
