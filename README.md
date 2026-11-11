@@ -175,7 +175,7 @@ A Mac version isn't planned yet. Each step is tracked on the [milestones page](h
 
 ## Privacy
 
-Everything runs locally. Tomecast uses the internet only to download engines and models, after asking. It doesn't check for updates on its own: run the install line again to update. There is no telemetry. Every download is checked against a checksum pinned in Tomecast's code. Models and most engines come from their official sources. The audio.cpp voice engine is Tomecast's own unmodified build of audio.cpp's official source, made by GitHub Actions so it runs on more distros, and downloaded from this repository's [releases](https://github.com/Kingskid2026/tomecast/releases/tag/audiocpp-v0.9.4-tc1) ([how it's built](THIRD_PARTY.md#audiocpp-builds-distributed-by-tomecast)).
+Everything runs locally. Tomecast uses the internet only to download engines and models, after asking. It doesn't check for updates on its own: run the install line again to update. There is no telemetry. Every download is checked against a checksum pinned in Tomecast's code. Models and most engines come from their official sources. The audio.cpp voice engine is Tomecast's own build of audio.cpp's official source, made by GitHub Actions so it runs on more distros, and downloaded from this repository's [releases](https://github.com/Kingskid2026/tomecast/releases/tag/audiocpp-v0.9.4-tc1) ([how it's built](THIRD_PARTY.md#audiocpp-builds-distributed-by-tomecast)). Its only source changes are small opt-in patches of Tomecast's own, listed there, which do nothing unless turned on.
 
 ## Contributing
 
