@@ -2319,8 +2319,10 @@ def test_the_start_up_scan_looks_at_the_card_only_when_it_is_switched_on(
             settings=settings,
             system_check=lambda: None,
         )
-        qtbot.waitUntil(lambda before=before: len(asked) > before)  # type: ignore[misc]
-        backend.shutdown()
+        try:
+            qtbot.waitUntil(lambda before=before: len(asked) > before)  # type: ignore[misc]
+        finally:
+            backend.shutdown()  # even if the wait fails: never leave its thread running
 
     assert asked == [False, True, False]  # off means the card isn't touched at all
 
@@ -2641,8 +2643,10 @@ def test_the_start_up_scan_lists_the_cards_once(qtbot: QtBot, tmp_path: Path) ->
         settings=QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat),
         system_check=lambda: None,
     )
-    qtbot.waitUntil(lambda: bool(given))
-    backend.shutdown()
+    try:
+        qtbot.waitUntil(lambda: bool(given))
+    finally:
+        backend.shutdown()  # even if the wait fails: never leave its thread running
 
     assert scanned == [True]
     assert given == [[card]]  # the probe gets that list instead of asking again

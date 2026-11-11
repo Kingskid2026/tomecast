@@ -2,7 +2,9 @@ import dataclasses
 import hashlib
 import json
 import platform
+import sys
 import tarfile
+import textwrap
 import time
 from pathlib import Path
 
@@ -110,9 +112,24 @@ def test_a_crash_at_startup_shows_the_engine_log(
         _server(tmp_path, fake_server).start()
 
 
+# A damaged build that crashes at once with SIGSEGV, saying nothing. It makes itself
+# non-dumpable first, so the kernel never hands its crash to the system's core-dump handler
+# (systemd-coredump, and the desktop's crash notification): the test needs the real signal,
+# not a core file. -I keeps PYTHON* settings (faulthandler) out, and SIG_DFL makes sure
+# nothing catches the signal and writes to the log.
+_SEGFAULTS = textwrap.dedent(
+    """
+    import ctypes, os, signal
+    ctypes.CDLL(None).prctl(4, 0, 0, 0, 0)  # PR_SET_DUMPABLE, 0: no core dump
+    signal.signal(signal.SIGSEGV, signal.SIG_DFL)
+    os.kill(os.getpid(), signal.SIGSEGV)
+    """
+)
+
+
 def test_an_engine_that_dies_without_a_word_says_how_it_ended(tmp_path: Path) -> None:
     program = tmp_path / "audiocpp_server"
-    program.write_text("#!/bin/sh\nkill -SEGV $$\n")  # a damaged build: crashes at once
+    program.write_text(f"#!{sys.executable} -I\n{_SEGFAULTS}")
     program.chmod(0o755)
 
     with pytest.raises(EngineError, match="no log; it exited with signal SIGSEGV"):
