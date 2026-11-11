@@ -74,7 +74,7 @@ function Install-Tomecast {
 
     $BinDir = (& $Uv tool dir --bin | Select-Object -Last 1).Trim()
     $Tomecast = Join-Path $BinDir 'tomecast.exe'
-    $version = & $Tomecast --version 2>$null
+    $version = & $Tomecast --version  # its errors stay visible, as in install.sh
     if ($LASTEXITCODE -ne 0) {
         throw "tomecast-install: error: Tomecast installed, but didn't start. Please open an issue."
     }
