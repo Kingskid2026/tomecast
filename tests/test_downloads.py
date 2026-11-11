@@ -1125,6 +1125,51 @@ def test_a_scan_takes_the_build_back_for_a_downgraded_tomecast(
     assert state["slots"]["engine"]["chosen_by"] == "0.2.0"  # the new choice is recorded
 
 
+def test_taking_a_build_back_keeps_the_other_one_to_go_back_to(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 0.2 installs its build, 0.3 switches to its own (not yet proven), then the user goes back
+    # to 0.2 and runs `tomecast scan`. The build before the switch is the one being taken back,
+    # so it can't also be the one to go back to.
+    root = tmp_path / "data"
+    ours, theirs = _build(tmp_path, "ours"), _build(tmp_path, "theirs")
+    monkeypatch.setattr(downloads, "__version__", "0.2.0")
+    prepare([ours], root, check=Check())
+    monkeypatch.setattr(downloads, "__version__", "0.3.0")
+    assert prepare([theirs], root, check=Check()).switched == (theirs,)
+    monkeypatch.setattr(downloads, "__version__", "0.2.0")
+
+    taken = prepare([ours], root, check=Check(), take_over=True)
+
+    assert taken.switched == (ours,)
+    slot = json.loads((root / "installed.json").read_text())["slots"]["engine"]
+    assert slot["current"] != slot["previous"]
+    assert slot["previous"] == build_folder(theirs, root).relative_to(root).as_posix()
+    assert build_sha256(build_folder(theirs, root)) is not None  # still there to go back to
+
+
+def test_switching_back_after_an_older_scan_can_still_roll_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 0.3 installs its build, 0.2's `tomecast scan` takes over, then 0.3 runs again and
+    # switches back. A failure of that build must roll back to 0.2's, not "back" to itself.
+    root = tmp_path / "data"
+    ours, theirs = _build(tmp_path, "ours"), _build(tmp_path, "theirs")
+    monkeypatch.setattr(downloads, "__version__", "0.3.0")
+    prepare([theirs], root, check=Check())
+    monkeypatch.setattr(downloads, "__version__", "0.2.0")
+    assert prepare([ours], root, check=Check(), take_over=True).switched == (ours,)
+    monkeypatch.setattr(downloads, "__version__", "0.3.0")
+
+    back = prepare([theirs], root, check=Check())
+
+    assert back.switched == (theirs,)
+    slot = json.loads((root / "installed.json").read_text())["slots"]["engine"]
+    assert slot["current"] != slot["previous"]
+    assert roll_back(root, back.builds, "crashed on the book")
+    assert _version(root, theirs) == "ours"
+
+
 def test_a_scan_doesnt_take_the_build_back_if_its_own_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

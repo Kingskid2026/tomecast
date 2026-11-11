@@ -17,9 +17,9 @@ There are two kinds of asset:
   which build of each archive is in use. :func:`prepare` switches to a new build only after
   the self-checks of the voices that use it have passed; until then, and if one fails, the
   build in use stays in use. A switched-to build that then fails a real run is rolled back
-  (:func:`roll_back`) until it has finished one (:func:`mark_proven`). Each archive keeps at
-  most two builds: the one in use, plus either the new one (if it is waiting or failed its
-  check) or the previous one (to go back to).
+  (:func:`roll_back`) until it has finished one (:func:`mark_proven`). Each archive usually
+  keeps two builds: the one in use, plus either the new one (if it is waiting or failed its
+  check) or the previous one (to go back to); see :func:`_clean_up` for when it keeps three.
 
 Builds that Tomecast 0.1.x extracted into ``engines/audiocpp-0.9.4-vulkan`` and the like are
 adopted where they are (see :attr:`Asset.replaces`), so upgrading never deletes them before
@@ -398,7 +398,8 @@ def prepare(
        A first install has nothing to fall back to, so it isn't checked here: the run itself
        shows whether it works (and a switched-to build that fails its first run is rolled
        back, see :func:`roll_back`).
-    4. Builds no longer needed are deleted: each archive keeps at most two.
+    4. Builds no longer needed are deleted: each archive usually keeps two (see
+       :func:`_clean_up`).
 
     Holds a lock on the data folder throughout, so two Tomecast processes don't install at
     once. While waiting for it, and during the checks, ``cancelled`` is asked whether the user
@@ -664,15 +665,20 @@ def _failure_record(reason: str, *, during: str) -> dict[str, str]:
 def _promote(asset: Asset, root: Path, *, proven: bool) -> None:
     """Make the pinned build of ``asset`` the one in use. The one to go back to is kept: the
     build being replaced if it had finished a book, else the one before it (so replacing a
-    just-switched build that never ran never loses the last build known to work)."""
+    just-switched build that never ran never loses the last build known to work). It is never
+    the new build itself: going "back" to the build in use would roll back nowhere."""
     slots = _load(root)
     old = _effective(asset, root, slots)
     new = _relative(build_folder(asset, root), root)
     old.failed.pop(asset.sha256, None)
-    fallback = old.current if old.proven else old.previous
+    preferred = old.current if old.proven else old.previous
+    fallback = next(
+        (folder for folder in (preferred, old.current, old.previous) if folder and folder != new),
+        None,
+    )
     slots[asset.slot] = _Slot(
         current=new,
-        previous=fallback if fallback != new else old.previous,
+        previous=fallback,
         chosen_by=__version__,
         proven=proven,
         failed=old.failed,

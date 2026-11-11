@@ -138,8 +138,10 @@ def finish(backend: Backend, code: int) -> int:
     parent-death signal each one was started with."""
     backend.shutdown()
     if backend.worker_thread.isRunning():
-        backend.save_settings()
-        sys.stdout.flush()
-        sys.stderr.flush()
+        with contextlib.suppress(Exception):
+            backend.save_settings()
+        for stream in (sys.stdout, sys.stderr):
+            with contextlib.suppress(Exception):
+                stream.flush()
         os._exit(code)
     return code

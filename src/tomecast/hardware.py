@@ -13,6 +13,7 @@ Tomecast never installs, updates or configures a graphics driver. It asks two qu
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import glob
 import json
@@ -76,15 +77,23 @@ def list_devices(
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
     deadline = time.monotonic() + timeout
-    while True:
-        try:
-            stdout, _ = process.communicate(timeout=0.2)
-            break
-        except subprocess.TimeoutExpired:
-            if time.monotonic() >= deadline or (cancelled is not None and cancelled()):
-                process.kill()
-                process.communicate()
-                return None
+    try:
+        while True:
+            try:
+                stdout, _ = process.communicate(timeout=0.2)
+                break
+            except subprocess.TimeoutExpired:
+                if time.monotonic() >= deadline or (cancelled is not None and cancelled()):
+                    return None
+    finally:
+        # Out early (timeout, stop, Ctrl-C): kill it and reap it, but don't wait for the end of
+        # stdout, which a child process it started may still hold open.
+        if process.returncode is None:
+            process.kill()
+            with contextlib.suppress(subprocess.SubprocessError):
+                process.wait(timeout=5)
+        if process.stdout is not None:
+            process.stdout.close()
     if process.returncode != 0:
         return None
     payload: object = None

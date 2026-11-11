@@ -440,8 +440,10 @@ def _convert(args: argparse.Namespace) -> int:
     sys.stdout.flush()
     # After "Done", and never waiting long on another Tomecast's install. A run that fell back
     # to the CPU says nothing about how the build does on the card, so it proves nothing.
+    # The book is made either way, so a disk that won't take installed.json isn't an error.
     if not fell_back:
-        mark_proven(root, builds)
+        with contextlib.suppress(OSError):
+            mark_proven(root, builds)
     return 0
 
 
