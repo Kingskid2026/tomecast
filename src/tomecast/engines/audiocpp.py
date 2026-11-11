@@ -158,6 +158,31 @@ _PORT_TAKEN = re.compile(
 )
 _PHONEME_LIMIT_MESSAGE = "exceeds 510"
 
+# How audio.cpp says the graphics card is out of memory, seen on the maintainer's laptop with
+# another program holding most of the card's memory (#49): Kokoro starts, and then requests
+# fail with HTTP 500 and a ggml message containing "failed to allocate" while the server stays
+# up; the heavier Ming fails while loading, with Vulkan's ErrorOutOfDeviceMemory in its log.
+# The other two are the same failure in Vulkan's and ggml's other words.
+_OUT_OF_MEMORY = re.compile(
+    r"failed to allocate|ErrorOutOfDeviceMemory|VK_ERROR_OUT_OF_DEVICE_MEMORY"
+    r"|memory allocation of size \d+ failed",
+    re.IGNORECASE,
+)
+# Not the card's memory: ggml recovers from a failed pinned-memory allocation by using
+# ordinary memory (it says so and carries on), and a CPU buffer is the computer's own memory,
+# which the CPU would need just the same.
+_NOT_THE_CARDS_MEMORY = re.compile(r"pinned memory|\bCPU\b|_cpu_", re.IGNORECASE)
+
+
+def out_of_graphics_memory(message: str) -> bool:
+    """Whether ``message`` (an error reply from audio.cpp, or its log) says the graphics card
+    ran out of memory. Only out-of-memory counts, not every failure: an engine that fails for
+    another reason must not be moved to the CPU as if it were short of memory."""
+    return any(
+        _OUT_OF_MEMORY.search(line) and not _NOT_THE_CARDS_MEMORY.search(line)
+        for line in message.splitlines()
+    )
+
 
 class EngineError(RuntimeError):
     """Raised when the voice engine can't start or can't voice a piece of text."""
@@ -165,6 +190,12 @@ class EngineError(RuntimeError):
 
 class GpuUnavailable(EngineError):
     """The engine was asked to use the graphics card and couldn't (or used the CPU instead)."""
+
+
+class GpuOutOfMemory(GpuUnavailable):
+    """The graphics card ran out of memory: while the engine started, or on a request. Other
+    programs using the card cause this, not the engine build, so it is never a crash or a
+    failed build: the same build carries on on its CPU backend (:class:`AutoKokoro`)."""
 
 
 class _ConnectionLost(EngineError):
@@ -308,6 +339,7 @@ class KokoroServer:
         self._tempdir: tempfile.TemporaryDirectory[str] | None = None
         self._base_url = ""
         self._consecutive_restarts = 0
+        self._log_offset = 0  # where the running process's part of the log starts
 
     @property
     def speed(self) -> float:
@@ -458,6 +490,8 @@ class KokoroServer:
 
         Restarts are counted per piece of text, so a long book survives an occasional crash,
         but an engine that crashes on the same text again and again gives up with its log.
+        One that stopped because the graphics card ran out of memory hasn't crashed: that
+        raises :class:`GpuOutOfMemory` and is never counted or restarted on the card.
         """
         try:
             data = self._request(text)
@@ -468,6 +502,13 @@ class KokoroServer:
             # restart nor "keeps crashing", which could be blamed on the build.
             self._stop_if_asked()
             log = _tail(self._log_path)
+            if self.backend == "vulkan" and out_of_graphics_memory(
+                self._log_since(self._log_offset)
+            ):
+                raise GpuOutOfMemory(
+                    f"the graphics card ran out of memory and the voice engine stopped. Its log:"
+                    f"\n{log}"
+                ) from error
             if self._consecutive_restarts >= _MAX_RESTARTS:
                 raise EngineError(f"the voice engine keeps crashing. Its log:\n{log}") from error
             self._consecutive_restarts += 1
@@ -486,6 +527,15 @@ class KokoroServer:
     def _log_path(self) -> Path:
         assert self._tempdir is not None
         return Path(self._tempdir.name) / "server.log"
+
+    def _log_since(self, offset: int) -> str:
+        """What the engine logged from byte ``offset`` on (one process's part of the log)."""
+        try:
+            with self._log_path.open("rb") as log_file:
+                log_file.seek(offset)
+                return log_file.read().decode("utf-8", "replace")
+        except OSError:
+            return ""
 
     def _launch(self) -> None:
         """Start the server process in the temp folder and wait until it's healthy.
@@ -508,6 +558,7 @@ class KokoroServer:
         assert self._tempdir is not None
         workdir = Path(self._tempdir.name)
         log_start = self._log_path.stat().st_size if self._log_path.exists() else 0
+        self._log_offset = log_start
         port = _free_port()
         self._base_url = f"http://127.0.0.1:{port}"
         config = workdir / "server.json"
@@ -528,14 +579,17 @@ class KokoroServer:
         while time.monotonic() < deadline:
             self._stop_if_asked()
             if self._process.poll() is not None:
-                with self._log_path.open("rb") as log_file:
-                    log_file.seek(log_start)
-                    this_start = log_file.read().decode("utf-8", "replace")
+                this_start = self._log_since(log_start)
                 if _PORT_TAKEN.search(this_start):
                     raise _PortTaken(this_start.strip()[-400:])
                 said = _tail(self._log_path).strip()
                 if not said:  # e.g. a damaged program, which dies before it can log anything
                     said = f"(no log; it exited with {_exit_status(self._process.returncode)})"
+                if self.backend == "vulkan" and out_of_graphics_memory(this_start):
+                    raise GpuOutOfMemory(
+                        f"the graphics card ran out of memory while the voice engine started:"
+                        f"\n{said}"
+                    )
                 raise EngineError(f"the voice engine stopped while starting:\n{said}")
             if self._healthy():
                 if self.backend == "vulkan" and self._reported_backend != "vulkan":
@@ -545,10 +599,13 @@ class KokoroServer:
                     )
                 return
             time.sleep(0.2)
-        raise EngineError(
-            f"the voice engine didn't start within {self._startup_timeout:.0f}s:\n"
-            f"{_tail(self._log_path)}"
-        )
+        problem = f"the voice engine didn't start within {self._startup_timeout:.0f}s"
+        if self.backend == "vulkan" and out_of_graphics_memory(self._log_since(log_start)):
+            # Still loading, or stuck, after the card ran out of memory (it said so).
+            raise GpuOutOfMemory(
+                f"the graphics card ran out of memory and {problem}:\n{_tail(self._log_path)}"
+            )
+        raise EngineError(f"{problem}:\n{_tail(self._log_path)}")
 
     def _stop_if_asked(self) -> None:
         if self._aborted.is_set() or (self._cancelled is not None and self._cancelled()):
@@ -589,7 +646,10 @@ class KokoroServer:
                 data: bytes = response.read()
                 return data
         except urllib.error.HTTPError as error:
-            raise EngineError(_error_message(error)) from error
+            message = _error_message(error)
+            if self.backend == "vulkan" and out_of_graphics_memory(message):
+                raise GpuOutOfMemory(message) from error  # the server is still up
+            raise EngineError(message) from error
         except (OSError, http.client.HTTPException) as error:
             raise _ConnectionLost(f"couldn't reach the voice engine: {error}") from error
 
@@ -762,6 +822,16 @@ def _tail(path: Path, lines: int = 20) -> str:
 
 CPU_FALLBACK_NOTE = "The graphics card didn't work, so Tomecast used the CPU."
 NO_DEVICE_NOTE = "No usable graphics card was found, so Tomecast used the CPU."
+# The card ran out of memory (other programs were using it): as the engine started, or partway
+# through a book. Each is one sentence for the command line, the window's banner and the done
+# screen, so it reads right while the book is still being made and after.
+OUT_OF_MEMORY_NOTE = (
+    "The graphics card didn't have enough free memory, so Tomecast used the CPU (slower)."
+)
+RAN_OUT_OF_MEMORY_NOTE = (
+    "The graphics card ran out of memory, so Tomecast carried on with the same voice on the "
+    "CPU (slower)."
+)
 
 
 class AutoKokoro(KokoroServer):
@@ -775,12 +845,24 @@ class AutoKokoro(KokoroServer):
     the card's name), :attr:`gpu_description` is the card's full description (or ``""``),
     and :attr:`fell_back` is True if the card was wanted but the CPU is used, so the run says
     nothing about how a new build does on the card (it isn't proven by it).
+
+    **Out of graphics memory.** If the card runs out of memory as the engine starts, or on a
+    request partway through a book, the same build carries on on its CPU backend with the same
+    voice, speed and seed, from the piece of text that failed (which is voiced again there, so
+    nothing is skipped), and stays there until the engine is stopped: a book never goes back
+    and forth. The next :meth:`start` (the next book) tries the card again.
+    :attr:`out_of_memory` is then True and :attr:`warning` says so in one sentence. It isn't
+    a crash or a broken build: it never counts towards "keeps crashing", and a run that hit it
+    neither proves nor rolls back a build. None of this depends on the voice model: it's how
+    audio.cpp's server reports the card's memory, so a second voice on the same server code
+    (Ming, #11) gets it as it is.
     """
 
     def __init__(self, root: Path, *, use_gpu: bool = True, **kwargs: object) -> None:
         self.use_gpu = use_gpu
         self.warning: str | None = None
         self.fell_back = False
+        self.out_of_memory = False
         self.device_label = "CPU"
         self.gpu_description = ""
         super().__init__(root, backend="vulkan" if use_gpu else "cpu", **kwargs)  # type: ignore[arg-type]
@@ -792,7 +874,7 @@ class AutoKokoro(KokoroServer):
     def start(self) -> None:
         if self._process is not None:
             return
-        self.warning, self.fell_back = None, False
+        self.warning, self.fell_back, self.out_of_memory = None, False, False
         self.device_label, self.gpu_description = "CPU", ""
         if not self.use_gpu:
             super().start()
@@ -808,6 +890,10 @@ class AutoKokoro(KokoroServer):
         self.backend, self.device = "vulkan", device.index
         try:
             super().start()
+        except GpuOutOfMemory:
+            self.out_of_memory = True  # before the CPU start, which could fail for its own reasons
+            self._use_cpu(OUT_OF_MEMORY_NOTE)
+            return
         except GpuUnavailable:
             self._use_cpu(CPU_FALLBACK_NOTE)
             return
@@ -819,6 +905,24 @@ class AutoKokoro(KokoroServer):
         self.backend, self.device = "cpu", None
         super().start()
         self.warning, self.fell_back = note, True
+
+    def synthesize(self, text: str, output: Path) -> None:
+        try:
+            super().synthesize(text, output)
+        except GpuOutOfMemory:
+            self._carry_on_on_cpu()
+            super().synthesize(text, output)  # the same text again: nothing is skipped
+
+    def _carry_on_on_cpu(self) -> None:
+        """The card ran out of memory partway: start the same build again on its CPU backend
+        (the voice, speed and seed are the engine's own, so they stay the same) and keep it
+        there for the rest of this run. It's not a crash, so it isn't counted as one."""
+        self.warning, self.fell_back, self.out_of_memory = RAN_OUT_OF_MEMORY_NOTE, True, True
+        self.device_label, self.gpu_description = "CPU", ""
+        self._stop_process()
+        self.backend, self.device = "cpu", None
+        self._consecutive_restarts = 0
+        self._launch()
 
 
 # --- Installing, and checking a new build before switching to it ------------------------------
@@ -834,7 +938,7 @@ def check_build(
     backend: Literal["cpu", "vulkan"],
     device: int | None = None,
     cancelled: IsCancelled | None = None,
-) -> str | None:
+) -> CheckResult:
     """Try the engine build in the folder ``engine``: ``None`` if it works, else why not.
 
     It must start with ``backend`` (and ``device``), ``/health`` must report that backend,
@@ -843,7 +947,9 @@ def check_build(
     ``espeak`` is the eSpeak NG build to use (``None``: the one in use). It gets the same
     time as a real run (a new build's first start on a graphics card compiles its shaders).
     If ``cancelled`` says the user stopped, this raises :class:`~tomecast.downloads.Cancelled`
-    rather than report a failure.
+    rather than report a failure. If the graphics card runs out of memory (other programs
+    are using it), that says nothing about the build: the result is
+    :class:`~tomecast.downloads.Inconclusive`, so nothing is switched or recorded.
     """
     with tempfile.TemporaryDirectory(prefix="tomecast-check-") as folder:
         wav = Path(folder) / "check.wav"
@@ -867,6 +973,8 @@ def check_build(
         except (EngineError, OSError) as error:
             if cancelled is not None and cancelled():
                 raise Cancelled from error
+            if isinstance(error, GpuOutOfMemory):
+                return Inconclusive(f"the graphics card ran out of memory: {error}")
             return str(error) or type(error).__name__
         return audio_problem(wav, SELF_CHECK_TEXT) or None
 
@@ -882,8 +990,9 @@ def self_check(root: Path, use_gpu: bool, cancelled: IsCancelled | None = None) 
     run checks again. A graphics-card build is never switched to on the strength of a CPU
     check while there's a card to use; only when every build answers that it sees no card
     (so a run voices on that build's CPU side anyway) is it checked on the CPU. If a build
-    doesn't answer at all, there's no verdict either. Each build's devices are listed once
-    per check, retries included.
+    doesn't answer at all, or the card runs out of memory (other programs are using it),
+    there's no verdict either. Each build's devices are listed once per check, retries
+    included.
     """
     engine_slot = engine_asset(use_gpu).slot
 
@@ -917,8 +1026,8 @@ def self_check(root: Path, use_gpu: bool, cancelled: IsCancelled | None = None) 
                     device=device.index,
                     cancelled=cancelled,
                 )
-                if problem is None or old_engine is None:
-                    return problem
+                if problem is None or isinstance(problem, Inconclusive) or old_engine is None:
+                    return problem  # out of memory on the card says nothing about any build
                 old_problem = check_build(
                     root,
                     old_engine,

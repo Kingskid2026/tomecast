@@ -197,26 +197,56 @@ def engine_speed(
 ) -> float | None:
     """How many times real time ``engine`` (already started) voices, on the build and device
     it uses: the speed measured before, or measured now on it (``measuring`` is called first).
-    ``None`` if the speed test failed (now, or recently); that never stops a conversion."""
-    key = speed_key(
+    ``None`` if the speed test failed (now, or recently); that never stops a conversion.
+
+    If the graphics card runs out of memory during the test and the engine carries on on the
+    CPU (:class:`~tomecast.engines.audiocpp.AutoKokoro`), the result is the CPU's speed: the
+    mixed measurement is thrown away, nothing is remembered for the card (another program
+    was using its memory; the card isn't broken), and the CPU's speed is the one known, or
+    measured now."""
+    announced = False
+    for _attempt in range(2):  # a second time only after moving to the CPU
+        key = _key_of(engine)
+        if (known := known_speed(root, key)) is not None:
+            return known
+        if failed_recently(root, key):
+            return None
+        if measuring and not announced:
+            measuring()
+            announced = True
+        backend = engine.backend
+        try:
+            value = round(measure(engine), 2)  # as it's remembered, so every run shows the same
+        except EngineError as error:
+            if engine.backend == backend:
+                remember_failure(root, key, str(error))
+            return None
+        if engine.backend == backend:
+            remember_speed(root, key, value)
+            return value
+    return None
+
+
+def known_cpu_speed(root: Path, engine: KokoroServer) -> float | None:
+    """The speed measured before on the CPU for ``engine``'s build, or else for the CPU build
+    (the same code: a CPU run hides the card from the graphics-card build), with the engine's
+    threads. ``None`` if neither has been measured. For the new estimate once the graphics
+    card has run out of memory partway through a book."""
+    for build in (engine.executable.parent, build_in_use(AUDIOCPP_CPU, root)):
+        if build is not None:
+            key = speed_key(build, backend="cpu", gpu_description="", threads=engine.threads)
+            if (known := known_speed(root, key)) is not None:
+                return known
+    return None
+
+
+def _key_of(engine: KokoroServer) -> str:
+    return speed_key(
         engine.executable.parent,
         backend="vulkan" if engine.backend == "vulkan" else "cpu",
         gpu_description=getattr(engine, "gpu_description", ""),
         threads=engine.threads,
     )
-    if (known := known_speed(root, key)) is not None:
-        return known
-    if failed_recently(root, key):
-        return None
-    if measuring:
-        measuring()
-    try:
-        value = round(measure(engine), 2)  # as it's remembered, so every run shows the same
-    except EngineError as error:
-        remember_failure(root, key, str(error))
-        return None
-    remember_speed(root, key, value)
-    return value
 
 
 def probe(

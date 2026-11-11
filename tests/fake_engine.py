@@ -11,9 +11,20 @@ with it) change how it behaves:
 ``FAKE_REPORT_BACKEND``   the backend ``/health`` reports (default: the configured one)
 ``FAKE_LOADED_DEVICE``    the device ``/v1/models`` says the model is on (default: the config's)
 ``FAKE_SILENT``           voice silence instead of a tone
-``FAKE_DIE_AFTER``        crash mid-request after this many requests (``FAKE_SLOW_EXIT``: slowly)
+``FAKE_DIE_AFTER``        crash mid-request after this many requests (``FAKE_SLOW_EXIT``: slowly;
+                          ``FAKE_DIE_SAYING``: logging this first)
 ``FAKE_DELAY``            seconds each request takes
 ``FAKE_START_DELAY``      seconds before it starts serving (a slow first start)
+``FAKE_OOM_VULKAN_AFTER`` on the Vulkan backend, requests after this many fail with HTTP 500
+                          and a ggml allocation failure, and the server stays up (as Kokoro
+                          does when the graphics card is out of memory);
+                          ``FAKE_OOM_CPU_TOO``: on the CPU backend too
+``FAKE_OOM_VULKAN_START`` on the Vulkan backend, log Vulkan's ErrorOutOfDeviceMemory while
+                          loading the model and exit (as Ming does); ``FAKE_OOM_HANG``: log it
+                          and keep running without ever serving
+``FAKE_OOM_LOG``          log this at start-up (a warning the engine carries on after)
+
+Each voiced request is logged with the backend that voiced it.
 """
 
 from __future__ import annotations
@@ -53,6 +64,15 @@ FAKE_SERVER = textwrap.dedent(
     ):
         print("model failed to load", flush=True)
         sys.exit(3)
+    if os.environ.get("FAKE_OOM_LOG"):
+        print(os.environ["FAKE_OOM_LOG"], file=sys.stderr, flush=True)
+    if os.environ.get("FAKE_OOM_VULKAN_START") and config["backend"] == "vulkan":
+        print("ggml_vulkan: Device memory allocation of size 1744830464 failed.", file=sys.stderr)
+        print("ggml_vulkan: vk::Device::allocateMemory: ErrorOutOfDeviceMemory", file=sys.stderr)
+        print("failed to load model 'ming'", file=sys.stderr, flush=True)
+        if os.environ.get("FAKE_OOM_HANG"):
+            time.sleep(60)
+        sys.exit(1)
 
     def wav_for(text):
         frames = max(1, int(len(text) / 15 * 24000))
@@ -95,6 +115,8 @@ FAKE_SERVER = textwrap.dedent(
             time.sleep(float(os.environ.get("FAKE_DELAY", "0")))
             die_after = os.environ.get("FAKE_DIE_AFTER")
             if die_after is not None and REQUESTS[0] > int(die_after):
+                if os.environ.get("FAKE_DIE_SAYING"):
+                    print(os.environ["FAKE_DIE_SAYING"], file=sys.stderr, flush=True)
                 if os.environ.get("FAKE_SLOW_EXIT"):
                     # The connection drops first, and the process only ends a bit later.
                     self.connection.shutdown(socket.SHUT_RDWR)
@@ -106,7 +128,20 @@ FAKE_SERVER = textwrap.dedent(
                 return self.fail("Kokoro phoneme string exceeds 510 symbols")
             if "EXPLODE" in text:
                 return self.fail("something broke")
-            log.write(json.dumps({"event": "voiced", "body": body}) + "\\n")
+            oom_after = os.environ.get("FAKE_OOM_VULKAN_AFTER")
+            if (
+                oom_after is not None
+                and (config["backend"] == "vulkan" or os.environ.get("FAKE_OOM_CPU_TOO"))
+                and REQUESTS[0] > int(oom_after)
+            ):
+                log.write(json.dumps({"event": "out of memory", "body": body}) + "\\n")
+                log.flush()
+                return self.fail(
+                    "kokoro synthesis failed: ggml_gallocr_reserve_n: failed to allocate "
+                    "Vulkan0 buffer of size 268435456"
+                )
+            log.write(json.dumps(
+                {"event": "voiced", "body": body, "backend": config["backend"]}) + "\\n")
             log.flush()
             data = wav_for(text)
             self.send_response(200)

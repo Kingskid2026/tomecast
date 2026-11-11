@@ -93,10 +93,15 @@ class Engine(VoiceEngine, Protocol):
     speed: float
     device_label: str  # after start(): what is in use, "CPU" or the card's short name
     gpu_description: str  # after start(): the card's full description, or "" on the CPU
-    warning: str | None  # after start(): why the CPU is used when the card was wanted
-    # after start(): the card was wanted but the CPU is used, so the run doesn't prove a
-    # graphics-card build
+    # after start(): why the CPU is used when the card was wanted. Also set partway through
+    # a book, when the card runs out of memory and the engine carries on on the CPU.
+    warning: str | None
+    # after start(): the card was wanted but the CPU is used (since the start, or since the
+    # card ran out of memory partway), so the run doesn't prove a graphics-card build
     fell_back: bool
+    # the card ran out of memory (as the engine started, or partway): other programs were
+    # using it, so a failure in this run is never blamed on the build
+    out_of_memory: bool
 
     def pin_builds(self, builds: Mapping[str, Path]) -> None:
         """Run exactly these engine builds (``Prepared.builds``): the work folder is keyed by
@@ -222,6 +227,9 @@ class ConvertJob:
     # The pronunciation fixes to use. None: read the lists on the worker (load_for_book), as
     # the command line does. The window passes its own only when a change couldn't be saved.
     fixes: Pronunciations | None = None
+    # The CPU's speed as the window knows it (the speed test, or a conversion), for the time
+    # left if the graphics card runs out of memory and the book carries on on the CPU.
+    cpu_speedup: float | None = None
 
 
 Job = ReadJob | ScanJob | PreviewJob | ConvertJob
@@ -271,9 +279,23 @@ def _size_of(output: Path) -> int:
 
 
 class _Meter:
-    """Wraps the engine to measure how fast it voices in this run (reused chunks don't count)."""
+    """Wraps the engine to measure how fast it voices in this run (reused chunks don't count).
 
-    def __init__(self, engine: VoiceEngine, control: TimedControl, chunks: Sequence[Chunk]):
+    If the engine moves to the CPU partway (the graphics card ran out of memory), it calls
+    ``on_fallback`` once and measures again from the next piece: the card's speed says nothing
+    about the CPU's. Until the CPU has voiced enough to measure, the speed is
+    ``cpu_speedup`` (from the speed test), if it's known.
+    """
+
+    def __init__(
+        self,
+        engine: Engine,
+        control: TimedControl,
+        chunks: Sequence[Chunk],
+        *,
+        cpu_speedup: float | None = None,
+        on_fallback: Callable[[], None] | None = None,
+    ):
         self._engine = engine
         self._control = control
         self._chars_before = [0]
@@ -284,6 +306,10 @@ class _Meter:
         self._audio_seconds = 0.0
         self._started: float | None = None
         self._paused_before = 0.0
+        self._cpu_speedup = cpu_speedup
+        self._on_fallback = on_fallback
+        self._expected: float | None = None  # the speed to show until it's measured again
+        self._audio_per_char = 0.0  # seconds of audio per character, kept across a restart
 
     @property
     def label(self) -> str:
@@ -301,11 +327,24 @@ class _Meter:
         if self._started is None:
             self._started = time.monotonic()
             self._paused_before = self._control.paused_seconds
+        on_the_card = not self._engine.fell_back
         self._engine.synthesize(text, output)
         self.voiced += 1
         self._voiced_chars += len(text)
         with contextlib.suppress(wave.Error, EOFError, OSError):
             self._audio_seconds += wav_info(output).seconds
+        if on_the_card and self._engine.fell_back:  # it carried on on the CPU
+            self._restart()
+            if self._on_fallback is not None:
+                self._on_fallback()
+
+    def _restart(self) -> None:
+        if self._voiced_chars and self._audio_seconds > 0:
+            self._audio_per_char = self._audio_seconds / self._voiced_chars
+        self.voiced = self._voiced_chars = 0
+        self._audio_seconds = 0.0
+        self._started = None
+        self._expected = self._cpu_speedup
 
     def _elapsed(self) -> float:
         if self._started is None:
@@ -313,20 +352,30 @@ class _Meter:
         paused = self._control.paused_seconds - self._paused_before
         return time.monotonic() - self._started - paused
 
+    def _measured(self) -> bool:
+        return (
+            self.voiced >= MIN_VOICED_FOR_ESTIMATES
+            and self._elapsed() > 0
+            and self._audio_seconds > 0
+            and self._voiced_chars > 0
+        )
+
     def speedup(self) -> float | None:
-        elapsed = self._elapsed()
-        if self.voiced < MIN_VOICED_FOR_ESTIMATES or elapsed <= 0 or self._audio_seconds <= 0:
-            return None
-        return self._audio_seconds / elapsed
+        if self._measured():
+            return self._audio_seconds / self._elapsed()
+        return self._expected
 
     def seconds_left(self, chunks_done: int) -> float | None:
         """The rest of the text's audio (estimated from the audio made per character so far),
-        divided by the measured speed."""
-        if self.speedup() is None or self._voiced_chars == 0:
-            return None
+        divided by the measured speed (or, just after moving to the CPU, the CPU's speed from
+        the speed test)."""
         done = min(chunks_done, len(self._chars_before) - 1)
         remaining_chars = self._chars_before[-1] - self._chars_before[done]
-        return remaining_chars * self._elapsed() / self._voiced_chars
+        if self._measured():
+            return remaining_chars * self._elapsed() / self._voiced_chars
+        if self._expected and self._audio_per_char:
+            return remaining_chars * self._audio_per_char / self._expected
+        return None
 
 
 def _as_sentence(message: str, *, capitalize: bool = True) -> str:
@@ -357,6 +406,9 @@ class ConversionWorker(QObject):
     converted = Signal(int, object)  # job, ConvertResult
     cancelled = Signal(int)  # job
     failed = Signal(int, str)  # job, message for the error banner
+    # job, a sentence for the banner while the book goes on: the graphics card ran out of
+    # memory, so the engine uses the CPU
+    noticed = Signal(int, str)
     deviceChosen = Signal(str)  # the graphics card's description, or "" for the CPU
     speedsKnown = Signal(object)  # Speeds, from the start-up scan
 
@@ -524,6 +576,7 @@ class ConversionWorker(QObject):
     def _convert(self, job: ConvertJob) -> None:
         workdir: Path | None = None
         builds: dict[str, Path] = {}
+        engine: Engine | None = None
         try:
             self._close_preview_engine()  # one model in memory at a time
             self._system_check()
@@ -564,16 +617,21 @@ class ConversionWorker(QObject):
             message = _as_sentence(str(error))
             # A switched-to update that crashes (or makes no usable audio) on its first book.
             # Not when the run was stopped: a stopped engine says nothing about the build.
+            # Nor after the graphics card ran out of memory: other programs using it did that,
+            # and what failed after it on the CPU is most likely short of memory too (on a
+            # graphics chip built into the processor, the card's memory is the computer's).
             failed_voicing = isinstance(error, EngineError | MissingAudioError)
             stopped = job.control.cancelled or self._stopping.is_set()
-            if failed_voicing and builds and not stopped and self._roll_back(job, builds, error):
+            blameless = stopped or (engine is not None and engine.out_of_memory)
+            if failed_voicing and builds and not blameless and self._roll_back(job, builds, error):
                 message += f" {UPDATE_FAILED_NOTE} Start again to make the book with it."
             elif workdir is not None and any((workdir / "chunks").glob("*.wav")):
                 message += " The audio made so far is kept, so starting again continues from there."
             self.failed.emit(job.job, message)
             return
         self.converted.emit(job.job, outcome)  # the book is done: tell the window first
-        if not engine.fell_back:  # a run that fell back to the CPU proves nothing for the card
+        # A run that fell back to the CPU (as it started, or partway) proves nothing for the card.
+        if not engine.fell_back:
             with contextlib.suppress(Cancelled, OSError):
                 mark_proven(self._root, builds, self._stopping.is_set)
 
@@ -605,12 +663,25 @@ class ConversionWorker(QObject):
         ``install_notes`` say an engine update was kept back.
         """
         control = job.control
+
+        def tell_out_of_memory() -> None:
+            """The card ran out of memory, so the CPU is in use: say so in the banner now,
+            not only on the done screen."""
+            self.deviceChosen.emit(engine.gpu_description)  # "": the CPU
+            if engine.out_of_memory and engine.warning:
+                self.noticed.emit(job.job, engine.warning)
+
         try:
             engine.start()
-            self.deviceChosen.emit(engine.gpu_description)
+            if engine.out_of_memory:
+                tell_out_of_memory()
+            else:
+                self.deviceChosen.emit(engine.gpu_description)
             started = time.monotonic()
             paused_before = control.paused_seconds
-            meter = _Meter(engine, control, chunks)
+            meter = _Meter(
+                engine, control, chunks, cpu_speedup=job.cpu_speedup, on_fallback=tell_out_of_memory
+            )
 
             def report(progress: ConversionProgress) -> None:
                 self._report(job.job, meter, progress)
