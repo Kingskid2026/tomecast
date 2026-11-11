@@ -370,19 +370,21 @@ def _voice_chunk(
     """Voice ``chunk`` into ``wav``. The file only appears once its audio passed the checks."""
     partial = wav.with_name(wav.name + ".partial")
     problem = ""
+    failure: RuntimeError | None = None  # the engine's own error, kept as the cause
     for _attempt in range(retries + 1):
         partial.unlink(missing_ok=True)
         try:
             engine.synthesize(chunk.text, partial)
         except RuntimeError as error:
-            problem = str(error)
+            problem, failure = str(error), error
             continue
-        problem = audio_problem(partial, chunk.text, speed)
+        problem, failure = audio_problem(partial, chunk.text, speed), None
         if not problem:
             partial.replace(wav)
             return
     partial.unlink(missing_ok=True)
-    raise MissingAudioError(f"no usable audio for {chunk.id} ({chunk.text[:80]!r}): {problem}")
+    message = f"no usable audio for {chunk.id} ({chunk.text[:80]!r}): {problem}"
+    raise MissingAudioError(message) from failure
 
 
 def audio_problem(wav: Path, text: str, speed: float = 1.0) -> str:

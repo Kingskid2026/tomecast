@@ -31,6 +31,13 @@ _STUCK: list[Any] = []
 
 
 @pytest.fixture(autouse=True)
+def _premium_preview_not_opted_into(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The premium voices are a preview opted into with TOMECAST_PREMIUM_PREVIEW=1: a
+    developer's own setting never reaches a test. Tests of the premium voice opt in."""
+    monkeypatch.delenv("TOMECAST_PREMIUM_PREVIEW", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _unknown_memory_and_power(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The scan finds no /proc/meminfo or /sys/class/power_supply, so it never picks fewer
     threads or warns about memory: pulling the charger mid-run, or a busy machine, can't

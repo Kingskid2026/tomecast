@@ -34,6 +34,12 @@ LONG = (
 )
 
 
+@pytest.fixture(autouse=True)
+def _premium_preview(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests use the premium voice, a preview for now: opted into."""
+    monkeypatch.setenv("TOMECAST_PREMIUM_PREVIEW", "1")
+
+
 @pytest.fixture
 def fake_server(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("FAKE_LOG", str(tmp_path / "fake.log"))
@@ -77,8 +83,8 @@ def test_a_ming_run_needs_the_engine_and_the_model_but_no_espeak() -> None:
 
 def test_voices_a_sentence_with_mings_request_and_config(tmp_path: Path, fake_server: Path) -> None:
     output = tmp_path / "out.wav"
-    with _server(tmp_path, fake_server, voice="US_Emma", language="fr") as engine:
-        engine.synthesize("Bonjour, Alice.", output)
+    with _server(tmp_path, fake_server, voice="US_Emma", language="en") as engine:
+        engine.synthesize("Hello, Alice.", output)
         assert engine.sample_rate == 44_100
         assert engine.label == "Ming (US_Emma)"
 
@@ -95,9 +101,9 @@ def test_voices_a_sentence_with_mings_request_and_config(tmp_path: Path, fake_se
     # Never a top-level speed (an HTTP 500) or voice (ignored): the voice is an option.
     assert request["body"] == {
         "model": "ming",
-        "input": "Bonjour, Alice.",
+        "input": "Hello, Alice.",
         "response_format": "wav",
-        "options": {"template_name": "ip", "voice_id": "US_Emma", "language": "fr", "seed": 42},
+        "options": {"template_name": "ip", "voice_id": "US_Emma", "language": "en", "seed": 42},
     }
 
 
@@ -136,8 +142,10 @@ def test_unknown_voices_languages_and_speeds_are_refused(tmp_path: Path, fake_se
     # The server would take any voice id silently, so it's checked here.
     with pytest.raises(EngineError, match="unknown premium voice"):
         _server(tmp_path, fake_server, voice="af_heart")
-    with pytest.raises(EngineError, match="doesn't speak"):
-        _server(tmp_path, fake_server, language="it")
+    # It speaks French and Chinese, but only English is checked for its piece size so far.
+    for language in ("it", "fr", "zh"):
+        with pytest.raises(EngineError, match="hasn't been checked"):
+            _server(tmp_path, fake_server, language=language)
     with pytest.raises(EngineError, match=r"between 0\.5 and 2\.0"):
         _server(tmp_path, fake_server, speed=2.5)
 
@@ -256,3 +264,26 @@ def test_ming_checks_a_new_engine_build_with_its_own_voice(tmp_path: Path) -> No
     check = ming.ming_check(tmp_path / "data", use_gpu=False)
     assert check.name == "Ming"
     assert check.uses == frozenset({AUDIOCPP_CPU.slot})
+
+
+def test_a_piece_split_twice_over_still_says_every_word(tmp_path: Path, fake_server: Path) -> None:
+    """The check fails the whole piece and its halves, and passes the quarters: every
+    quarter is voiced and checked, in order, and they join into the piece's audio."""
+    checked: list[str] = []
+
+    def passes_short_pieces(wav: Path, text: str) -> str:
+        checked.append(text)
+        return "skipped words" if len(text) > 50 else ""
+
+    output = tmp_path / "out.wav"
+    with _server(tmp_path, fake_server, verify=passes_short_pieces) as engine:
+        engine.synthesize(LONG, output)
+
+    voiced = _voiced(tmp_path)
+    assert checked == voiced  # every voicing was checked, at every depth
+    halves = [text for text in voiced[1:] if len(text) > 50]
+    quarters = [text for text in voiced if len(text) <= 50]
+    assert voiced[0] == LONG
+    assert len(halves) >= 2  # depth 1 failed too
+    assert " ".join(quarters) == LONG  # depth 2: nothing lost or repeated
+    assert wav_info(output).seconds >= sum(len(q) for q in quarters) / 15 - 0.01

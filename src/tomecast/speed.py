@@ -101,11 +101,15 @@ def audio_minutes(words: int, speed: float = 1.0) -> float:
     return words / WORDS_PER_MINUTE / speed
 
 
-def make_minutes(words: int, speed: float, speedup: float) -> float:
+def make_minutes(
+    words: int, speed: float, speedup: float, *, voice_speed: float | None = None
+) -> float:
     """How long voicing ``words`` takes at ``speedup`` times real time. ``speedup`` is measured on
-    the voice's own audio, so what counts is the voice's speed, which stops at 1.5x (the
-    time-stretch on top is quick)."""
-    voiced = words / WORDS_PER_MINUTE / split_speed(speed)[0]
+    the voice's own audio, so what counts is the voice's own speed: ``voice_speed`` if given
+    (the premium voice's is always 1.0), else Kokoro's, which stops at 1.5x (the time-stretch
+    on top is quick)."""
+    own = split_speed(speed)[0] if voice_speed is None else voice_speed
+    voiced = words / WORDS_PER_MINUTE / own
     return voiced / speedup if speedup > 0 else 0.0
 
 

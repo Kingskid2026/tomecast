@@ -64,7 +64,10 @@ def work_folder(
     # premium voice is also keyed by its flow steps, and by Ming's files *and* Kokoro's: if
     # the graphics card fails, Kokoro voices the rest of the book into this same folder
     # (whatever --if-card-fails says this time, so a stopped book resumes here either way).
-    settings = [work_key(voice), str(speed), f"seed={DEFAULT_SEED}", f"audiocpp-{AUDIOCPP_VERSION}"]
+    # The speed isn't in a premium voice's key: it always speaks at 1.0 (so does Kokoro when
+    # it takes over), and the whole book is stretched afterwards, so its pieces fit any speed.
+    voiced_at = "stretched" if ming.is_ming_voice(voice) else str(speed)
+    settings = [work_key(voice), voiced_at, f"seed={DEFAULT_SEED}", f"audiocpp-{AUDIOCPP_VERSION}"]
     if ming.is_ming_voice(voice):
         assets = (*ming.required_assets(use_gpu), ESPEAK_NG, KOKORO_Q8)
     else:
