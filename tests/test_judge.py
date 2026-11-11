@@ -19,11 +19,12 @@ from tomecast.ai.judge import (
     Stats,
     Verdict,
     apply_verdicts,
+    chapters_from,
     check_chapters,
     check_edit,
-    chapters_from,
     judge_book,
     judge_lines,
+    looks_like_sentence,
     max_tokens,
     parse_reply,
     preview,
@@ -329,5 +330,38 @@ def test_a_model_that_drops_everything_only_loses_short_lines() -> None:
     model = FakeModel([{"drop": list(range(1, len(STORY) + 1)), "chapter_start": []}])
     judged = judge_book(Book("T", (), None, (chapter,)), model)
     kept = [p for c in judged.book.chapters for p in c.spoken_paragraphs()]
-    assert kept == [STORY[1], STORY[3], STORY[6]]  # the long sentences all stay
-    assert all(len(line.split()) <= 12 for i, line in enumerate(STORY) if line not in kept)
+    assert kept == [STORY[1], STORY[3], STORY[6], STORY[7]]  # every sentence stays
+    assert [line for line in STORY if line not in kept] == [STORY[0], "12", "*", "CHAPTER II."]
+    assert judged.refused == 4
+
+
+@pytest.mark.parametrize(
+    ("line", "sentence"),
+    [
+        ("“Yes.”", True),
+        ("So Della did it.", True),
+        ("“Is anyone there?” she called.", True),
+        ("Well…", True),
+        ("_She stopped._", True),
+        ("(See the note.)", True),
+        ("12", False),
+        ("THE GIFT OF THE MAGI", False),
+        ("CHAPTER II.", False),  # no lowercase: a heading
+        ("PREFACE.", False),
+        ("Mr. and Mrs. Bennet 5", False),
+        ("[Illustration: The arrival.]", False),
+        ("[_Copyright 1894 by George Allen._]]", False),
+        ("“He came down to see the place”", False),
+        ("*", False),
+        ("", False),
+    ],
+)
+def test_looks_like_sentence(line: str, sentence: bool) -> None:
+    assert looks_like_sentence(line) is sentence
+
+
+def test_a_short_sentence_is_never_dropped_unless_the_guard_is_off() -> None:
+    edit = apply_verdicts(STORY, {7: Verdict.DROP})
+    assert edit.dropped == () and edit.refused[0].reason == "it looks like a sentence"
+    edit = apply_verdicts(STORY, {7: Verdict.DROP}, JudgeOptions(keep_sentences=False))
+    assert edit.dropped == (7,)

@@ -194,9 +194,10 @@ class LlamaServer:
         if self._log is not None:
             self._log_file = self._log
         else:
-            handle = tempfile.NamedTemporaryFile(prefix="tomecast-llama-", suffix=".log")
-            handle.close()
-            self._log_file = Path(handle.name)
+            with tempfile.NamedTemporaryFile(
+                prefix="tomecast-llama-", suffix=".log", delete=False
+            ) as handle:
+                self._log_file = Path(handle.name)
         command = server_command(
             self.executable, self.model, port=port, threads=self.threads, context=self.context
         )

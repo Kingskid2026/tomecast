@@ -81,7 +81,7 @@ def test_a_server_that_exits_at_once_is_reported(tmp_path: Path) -> None:
 def test_judge_downloads_are_pinned_opt_in_and_not_in_the_default_set() -> None:
     from tomecast import manifest
 
-    for asset in assets.JUDGE_ASSETS + (assets.MINICPM5_Q4_K_M,):
+    for asset in (*assets.JUDGE_ASSETS, assets.MINICPM5_Q4_K_M):
         assert asset.opt_in
         assert len(asset.sha256) == 64
         assert asset not in manifest.ASSETS

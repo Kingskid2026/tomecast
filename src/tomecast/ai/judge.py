@@ -15,6 +15,11 @@ below limit which lines it may drop:
   :attr:`JudgeOptions.max_drop_words` words is refused (the line is kept) and reported. Page
   numbers, running headers, contents entries and footnote markers are short; a paragraph of
   the story is not. So the worst a confused model can do is drop a short line.
+- **Sentences are never dropped**, however short: a line with lowercase letters that ends like
+  a sentence (".", "!", "?", "…", maybe inside quotes), such as the dialogue line
+  "“Yes.”", is kept (:func:`looks_like_sentence`). Junk rarely ends that way: page numbers
+  and contents entries end in a number, running headers have no full stop, and notes like
+  "[Illustration]" end in a bracket.
 - **Only short lines can start a chapter**, and a blank line can't.
 - **Anything unexpected keeps the text.** A reply that isn't valid JSON, names a line that
   doesn't exist or fails twice leaves that window of lines exactly as it was.
@@ -74,6 +79,7 @@ class JudgeOptions:
     """Limits on what the model may do, and how lines are shown to it."""
 
     max_drop_words: int = 12  # a drop on a longer line is refused
+    keep_sentences: bool = True  # a drop on a line that looks like a sentence is refused
     max_heading_words: int = 12  # a chapter start on a longer line is refused
     preview_chars: int = 160  # longer lines are shortened in the prompt (never in the book)
     window_lines: int = 120  # lines per request
@@ -243,6 +249,19 @@ def words(line: str) -> int:
     return len(line.split())
 
 
+_SENTENCE_END = frozenset(".!?…")
+# Closing quotes (curly and straight), a bracket and emphasis marks after a full stop.
+_CLOSERS = "\u201d\u2019\"')_*"
+
+
+def looks_like_sentence(line: str) -> bool:
+    """Whether a line reads as a sentence: it has a lowercase letter and ends with ".", "!",
+    "?" or "…", perhaps followed by closing quotes. "“Yes.”" and "So Della did it." do;
+    "12", "THE GIFT OF THE MAGI", "Mr. and Mrs. Bennet 5" and "[Illustration.]" don't."""
+    text = line.strip().rstrip(_CLOSERS).rstrip()
+    return bool(text) and text[-1] in _SENTENCE_END and any(char.islower() for char in text)
+
+
 def guard(
     lines: Sequence[str], verdicts: Mapping[int, Verdict], options: JudgeOptions
 ) -> tuple[dict[int, Verdict], list[Refusal]]:
@@ -256,6 +275,8 @@ def guard(
         count = words(line)
         if verdict is Verdict.DROP and count > options.max_drop_words:
             refused.append(Refusal(index, verdict, f"{count} words is too long to drop"))
+        elif verdict is Verdict.DROP and options.keep_sentences and looks_like_sentence(line):
+            refused.append(Refusal(index, verdict, "it looks like a sentence"))
         elif verdict is Verdict.CHAPTER_START and not line.strip():
             refused.append(Refusal(index, verdict, "a blank line can't be a heading"))
         elif verdict is Verdict.CHAPTER_START and count > options.max_heading_words:
@@ -345,8 +366,11 @@ def check_edit(edit: Edit, options: JudgeOptions | None = None) -> None:
         if not _same(got, want):
             raise EditCheckError(f"kept line {position + 1} changed: {want!r} became {got!r}")
     for index in edit.dropped:
-        if words(edit.original[index]) > options.max_drop_words:
+        line = edit.original[index]
+        if words(line) > options.max_drop_words:
             raise EditCheckError(f"line {index + 1} is too long to have been dropped")
+        if options.keep_sentences and looks_like_sentence(line):
+            raise EditCheckError(f"line {index + 1} is a sentence, so it can't be dropped")
     before = [word for line in edit.original for word in line.split()]
     after = [word for line in rebuilt for word in line.split()]
     gone = [word for index in edit.dropped for word in edit.original[index].split()]

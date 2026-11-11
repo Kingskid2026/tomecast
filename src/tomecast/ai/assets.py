@@ -4,10 +4,12 @@ Data only, like :mod:`tomecast.manifest`. These aren't in ``manifest.ASSETS`` ye
 ``tomecast doctor`` and a normal conversion never fetch them; they move there when the AI
 pass is wired into the window and the terminal command.
 
-- **llama.cpp:** the official prebuilt ``ubuntu-x64`` CPU build from ggml-org's releases
-  (built on Ubuntu 22.04, so glibc 2.35, which Tomecast already needs for its window). LFM3
-  needs b11960 or newer; the NVFP4 file (not used) needs b12088. SHA-256 is the digest
-  GitHub publishes for the release asset.
+- **llama.cpp:** the official prebuilt ``ubuntu-x64`` CPU build from ggml-org's releases. Its
+  programs need glibc 2.34 and the system's libstdc++ from GCC 12 or newer (``GLIBCXX_3.4.30``,
+  checked with ``objdump -T``), the same glibc floor as Tomecast's window. It holds CPU
+  kernels for every x86-64 level and picks the best one at run time. LFM3 needs b11960 or
+  newer; the NVFP4 file (not used) needs b12088. The SHA-256 is the digest GitHub publishes
+  for the release asset.
 - **LFM3-1.7B QAD-Q4_0:** Liquid AI's own file, trained to recover 4-bit losses (QAD). LFM
   Open License v1.0: commercial use is only licensed for a person or company with **under
   US$10M annual revenue**; non-commercial use has no cap. Downloaded by the user, on first

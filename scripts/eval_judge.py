@@ -29,7 +29,7 @@ from tomecast.readers.txt import read_txt
 KEEP, DROP, START, EITHER = "keep", "drop", "chapter_start", "either"
 
 _CHAPTER = re.compile(r"^(?:CHAPTER|Chapter) [IVXLC]+\.?\]?$")
-_STORY = re.compile(r"^[IVX]+\. [A-Z][A-Z \-’'.,]+$")  # "I. A SCANDAL IN BOHEMIA"
+_STORY = re.compile(r"^[IVX]+\. [A-Z][A-Z \-\u2019'.,]+$")  # "I. A SCANDAL IN BOHEMIA"
 _SECTION = re.compile(r"^[IVX]+\.$")  # a numbered section inside a story
 _LISTED = re.compile(r"^.{1,80}\s(?:[ivxlc]+|\d+)$")  # "Mr. and Mrs. Bennet 5"
 
@@ -59,10 +59,8 @@ def gold(lines: Sequence[str]) -> list[str]:
             seen_body = True
             labels.append(START)
         elif in_picture or text.startswith("[Illustration"):
-            if in_picture:
-                in_picture = not text.endswith("]")
-            else:
-                in_picture = text.count("[") > text.count("]")
+            # Still open: the note goes on until a line ends with its closing bracket.
+            in_picture = not text.endswith("]") if in_picture else text.count("[") > text.count("]")
             # A long line in a picture note (a dedication) may be read or skipped.
             labels.append(EITHER if len(text.split()) > 12 else DROP)
         elif text in {"Contents", "CONTENTS", "PAGE"}:
@@ -85,7 +83,9 @@ def gold(lines: Sequence[str]) -> list[str]:
     return labels
 
 
-def predicted(lines: Sequence[str], verdicts: dict[int, Verdict], options: JudgeOptions) -> list[str]:
+def predicted(
+    lines: Sequence[str], verdicts: dict[int, Verdict], options: JudgeOptions
+) -> list[str]:
     edit = apply_verdicts(lines, verdicts, options)
     labels = [KEEP] * len(lines)
     for index in edit.dropped:
