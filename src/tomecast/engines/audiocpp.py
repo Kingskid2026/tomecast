@@ -5,9 +5,9 @@ audio.cpp (https://github.com/0xShug0/audio.cpp) runs the Kokoro voice model. To
 its HTTP server once per conversion, so the model is loaded a single time, and sends it one
 small chunk of text per request. Facts this module relies on were checked against v0.9.4:
 
-* upstream's prebuilt Linux binaries need glibc 2.43, so Tomecast uses its own unmodified
-  build of the same release (.github/workflows/engine-build.yml), which needs glibc 2.28 and
-  a CPU with AVX2;
+* upstream's prebuilt Linux binaries need glibc 2.43, so Tomecast uses its own build of the
+  same release (.github/workflows/engine-build.yml), which needs glibc 2.28 and a CPU with
+  AVX2, and changes nothing else unless one of its opt-in patches is turned on;
 * Kokoro needs eSpeak NG at runtime for every sentence (found via environment variables);
 * eSpeak's data path must be shorter than 160 bytes;
 * more than 510 phonemes in one request is a hard error, not a silent cut;
@@ -409,12 +409,13 @@ class KokoroServer:
 
     def abort(self) -> None:
         """Stop the engine now, from any thread: a start-up or request in progress fails at
-        once, and it isn't restarted (closing the window does this)."""
+        once, and it isn't restarted (closing the window does this). Like every stop, it's
+        SIGKILL (see :meth:`_stop_process`)."""
         self._aborted.set()
         process = self._process
         if process is not None:
             with contextlib.suppress(OSError):
-                process.terminate()
+                process.kill()
 
     def _resolve(self) -> tuple[Path, Path]:
         program = self._chosen_executable or (
@@ -528,7 +529,14 @@ class KokoroServer:
                 raise EngineError(f"the voice engine keeps crashing. Its log:\n{log}") from error
             self._consecutive_restarts += 1
             self._stop_process()
-            self._launch()
+            try:
+                self._launch()
+            except GpuUnavailable:
+                # It came back up, but not on the graphics card (or the card is out of
+                # memory): stop it, as start() does, so it never voices the rest of the book
+                # as if it were on the card. AutoKokoro carries on on the CPU and says so.
+                self._stop_process()
+                raise
             try:
                 data = self._request(text)
             except _ConnectionLost as retry_error:
@@ -592,6 +600,9 @@ class KokoroServer:
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 env=self._environment(workdir),
+                # Its own process group, so a Ctrl-C in the terminal reaches Tomecast, which
+                # stops it, and never the engine itself (see _stop_process).
+                process_group=0,
                 preexec_fn=_stop_with_parent,  # only calls prctl, safe after fork
             )
         with _RUNNING_LOCK:
@@ -640,16 +651,23 @@ class KokoroServer:
             raise Cancelled
 
     def _stop_process(self) -> None:
+        """Stop the engine with SIGKILL, never SIGTERM or SIGINT, and reap it.
+
+        audio.cpp 0.9.4's handler for those only sets a flag: once the model has loaded, the
+        server stops listening and frees the model while a request may still be running on
+        its own (detached) thread, which then crashes with SIGSEGV and leaves a core dump of
+        hundreds of MB. While the model loads it doesn't look at the flag at all. SIGKILL runs
+        none of that and never dumps core, and nothing is lost: the engine keeps nothing worth
+        saving. Its log is only read after a crash, not after a stop like this; the private
+        folder with its config, log and eSpeak link is removed by :meth:`close`, once the
+        process has gone; and the model files it unpacks under its TMPDIR are compared and
+        rewritten at every start, so one cut off mid-write is put right the next time."""
         with _RUNNING_LOCK:
             _RUNNING.discard(self)
         if self._process is None:
             return
-        self._process.terminate()
-        try:
-            self._process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            self._process.kill()
-            self._process.wait()
+        self._process.kill()  # does nothing if it has already exited
+        self._process.wait()
         self._process = None
 
     def _request(self, text: str) -> bytes:
@@ -802,9 +820,10 @@ def _stop_with_parent() -> None:
     """Runs in the engine's process before it starts: stop it if Tomecast itself dies.
 
     Linux sends the signal when the *thread* that started the engine exits, so the desktop
-    window must start the engine from a thread that lives as long as the conversion.
+    window must start the engine from a thread that lives as long as the conversion. It's
+    SIGKILL, like every other stop (see :meth:`KokoroServer._stop_process`).
     """
-    _PRCTL(_PR_SET_PDEATHSIG, signal.SIGTERM)
+    _PRCTL(_PR_SET_PDEATHSIG, signal.SIGKILL)
 
 
 def _has_exited(process: subprocess.Popen[bytes], grace: float = 2.0) -> bool:
@@ -875,9 +894,11 @@ class AutoKokoro(KokoroServer):
     both use it. With ``use_gpu`` it runs the Vulkan build, asks it which devices the installed
     drivers expose, and starts on the best one. If there is none, or the engine won't start on
     it (or reports another backend), it starts again on the CPU with the same build and sets
-    :attr:`warning`. After :meth:`start`, :attr:`device_label` says what is in use ("CPU" or
-    the card's name), :attr:`gpu_description` is the card's full description (or ``""``),
-    and :attr:`fell_back` is True if the card was wanted but the CPU is used, so the run says
+    :attr:`warning`. So does a crash restart partway through a book that comes back up on
+    another backend: the rest of the book, from the piece that failed, is voiced on the CPU.
+    After :meth:`start`, :attr:`device_label` says what is in use ("CPU" or the card's name),
+    :attr:`gpu_description` is the card's full description (or ``""``), and
+    :attr:`fell_back` is True if the card was wanted but the CPU is used, so the run says
     nothing about how a new build does on the card (it isn't proven by it).
 
     **Out of graphics memory.** If the card runs out of memory as the engine starts, or on a
@@ -944,14 +965,20 @@ class AutoKokoro(KokoroServer):
         try:
             super().synthesize(text, output)
         except GpuOutOfMemory:
-            self._carry_on_on_cpu()
+            self.out_of_memory = True
+            self._carry_on_on_cpu(RAN_OUT_OF_MEMORY_NOTE)
             super().synthesize(text, output)  # the same text again: nothing is skipped
+        except GpuUnavailable:
+            # It crashed and came back up, but not on the card (a driver reset, say).
+            self._carry_on_on_cpu(CPU_FALLBACK_NOTE)
+            super().synthesize(text, output)
 
-    def _carry_on_on_cpu(self) -> None:
-        """The card ran out of memory partway: start the same build again on its CPU backend
-        (the voice, speed and seed are the engine's own, so they stay the same) and keep it
-        there for the rest of this run. It's not a crash, so it isn't counted as one."""
-        self.warning, self.fell_back, self.out_of_memory = RAN_OUT_OF_MEMORY_NOTE, True, True
+    def _carry_on_on_cpu(self, note: str) -> None:
+        """The card ran out of memory partway, or came back from a crash restart on another
+        backend: start the same build again on its CPU backend (the voice, speed and seed are
+        the engine's own, so they stay the same), keep it there for the rest of this run, and
+        say why with ``note``. It's not a crash, so it isn't counted as one."""
+        self.warning, self.fell_back = note, True
         self.device_label, self.gpu_description = "CPU", ""
         self._stop_process()
         self.backend, self.device = "cpu", None

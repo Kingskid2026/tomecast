@@ -24,8 +24,16 @@ with it) change how it behaves:
                           loading (``OOM_MING_START``) and exit; ``FAKE_OOM_HANG``: log it
                           and keep running without ever serving
 ``FAKE_OOM_LOG``          log this at start-up (a warning the engine carries on after)
+``FAKE_BUSY``             a file it creates as each request begins (one is under way)
 
 Each voiced request is logged with the backend that voiced it.
+
+SIGINT and SIGTERM are handled the way audio.cpp 0.9.4 handles them (its handler only sets a
+flag, app/server/main.cpp): each is logged as a ``signal`` event; while the model loads nothing
+happens until loading ends, and then it exits without serving; an idle server exits at once;
+and one in the middle of a request crashes with SIGSEGV, as audio.cpp does when it frees the
+model under the request's own thread. It never writes a core dump. SIGKILL is the stop that
+runs none of this, so a test that finds no ``signal`` event knows the engine never got one.
 """
 
 from __future__ import annotations
@@ -76,6 +84,25 @@ FAKE_SERVER = textwrap.dedent(
         if k.startswith(("AUDIOCPP_", "TMPDIR", "GGML_", "VK_"))
     }}) + "\\n")
     log.flush()
+
+    import ctypes, signal
+    ctypes.CDLL(None).prctl(4, 0, 0, 0, 0)  # PR_SET_DUMPABLE, 0: its crashes write no core dump
+    STATE = {"serving": False, "busy": 0, "stop": False}
+    SIGNAL_LOG = os.open(os.environ["FAKE_LOG"], os.O_WRONLY | os.O_APPEND)
+
+    def on_signal(signum, frame):  # audio.cpp 0.9.4's request_shutdown, and what follows it
+        event = {"event": "signal", "signal": signal.Signals(signum).name}
+        os.write(SIGNAL_LOG, (json.dumps(event) + "\\n").encode())
+        if STATE["busy"]:  # the model is freed under the running request
+            signal.signal(signal.SIGSEGV, signal.SIG_DFL)
+            os.kill(os.getpid(), signal.SIGSEGV)
+        STATE["stop"] = True
+        if STATE["serving"]:
+            os._exit(0)
+
+    signal.signal(signal.SIGINT, on_signal)
+    signal.signal(signal.SIGTERM, on_signal)
+
     time.sleep(float(os.environ.get("FAKE_START_DELAY", "0")))  # a slow first start
     if os.environ.get("FAKE_CRASH") or (
         os.environ.get("FAKE_CRASH_VULKAN") and config["backend"] == "vulkan"
@@ -89,6 +116,8 @@ FAKE_SERVER = textwrap.dedent(
         if os.environ.get("FAKE_OOM_HANG"):
             time.sleep(60)
         sys.exit(1)
+    if STATE["stop"]:  # asked to stop while loading: audio.cpp only looks once it has loaded
+        sys.exit(0)
 
     def wav_for(text):
         frames = max(1, int(len(text) / 15 * 24000))
@@ -127,7 +156,16 @@ FAKE_SERVER = textwrap.dedent(
                 json.dumps({"status": "ok", "backend": backend, "version": "0.9.4"}).encode())
 
         def do_POST(self):
+            STATE["busy"] += 1
+            try:
+                self.speak()
+            finally:
+                STATE["busy"] -= 1
+
+        def speak(self):
             REQUESTS[0] += 1
+            if os.environ.get("FAKE_BUSY"):
+                open(os.environ["FAKE_BUSY"], "a").close()
             time.sleep(float(os.environ.get("FAKE_DELAY", "0")))
             die_after = os.environ.get("FAKE_DIE_AFTER")
             if die_after is not None and REQUESTS[0] > int(die_after):
@@ -172,7 +210,9 @@ FAKE_SERVER = textwrap.dedent(
             self.end_headers()
             self.wfile.write(data)
 
-    http.server.HTTPServer((config["host"], config["port"]), Handler).serve_forever()
+    listener = http.server.HTTPServer((config["host"], config["port"]), Handler)
+    STATE["serving"] = True
+    listener.serve_forever()
     """
 )
 

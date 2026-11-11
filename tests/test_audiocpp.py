@@ -1,10 +1,14 @@
 import dataclasses
 import hashlib
 import json
+import os
 import platform
+import signal
+import subprocess
 import sys
 import tarfile
 import textwrap
+import threading
 import time
 from pathlib import Path
 
@@ -457,6 +461,43 @@ def test_auto_falls_back_when_the_server_reports_the_cpu(
         assert engine.warning == "The graphics card didn't work, so Tomecast used the CPU."
 
 
+def test_a_crash_restart_that_comes_back_off_the_card_carries_on_on_the_cpu_and_says_so(
+    tmp_path: Path, fake_server: Path, with_devices: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FAKE_DIE_AFTER", "1")  # each engine process answers once, then crashes
+    with AutoKokoro(tmp_path / "data", executable=fake_server, startup_timeout=20) as engine:
+        engine.synthesize("First.", tmp_path / "1.wav")
+        assert engine.device_label == "NVIDIA RTX PRO 1000"
+        monkeypatch.setenv("FAKE_REPORT_BACKEND", "cpu")  # the card is gone when it restarts
+        engine.synthesize("Second.", tmp_path / "2.wav")  # crashes, comes back, not on the card
+
+        assert (engine.backend, engine.device_label, engine.gpu_description) == ("cpu", "CPU", "")
+        assert engine.warning == audiocpp.CPU_FALLBACK_NOTE
+        assert engine.fell_back is True  # so the run proves nothing for the card's build
+        assert engine.out_of_memory is False
+    backends = [start["config"]["backend"] for start in _starts(tmp_path)]  # type: ignore[index]
+    assert backends == ["vulkan", "vulkan", "cpu"]  # the one on the wrong backend was stopped
+    voiced = [(e["body"], e["backend"]) for e in _events(tmp_path) if e["event"] == "voiced"]
+    texts = [(body["input"], backend) for body, backend in voiced]  # type: ignore[index]
+    assert texts == [("First.", "vulkan"), ("Second.", "cpu")]  # nothing skipped
+    assert wav_info(tmp_path / "2.wav").frames > 0
+
+
+def test_a_crash_restart_on_another_backend_is_never_left_running(
+    tmp_path: Path, fake_server: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FAKE_DIE_AFTER", "1")
+    with _server(tmp_path, fake_server, backend="vulkan", device=0) as engine:
+        engine.synthesize("First.", tmp_path / "1.wav")
+        monkeypatch.setenv("FAKE_REPORT_BACKEND", "cpu")
+        with pytest.raises(GpuUnavailable, match="reported the cpu backend"):
+            engine.synthesize("Second.", tmp_path / "2.wav")
+        assert engine._process is None  # stopped, as start() would have
+        with pytest.raises(EngineError, match="isn't running"):  # a retry doesn't voice there
+            engine.synthesize("Second.", tmp_path / "2.wav")
+    assert [e["body"]["input"] for e in _events(tmp_path) if e["event"] == "voiced"] == ["First."]  # type: ignore[index]
+
+
 def test_auto_uses_the_cpu_when_no_card_is_found(tmp_path: Path, fake_server: Path) -> None:
     with AutoKokoro(tmp_path / "data", executable=fake_server, startup_timeout=20) as engine:
         assert engine.backend == "cpu"
@@ -845,6 +886,154 @@ def test_an_aborted_engine_is_not_restarted(tmp_path: Path, fake_server: Path) -
         with pytest.raises(Cancelled):
             engine.synthesize("Anyone there?", tmp_path / "x.wav")
     assert len(_starts(tmp_path)) == 1
+
+
+# --- Stopping without a crash -----------------------------------------------------------------
+# audio.cpp 0.9.4 frees the model when it gets SIGINT or SIGTERM, while a request may still run
+# on its own thread: it segfaults and leaves a core dump of hundreds of MB. The fake engine does
+# the same (see fake_engine.py), so these tests notice any stop that isn't SIGKILL.
+
+
+def _signals(tmp_path: Path) -> list[object]:
+    """The SIGINT and SIGTERM the engine got: each one runs audio.cpp's own (crashing) stop."""
+    return [event["signal"] for event in _events(tmp_path) if event["event"] == "signal"]
+
+
+def _wait_for(path: Path, timeout: float = 20) -> None:
+    deadline = time.monotonic() + timeout
+    while not path.exists():
+        assert time.monotonic() < deadline, f"{path.name} never appeared"
+        time.sleep(0.02)
+
+
+@pytest.mark.parametrize("how", ["close", "abort"])
+def test_stopping_the_engine_mid_sentence_kills_it_without_a_crash(
+    tmp_path: Path, fake_server: Path, monkeypatch: pytest.MonkeyPatch, how: str
+) -> None:
+    monkeypatch.setenv("FAKE_DELAY", "20")  # a sentence that takes 20 s to voice
+    monkeypatch.setenv("FAKE_BUSY", str(tmp_path / "busy"))
+    engine = _server(tmp_path, fake_server)
+    engine.start()
+    process = engine._process
+    assert process is not None
+    errors: list[BaseException] = []
+
+    def voice() -> None:
+        try:
+            engine._request("This takes a while to say.")
+        except BaseException as error:
+            errors.append(error)
+
+    thread = threading.Thread(target=voice)
+    thread.start()
+    _wait_for(tmp_path / "busy")  # the engine is voicing it
+    started = time.monotonic()
+    if how == "close":
+        engine.close()  # the command line, after Ctrl-C or `kill`
+    else:
+        audiocpp.stop_all_engines()  # closing the window
+        process.wait(timeout=10)
+        engine.close()
+    thread.join(timeout=10)
+
+    assert time.monotonic() - started < 5  # at once, not after a grace period
+    assert process.returncode == -signal.SIGKILL  # not -SIGSEGV
+    assert _signals(tmp_path) == []
+    assert not thread.is_alive() and len(errors) == 1
+
+
+def test_a_start_up_is_stopped_at_once_even_while_the_model_loads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FAKE_LOG", str(tmp_path / "fake.log"))
+    loading = write_fake_server(tmp_path / "audiocpp_server", {"FAKE_START_DELAY": "30"})
+    looks: list[None] = []
+
+    def ctrl_c_on_the_third_look(self: KokoroServer) -> bool:
+        looks.append(None)
+        if len(looks) == 3:
+            raise KeyboardInterrupt
+        return False
+
+    monkeypatch.setattr(KokoroServer, "_healthy", ctrl_c_on_the_third_look)
+    engine = KokoroServer(tmp_path / "data", executable=loading, startup_timeout=60)
+    started = time.monotonic()
+    with pytest.raises(KeyboardInterrupt):
+        engine.start()
+
+    assert time.monotonic() - started < 5  # audio.cpp looks at SIGTERM only once it has loaded
+    assert engine._process is None and engine._tempdir is None
+    assert _signals(tmp_path) == []
+
+
+# Tomecast running the engine, voicing a sentence that takes a while. It prints the engine's
+# process ID once it's running; the test then stops it the way a terminal or the system would.
+_RUNS_THE_ENGINE = textwrap.dedent(
+    """
+    import ctypes, sys
+    from pathlib import Path
+    from tomecast.engines.audiocpp import KokoroServer
+
+    ctypes.CDLL(None).prctl(4, 0, 0, 0, 0)  # PR_SET_DUMPABLE, 0: no core dump, whatever happens
+    data, program, output = map(Path, sys.argv[1:4])
+    with KokoroServer(data, executable=program, startup_timeout=20) as engine:
+        print(engine._process.pid, flush=True)
+        engine.synthesize("This takes a while to say.", output)
+    """
+)
+
+
+def _gone(pid: int) -> bool:
+    try:
+        state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+    except (OSError, IndexError):
+        return True
+    return state in ("Z", "X")  # exited, and only waiting to be reaped
+
+
+@pytest.mark.parametrize("stop", ["ctrl-c", "tomecast killed"])
+def test_the_engine_never_gets_ctrl_c_or_tomecasts_death_as_a_signal_it_handles(
+    tmp_path: Path, fake_server: Path, monkeypatch: pytest.MonkeyPatch, stop: str
+) -> None:
+    monkeypatch.setenv("FAKE_DELAY", "20")
+    monkeypatch.setenv("FAKE_BUSY", str(tmp_path / "busy"))
+    script = tmp_path / "run_the_engine.py"
+    script.write_text(_RUNS_THE_ENGINE)
+    arguments = [str(tmp_path / "data"), str(fake_server), str(tmp_path / "out.wav")]
+    engine = 0
+    with (tmp_path / "stderr.txt").open("w") as stderr:
+        # A session of its own, like a terminal's foreground job, so the Ctrl-C below can go to
+        # its whole process group (as a terminal sends it) without reaching pytest.
+        child = subprocess.Popen(
+            [sys.executable, str(script), *arguments],
+            stdout=subprocess.PIPE,
+            stderr=stderr,
+            text=True,
+            start_new_session=True,
+        )
+    try:
+        assert child.stdout is not None
+        engine = int(child.stdout.readline())
+        _wait_for(tmp_path / "busy")  # the engine is voicing the sentence
+        if stop == "ctrl-c":
+            os.killpg(child.pid, signal.SIGINT)  # what a terminal does on Ctrl-C
+        else:
+            child.kill()  # the out-of-memory killer, say: the parent-death signal stops it
+        child.wait(timeout=20)
+        deadline = time.monotonic() + 10
+        while not _gone(engine):
+            assert time.monotonic() < deadline, "the engine outlived Tomecast"
+            time.sleep(0.05)
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait()
+        if engine and not _gone(engine):
+            os.kill(engine, signal.SIGKILL)
+        if child.stdout is not None:
+            child.stdout.close()
+
+    assert _signals(tmp_path) == []  # stopped by SIGKILL alone: audio.cpp's own stop never ran
 
 
 def test_loaded_device_reads_audiocpps_reply(tmp_path: Path, fake_server: Path) -> None:
