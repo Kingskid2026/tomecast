@@ -20,6 +20,8 @@ from machine_factory import ON_BATTERY, PLUGGED_IN, pin_machine
 from pdf_factory import PageBuilder, build_pdf
 
 from tomecast import __version__, cli, machine
+from tomecast.audio import wav_info
+from tomecast.convert import ConversionProgress
 from tomecast.downloads import UPDATE_FAILED_NOTE, Asset, build_in_use, failure, roll_back
 from tomecast.engines import audiocpp
 from tomecast.engines.audiocpp import EngineError
@@ -48,6 +50,7 @@ class FakeKokoro:
         self, root: Path, *, voice: str, speed: float, use_gpu: bool = False, **kwargs: object
     ) -> None:
         self.kwargs = kwargs  # builds=..., as prepare() chose them
+        self.speed = speed
         self.label = f"Fake ({voice})"
         self.max_chars = 200
         self.sample_rate = 24000
@@ -58,6 +61,14 @@ class FakeKokoro:
         self.gpu_description = ""
         self.calls = 0
         FakeKokoro.made.append(self)
+
+    @property
+    def voice_speed(self) -> float:  # as KokoroServer: the voice speaks at most 1.5x...
+        return audiocpp.split_speed(self.speed)[0]
+
+    @property
+    def tempo(self) -> float:  # ...and the rest is a time-stretch, left to whoever plays it
+        return audiocpp.split_speed(self.speed)[1]
 
     def __enter__(self) -> "FakeKokoro":
         if self.use_gpu and FakeKokoro.gpu_warning:
@@ -90,7 +101,7 @@ class FakeKokoro:
         FakeKokoro.texts.append(text)
         if self.use_gpu and not self.fell_back:
             FakeKokoro.on_card.append(text)
-        frames = round(len(text) / 15 * 24000)
+        frames = round(len(text) / 15 * 24000 / self.voice_speed)
         samples = array.array("h", (round(8000 * math.sin(i / 8)) for i in range(frames)))
         with wave.open(str(output), "wb") as wav:
             wav.setnchannels(1)
@@ -211,6 +222,119 @@ def test_convert_refuses_to_overwrite_without_force(
 
     assert cli.main(["convert", str(book), "--force"]) == 0
     assert (tmp_path / "story.m4b").read_bytes() != b"keep me"
+
+
+@pytest.mark.parametrize("force", [[], ["--force"]])
+@pytest.mark.parametrize(
+    ("options", "taken", "message"),
+    [
+        (["-o", "{tmp}/Audiobooks"], "folder", "Audiobooks is a folder. Give the audiobook"),
+        (["--format", "mp3", "-o", "{tmp}/mine"], "file", "mine is a file, but --format mp3"),
+        (["-o", "{tmp}/story.mp3"], None, "story.mp3 ends in .mp3, but the audiobook is an M4B"),
+    ],
+)
+def test_convert_refuses_an_output_that_cant_work_before_voicing_anything(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    force: list[str],
+    options: list[str],
+    taken: str | None,
+    message: str,
+) -> None:
+    book = _epub(tmp_path)
+    options = [option.format(tmp=tmp_path) for option in options]
+    output = Path(options[-1])
+    if taken == "folder":
+        output.mkdir()
+    elif taken == "file":
+        output.write_bytes(b"keep me")
+
+    assert cli.main(["convert", str(book), *options, *force]) == 1
+
+    err = capsys.readouterr().err
+    assert message in err
+    assert "Run the same command again" not in err
+    assert FakeKokoro.voiced == 0  # refused in the first second, not after the whole book
+    if taken == "folder":
+        assert list(output.iterdir()) == []
+    elif taken == "file":
+        assert output.read_bytes() == b"keep me"
+    else:
+        assert not output.exists()
+
+
+def test_convert_mp3_of_a_book_without_an_extension_doesnt_aim_at_the_book(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    book = _epub(tmp_path).rename(tmp_path / "story")  # the reader sniffs it as an EPUB
+    original = book.read_bytes()
+
+    assert cli.main(["convert", str(book), "--format", "mp3", "--force"]) == 1
+
+    assert "story is a file, but --format mp3" in capsys.readouterr().err
+    assert FakeKokoro.voiced == 0
+    assert book.read_bytes() == original
+    assert cli.main(["convert", str(book), "--format", "mp3", "-o", str(tmp_path / "s")]) == 0
+
+
+@pytest.mark.parametrize("output_format", ["m4b", "mp3"])
+def test_convert_never_replaces_an_output_that_appears_while_voicing(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    output_format: str,
+) -> None:
+    """Two runs with different voices aim at the same story.m4b: the one that finishes
+    second doesn't replace the first one's book, though both passed the check at the start."""
+    book = _epub(tmp_path)
+    target = tmp_path / ("story" if output_format == "mp3" else "story.m4b")
+    real = FakeKokoro.synthesize
+
+    def another_run_finishes_first(self: FakeKokoro, text: str, output: Path) -> None:
+        if output_format == "mp3":
+            target.mkdir(exist_ok=True)
+            (target / "01 - Chapter One.mp3").write_bytes(b"another run's book")
+        else:
+            target.write_bytes(b"another run's book")
+        real(self, text, output)
+
+    monkeypatch.setattr(FakeKokoro, "synthesize", another_run_finishes_first)
+    arguments = ["convert", str(book), "--format", output_format]
+
+    assert cli.main(arguments) == 1
+
+    err = capsys.readouterr().err
+    assert "appeared while this book was being made, so it wasn't replaced" in err
+    theirs = target / "01 - Chapter One.mp3" if output_format == "mp3" else target
+    assert theirs.read_bytes() == b"another run's book"
+    assert sorted(p.name for p in tmp_path.iterdir()) == sorted(["data", "story.epub", target.name])
+
+    # Its audio is kept, so another name carries on from there without voicing again.
+    monkeypatch.setattr(FakeKokoro, "synthesize", real)
+    voiced = FakeKokoro.voiced
+    mine = tmp_path / ("mine" if output_format == "mp3" else "mine.m4b")
+    assert cli.main([*arguments, "-o", str(mine)]) == 0
+    assert "Picked up where the last run stopped (5 pieces)" in capsys.readouterr().out
+    assert FakeKokoro.voiced == voiced
+    assert mine.exists()
+    assert theirs.read_bytes() == b"another run's book"
+
+
+def test_convert_with_force_replaces_an_output_that_appears_while_voicing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    book = _epub(tmp_path)
+    target = tmp_path / "story.m4b"
+    real = FakeKokoro.synthesize
+
+    def another_run_finishes_first(self: FakeKokoro, text: str, output: Path) -> None:
+        target.write_bytes(b"another run's book")
+        real(self, text, output)
+
+    monkeypatch.setattr(FakeKokoro, "synthesize", another_run_finishes_first)
+
+    assert cli.main(["convert", str(book), "--force"]) == 0
+    assert target.read_bytes() != b"another run's book"
 
 
 @pytest.mark.parametrize(
@@ -670,6 +794,22 @@ def test_preview_passes_the_voice_and_speed_to_the_engine(
     assert seen == {"voice": "bm_george", "speed": 1.25}
 
 
+def test_preview_is_time_stretched_above_the_voices_own_top_speed_like_the_book(
+    tmp_path: Path, played: list[Path]
+) -> None:
+    text = "Galadriel went down to the river"
+    seconds: dict[str, float] = {}
+    for speed in ("1.0", "1.5", "2.0", "3.0"):
+        out = tmp_path / f"{speed}.wav"
+        assert cli.main(["preview", text, "--speed", speed, "-o", str(out)]) == 0
+        seconds[speed] = wav_info(out).seconds
+
+    # The voice speaks at most 1.5x; the rest is the time-stretch the book gets when packaged.
+    for speed in ("1.5", "2.0", "3.0"):
+        assert seconds[speed] == pytest.approx(seconds["1.0"] / float(speed), rel=0.05)
+    assert FakeKokoro.texts == [text] * 4  # every word, every time
+
+
 def test_preview_uses_the_graphics_card_when_there_is_one(
     played: list[Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -865,6 +1005,73 @@ def test_the_estimate_line_rounds_like_the_window() -> None:
     assert cli._rough_minutes(167) == "about 2 h 47 min"
 
 
+class _Clock:
+    """Stands in for the ``time`` module in ``cli``: the test moves the time on."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+class _Terminal(io.StringIO):
+    def isatty(self) -> bool:
+        return True
+
+
+def _time_left(terminal: _Terminal) -> str:
+    """The progress line as it reads now: ``"… · about 4m 10s left"`` -> ``"4m 10s"``."""
+    line = terminal.getvalue().split("\r")[-1].removesuffix("\033[K")
+    return line.rsplit("about ", 1)[1].removesuffix(" left")
+
+
+def _piece(done: int, reused: int = 0, total: int = 2000) -> ConversionProgress:
+    return ConversionProgress(done, total, 0, 1, chunks_reused=reused)
+
+
+def test_time_left_on_a_resumed_book_counts_only_the_pieces_voiced_in_this_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _Clock()
+    monkeypatch.setattr(cli, "time", clock)
+    terminal = _Terminal()
+    progress = cli._ProgressPrinter(terminal)
+    clock.now += 10  # the engine starts and the speed test runs: not voicing
+    progress.update(_piece(0))  # convert_book's first report
+    for done in range(1, 1801):  # the last run made these: reused, no voicing
+        clock.now += 0.01
+        progress.update(_piece(done, reused=done))
+    assert terminal.getvalue() == ""  # nothing measured yet, so no time left to show
+
+    for done in range(1801, 1901):  # 100 pieces voiced now, 2.5 s each
+        clock.now += 2.5
+        progress.update(_piece(done, reused=1800))
+
+    assert _time_left(terminal) == "4m 10s"  # the 100 pieces left, at 2.5 s each
+
+
+def test_time_left_is_measured_again_after_the_move_to_the_cpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _Clock()
+    monkeypatch.setattr(cli, "time", clock)
+    terminal = _Terminal()
+    progress = cli._ProgressPrinter(terminal)
+    progress.update(_piece(0, total=100))
+    for done in range(1, 11):  # on the card, 1 s each
+        clock.now += 1
+        progress.update(_piece(done, total=100))
+    clock.now += 30  # the card ran out of memory: the CPU engine starts, then voices the piece
+    progress.restart(11)
+    progress.update(_piece(11, total=100))
+    for done in range(12, 15):  # on the CPU, 5 s each
+        clock.now += 5
+        progress.update(_piece(done, total=100))
+
+    assert _time_left(terminal) == "7m 10s"  # the 86 pieces left, at the CPU's 5 s each
+
+
 def test_an_update_isnt_downloaded_without_permission_and_the_old_build_is_used(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -878,6 +1085,77 @@ def test_an_update_isnt_downloaded_without_permission_and_the_old_build_is_used(
     assert "Tomecast has an update to download:" in out
     assert "run again with --yes to download the update" in out
     assert build_in_use(asset, tmp_path / "data") == legacy
+
+
+def _at_a_terminal(monkeypatch: pytest.MonkeyPatch, *, output_shown: bool = True) -> None:
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: output_shown)
+
+
+def _ctrl_d(prompt: object = "") -> str:
+    raise EOFError
+
+
+def _a_model() -> Asset:
+    return Asset("Kokoro voice model", "https://example.invalid/m.gguf", "0" * 64, 190_000_000, "m")
+
+
+def test_ctrl_d_at_the_download_question_is_a_no_without_a_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(audiocpp, "required_assets", lambda use_gpu: (_a_model(),))
+    _at_a_terminal(monkeypatch)
+    monkeypatch.setattr("builtins.input", _ctrl_d)
+
+    assert cli.main(["convert", str(_epub(tmp_path))]) == 1
+
+    captured = capsys.readouterr()
+    assert "tomecast: error: nothing was downloaded" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_ctrl_d_at_the_update_question_keeps_the_version_it_has(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    asset, legacy = _engine_update(tmp_path)
+    monkeypatch.setattr(audiocpp, "required_assets", lambda use_gpu: (asset,))
+    _at_a_terminal(monkeypatch)
+    monkeypatch.setattr("builtins.input", _ctrl_d)
+
+    assert cli.main(["convert", str(_epub(tmp_path))]) == 0
+
+    assert "Tomecast will keep using the version it has." in capsys.readouterr().out
+    assert build_in_use(asset, tmp_path / "data") == legacy
+
+
+def test_nothing_is_asked_when_the_output_goes_to_a_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(audiocpp, "required_assets", lambda use_gpu: (_a_model(),))
+    _at_a_terminal(monkeypatch, output_shown=False)  # `tomecast convert book.epub > log.txt`
+
+    def unseen_question(prompt: object = "") -> str:
+        raise AssertionError("the question went where nobody can see it")
+
+    monkeypatch.setattr("builtins.input", unseen_question)
+
+    assert cli.main(["convert", str(_epub(tmp_path))]) == 1
+
+    assert "--yes" in capsys.readouterr().err
+
+
+def test_waiting_for_another_tomecast_says_so(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "data"
+    root.mkdir()
+    other = (root / ".install.lock").open("w")  # another Tomecast is installing
+    fcntl.flock(other, fcntl.LOCK_EX)
+    threading.Timer(0.6, other.close).start()
+
+    assert cli.main(["convert", str(_epub(tmp_path))]) == 0
+
+    assert "Waiting for another Tomecast to finish installing" in capsys.readouterr().out
 
 
 def test_an_update_that_fails_its_check_is_reported_and_the_old_build_kept(

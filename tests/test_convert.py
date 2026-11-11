@@ -1,5 +1,7 @@
 import array
+import hashlib
 import math
+import os
 import subprocess
 import threading
 import time
@@ -175,6 +177,9 @@ def test_retries_can_run_out(tmp_path: Path) -> None:
         ("missing", "no file"),
         ("garbage", "not a valid WAV"),
         ("empty", "empty"),
+        ("emptied", "not a valid WAV"),
+        ("cut short", "cut short"),
+        ("odd length", "cut short"),
     ],
 )
 def test_audio_problem_explains_bad_files(tmp_path: Path, setup: str, problem: str) -> None:
@@ -183,7 +188,26 @@ def test_audio_problem_explains_bad_files(tmp_path: Path, setup: str, problem: s
         wav.write_bytes(b"not audio")
     elif setup == "empty":
         write_silence(wav, seconds=0, sample_rate=SAMPLE_RATE)
+    elif setup != "missing":  # whole audio, then damaged on disk (a power cut, say)
+        _write_speech_like(wav, "Hello. " * 10)
+        _damage(wav, setup)
     assert problem in audio_problem(wav, "Hello.")
+
+
+def _damage(wav: Path, how: str) -> None:
+    """What a power cut can leave of a file whose name reached the disk before its data."""
+    data = wav.stat().st_size - _WAV_HEADER
+    if how == "emptied":
+        wav.write_bytes(b"")
+    elif how == "cut short":  # the header promises more frames than are there
+        os.truncate(wav, _WAV_HEADER + data // 4 * 2)
+    elif how == "odd length":  # cut off in the middle of a sample
+        os.truncate(wav, _WAV_HEADER + data // 4 * 2 + 1)
+    else:
+        raise ValueError(how)
+
+
+_WAV_HEADER = 44  # the size of the header Python's wave module writes
 
 
 def test_audio_problem_accepts_good_audio(tmp_path: Path) -> None:
@@ -302,6 +326,59 @@ def test_an_interrupted_conversion_resumes_without_redoing_work(tmp_path: Path) 
     spoken = "".join("".join(t.split()) for t in first.texts[:3] + second.texts)
     source = "".join("".join(p.split()) for c in book.chapters for p in c.spoken_paragraphs())
     assert spoken == source  # together, the two runs voiced every character exactly once
+
+
+def test_progress_says_how_many_pieces_an_earlier_run_had_made(tmp_path: Path) -> None:
+    book = _book()
+    workdir = tmp_path / "work"
+    with pytest.raises(MissingAudioError, match="interrupted"):
+        convert_book(book, CountingEngine(limit=3), tmp_path / "b.m4b", workdir=workdir, retries=0)
+    seen: list[ConversionProgress] = []
+
+    engine = CountingEngine()
+    result = convert_book(book, engine, tmp_path / "b.m4b", workdir=workdir, progress=seen.append)
+
+    # Reused pieces take no voicing time, so whoever measures the speed must leave them out.
+    voicing = [p for p in seen if p.stage == "voicing"]
+    assert [p.chunks_reused for p in voicing[:5]] == [0, 1, 2, 3, 3]
+    assert all(p.chunks_reused == 3 for p in seen[4:])
+    assert voicing[-1].chunks_done - voicing[-1].chunks_reused == len(engine.texts)
+    assert result.reused_chunks == 3
+
+
+@pytest.mark.parametrize("damage", ["emptied", "cut short", "odd length"])
+@pytest.mark.parametrize("which", ["spoken", "scene break"])
+def test_a_chunk_damaged_on_disk_is_voiced_again_on_resume(
+    tmp_path: Path, which: str, damage: str
+) -> None:
+    paragraphs = ("It was a dark night and the wind howled.", "* * *", "Then it stopped.")
+    book = Book("B", ("A",), "en", (Chapter("One", paragraphs),))
+    workdir = tmp_path / "work"
+    first = FakeEngine()
+    whole = convert_book(book, first, tmp_path / "a.m4b", workdir=workdir)
+    files = sorted((workdir / "chunks").glob("*.wav"))
+    hashes = {text: hashlib.sha256(text.encode()).hexdigest()[:12] for text in first.texts}
+    spoken = first.texts[1]
+    if which == "spoken":
+        target = next(path for path in files if hashes[spoken] in path.name)
+    else:
+        (target,) = (p for p in files if not any(h in p.name for h in hashes.values()))
+    _damage(target, damage)
+
+    second = FakeEngine()
+    resumed = convert_book(book, second, tmp_path / "b.m4b", workdir=workdir)
+
+    # Only the damaged piece is made again (a scene break's silence isn't voiced), and the
+    # book is whole: every piece is there, at its full length.
+    assert second.texts == ([spoken] if which == "spoken" else [])
+    assert resumed.reused_chunks == len(files) - 1
+    assert resumed.chapters[-1].end_seconds == pytest.approx(whole.chapters[-1].end_seconds)
+    assert (tmp_path / "b.m4b").is_file()
+    third = FakeEngine()
+    assert convert_book(book, third, tmp_path / "c.m4b", workdir=workdir).reused_chunks == len(
+        files
+    )
+    assert third.texts == []  # and it's reused from then on
 
 
 def test_changed_text_is_voiced_again_on_resume(tmp_path: Path) -> None:

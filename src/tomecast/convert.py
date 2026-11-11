@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Protocol
 
-from tomecast.audio import peak_level, wav_info, write_silence
+from tomecast.audio import read_wav, wav_info, write_silence
 from tomecast.book import Book
 from tomecast.chunking import Boundary, Chunk, chunk_paragraphs
 from tomecast.packaging import (
@@ -159,6 +159,9 @@ class ConversionProgress:
     now_speaking: str = ""  # the text being voiced next ("" once all of it is voiced)
     audio_seconds: float = 0.0  # length of the audio made so far
     stage: Literal["voicing", "packaging"] = "voicing"
+    # Of ``chunks_done``, how many an earlier run had already made (reused, so not voiced
+    # now): a speed or time left measured on this run leaves them out.
+    chunks_reused: int = 0
 
 
 ProgressCallback = Callable[[ConversionProgress], None]
@@ -218,6 +221,7 @@ def convert_book(
     retries: int = 1,
     chapters: Sequence[int] | None = None,
     overwrite: bool = True,
+    rename: bool = True,
     format: Literal["m4b", "mp3"] = "m4b",
     prep: TextPrep | None = None,
 ) -> ConversionResult:
@@ -237,7 +241,9 @@ def convert_book(
 
     ``overwrite=False`` never replaces an existing file: if ``output`` is taken, even by a
     file that appeared while voicing, the book is written to "name (2).m4b" and so on. The
-    path used is in the result.
+    path used is in the result. With ``rename=False`` as well, a taken ``output`` raises
+    :class:`~tomecast.packaging.OutputExistsError` instead (the voiced chunks stay in
+    ``workdir``, so a run with another name or ``overwrite=True`` reuses them).
 
     ``format="mp3"`` writes a folder of MP3 files, one per chapter, at ``output`` (which is
     then the folder's name) instead of an M4B file. Everything else is the same.
@@ -264,7 +270,7 @@ def convert_book(
             progress(
                 ConversionProgress(
                     done, total, chapter_index, chapter_count, upcoming, seconds,
-                    "packaging" if stage == "packaging" else "voicing",
+                    "packaging" if stage == "packaging" else "voicing", reused,
                 )
             )  # fmt: skip
 
@@ -282,7 +288,7 @@ def convert_book(
             if control:
                 control.checkpoint()
             wav = chunk_dir / _chunk_file_name(chunk)
-            if _is_reusable(wav, chunk, voice_speed):
+            if _is_reusable(wav, chunk, voice_speed, engine.sample_rate):
                 reused += 1
             elif chunk.speakable:
                 _voice_chunk(engine, chunk, wav, retries, voice_speed)
@@ -314,7 +320,9 @@ def convert_book(
     )
     tempo = getattr(engine, "tempo", 1.0)
     write = write_mp3s if format == "mp3" else write_m4b
-    packaged = write(audio, info, output, workdir=workdir, overwrite=overwrite, tempo=tempo)
+    packaged = write(
+        audio, info, output, workdir=workdir, overwrite=overwrite, rename=rename, tempo=tempo
+    )
     return ConversionResult(packaged.chapters, reused, tuple(warnings), packaged.output)
 
 
@@ -324,13 +332,28 @@ def _chunk_file_name(chunk: Chunk) -> str:
     return f"{chunk.id}-{digest}.wav"
 
 
-def _is_reusable(wav: Path, chunk: Chunk, speed: float = 1.0) -> bool:
-    """True if a previous run already made good audio for exactly this chunk."""
+def _is_reusable(wav: Path, chunk: Chunk, speed: float, sample_rate: int) -> bool:
+    """True if a previous run already made good audio for exactly this chunk. It gets the
+    same checks as new audio (a scene break's silence is checked to be whole), because a
+    power cut or a system crash can leave a file with its name on disk but not all its data:
+    anything that fails them is made again rather than reused."""
     if not wav.is_file():
         return False
     if not chunk.speakable:
-        return True
+        return _is_whole_silence(wav, sample_rate)
     return not audio_problem(wav, chunk.text, speed)
+
+
+def _is_whole_silence(wav: Path, sample_rate: int) -> bool:
+    """True if ``wav`` is a readable mono 16-bit WAV at ``sample_rate`` holding every frame
+    its header says it has (what :func:`convert_book` writes for a scene break)."""
+    try:
+        info = wav_info(wav)
+        if (info.channels, info.sample_width, info.sample_rate) != (1, 2, sample_rate):
+            return False
+        return 0 < info.frames <= read_wav(wav).frames
+    except (wave.Error, EOFError, OSError, ValueError):
+        return False
 
 
 def _gap_after(chunk: Chunk, *, is_title: bool, is_last: bool) -> float:
@@ -367,7 +390,10 @@ def audio_problem(wav: Path, text: str, speed: float = 1.0) -> str:
 
     ``speed`` is how fast the voice was asked to speak: faster narration is allowed to be
     proportionally shorter. Slower than 1.0 gets no extra allowance, so the check never
-    weakens below its strength at normal speed."""
+    weakens below its strength at normal speed.
+
+    The file is read to its end, so one holding fewer frames than its header says (cut
+    short, by a power cut say) fails too: packaging needs every frame the header promises."""
     if not wav.is_file():
         return "the engine wrote no file"
     try:
@@ -381,6 +407,16 @@ def audio_problem(wav: Path, text: str, speed: float = 1.0) -> str:
     shortest = len(text) / MAX_CHARS_PER_SECOND / max(1.0, speed)
     if info.seconds < shortest:
         return f"only {info.seconds:.2f}s of audio for {len(text)} characters (text was cut off?)"
-    if peak_level(wav) < SILENCE_LEVEL:
+    try:
+        data = read_wav(wav)
+    except (wave.Error, EOFError, OSError) as error:
+        return f"the audio can't be read ({error})"
+    if data.frames < info.frames:
+        # The header can't be trusted for the length: packaging needs every frame it promises.
+        return (
+            f"the file holds {data.frames} of the {info.frames} frames its header says "
+            "(it was cut short)"
+        )
+    if data.peak < SILENCE_LEVEL:
         return "the audio is silent"
     return ""

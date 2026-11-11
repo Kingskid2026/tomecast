@@ -2,7 +2,8 @@ name: Engine build
 
 # Builds the audio.cpp voice engine from its pinned upstream release on an old base system
 # (manylinux_2_28: AlmaLinux 8, glibc 2.28), so one build runs on nearly every Linux distro
-# from 2019 on. Upstream's own Linux binaries need glibc 2.43 (#18).
+# from 2019 on. Upstream's own Linux binaries need glibc 2.43 (#18). The build applies
+# Tomecast's own opt-in patches from .github/patches/audiocpp/ (see build-audiocpp.sh).
 #
 # - Pull requests that change the build: build and check it, publish nothing.
 # - A pushed tag like audiocpp-v0.9.4-tc1: build from scratch (no caches), attest where each
@@ -20,6 +21,7 @@ on:
       - .github/workflows/engine-build.yml
       - .github/scripts/build-audiocpp.sh
       - .github/scripts/build-vulkan-tools.sh
+      - .github/patches/audiocpp/**
   workflow_dispatch:
 
 permissions: {}
@@ -93,13 +95,13 @@ jobs:
           fi
           docker run --rm \
             -e AUDIOCPP_VERSION -e AUDIOCPP_COMMIT -e BUILD_URL "${cache_env[@]}" \
-            -v "$PWD/tomecast/.github/scripts:/scripts:ro" \
+            -v "$PWD/tomecast/.github:/github:ro" \
             -v "$PWD/audiocpp:/src" \
             -v "$PWD/out:/out" \
             -v "$RUNNER_TEMP/ccache:/ccache" \
             -v "$RUNNER_TEMP/vulkan-tools:/vulkan-tools" \
             "$BUILD_IMAGE" \
-            /scripts/build-audiocpp.sh "$VARIANT" /src "/out/$BUNDLE"
+            /github/scripts/build-audiocpp.sh "$VARIANT" /src "/out/$BUNDLE"
       - name: Save compiler cache
         if: always() && env.RELEASE != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0 # zizmor: ignore[cache-poisoning]
@@ -234,9 +236,9 @@ jobs:
         run: |
           cat dist/*.sha256 > dist/SHA256SUMS
           cat > notes.md <<EOF
-          Unmodified builds of [audio.cpp](https://github.com/0xShug0/audio.cpp) $AUDIOCPP_VERSION (commit \`$AUDIOCPP_COMMIT\`) for Tomecast's voice engine. They run on Linux with **glibc 2.28 or newer** (x86-64 CPUs with AVX2), where upstream's own builds need glibc 2.43 (#18).
+          Builds of [audio.cpp](https://github.com/0xShug0/audio.cpp) $AUDIOCPP_VERSION (commit \`$AUDIOCPP_COMMIT\`) for Tomecast's voice engine. They run on Linux with **glibc 2.28 or newer** (x86-64 CPUs with AVX2), where upstream's own builds need glibc 2.43 (#18).
 
-          Built by [this workflow run]($RUN_URL) from \`.github/workflows/engine-build.yml\` at this tag (Tomecast commit \`$GITHUB_SHA\`), in the \`manylinux_2_28\` image (AlmaLinux 8) with GCC 14, using upstream's release options. The C++ and OpenMP runtimes are linked in statically. The Vulkan build loads the system's own \`libvulkan.so.1\` and graphics driver; no driver is included. Each tarball has \`BUILD-INFO.txt\` with the exact options, and \`licenses/\` for the code compiled in.
+          Built by [this workflow run]($RUN_URL) from \`.github/workflows/engine-build.yml\` at this tag (Tomecast commit \`$GITHUB_SHA\`), in the \`manylinux_2_28\` image (AlmaLinux 8) with GCC 14, using upstream's release options. The source carries Tomecast's own patches from \`.github/patches/audiocpp/\` at this tag, and nothing else. Each one is opt-in: unless its environment variables are set, the server behaves exactly like upstream's. The C++ and OpenMP runtimes are linked in statically. The Vulkan build loads the system's own \`libvulkan.so.1\` and graphics driver; no driver is included. Each tarball has \`BUILD-INFO.txt\` with the exact options and patches, \`patches/\` with the patches themselves, and \`licenses/\` for the code compiled in.
 
           This is not a Tomecast release, and you don't need to download these by hand: Tomecast fetches the one it needs and checks it against the SHA-256 pinned in its code.
 
