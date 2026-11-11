@@ -10,6 +10,11 @@ It is deterministic (the same text always gives the same result) and it never re
 Rules only replace a written form with words that say the same thing, and :func:`words_lost`
 double-checks every paragraph: if a paragraph would lose a word, it is left as written.
 
+Before the rules, apostrophe-like marks that eSpeak would read out by name (the hamza and
+ayin of transliterated Arabic, the Russian soft sign...) become plain apostrophes
+(:func:`tomecast.marks.speakable`), in the book's text and in the respellings alike, whatever
+the language.
+
 Language comes from the book. English has rules (:mod:`tomecast.textprep_en`); a book in a
 language without rules is voiced as written, apart from the pronunciation lists. A new language
 plugs in by adding an object with ``heading`` and ``body`` methods to :data:`RULES`.
@@ -23,6 +28,7 @@ from dataclasses import dataclass, field
 from typing import Protocol
 
 from tomecast.book import Chapter
+from tomecast.marks import speakable
 from tomecast.pronunciations import Pronunciations
 from tomecast.textprep_en import ROMAN_PATTERN, EnglishRules
 
@@ -97,8 +103,9 @@ def words_lost(before: str, after: str, consumed: Iterable[str] = ()) -> list[st
 
 @dataclass(frozen=True, slots=True)
 class TextPrep:
-    """Prepares the text of a book for the voice: pronunciation fixes first, then the
-    language's rules. Build one with :meth:`for_language`."""
+    """Prepares the text of a book for the voice: pronunciation fixes first, then marks the
+    voice would read out by name made speakable, then the language's rules. Build one with
+    :meth:`for_language`."""
 
     rules: TextRules
     pronunciations: Pronunciations = field(default_factory=Pronunciations)
@@ -126,7 +133,8 @@ class TextPrep:
         return tuple(prepared)
 
     def _prepare(self, text: str, rule: _Rule) -> str:
-        fixed = self.pronunciations.apply(text)
+        # The fixes see the text as the book has it, so a left side with such a mark matches.
+        fixed = speakable(self.pronunciations.apply(text))
         prepared = rule(fixed)
         if prepared == fixed:
             return fixed

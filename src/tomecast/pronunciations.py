@@ -40,6 +40,8 @@ import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from tomecast.marks import speakable
+
 GLOBAL_FILE_NAME = "pronunciations.txt"
 BOOK_FILE_SUFFIX = ".pronunciations.txt"
 
@@ -49,6 +51,7 @@ _CAPITALS = re.compile(r"[A-Za-z]{2,}")
 # Symbols only a phonetic alphabet uses. Letters that real spellings use too (æ, ð, þ, ŋ, ø,
 # accented letters) are left out, and so are the marks that transliterations of names use:
 # the ʻokina (U+02BB), the apostrophe ʼ (U+02BC), the primes ʹ ʺ and the half rings ʾ ʿ.
+# (eSpeak would read those marks out by name too, so tomecast.marks makes them apostrophes.)
 _IPA = re.compile(
     "["
     "\u0250-\u02af"  # IPA Extensions: ɐ ɑ ə ɛ ɡ ɪ ɔ ʃ ʊ ʌ ʒ ʔ ...
@@ -102,10 +105,14 @@ def is_phonetic(spoken: str) -> bool:
 
 
 def respelling(value: str) -> str:
-    """How a right-hand side is actually spoken: capitalised syllables are lowercased.
+    """How a right-hand side is actually spoken: capitalised syllables are lowercased, and
+    apostrophe-like marks eSpeak would read out by name are plain apostrophes
+    (:func:`tomecast.marks.speakable`).
 
-    ``her-MY-oh-nee`` -> ``her-my-oh-nee``. Single capital letters are left alone.
+    ``her-MY-oh-nee`` -> ``her-my-oh-nee``, ``ha-WAI-ʼee`` -> ``ha-wai-'ee``. Single capital
+    letters are left alone.
     """
+    value = speakable(value)
     return _CAPITALS.sub(lambda m: m.group().lower() if m.group().isupper() else m.group(), value)
 
 
