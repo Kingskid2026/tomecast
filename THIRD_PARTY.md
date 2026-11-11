@@ -9,7 +9,7 @@ This list reflects the current design ([docs/architecture.md](docs/architecture.
 | Model | Used for | License | Source |
 |---|---|---|---|
 | Kokoro 82M | Default voice, any computer | Apache 2.0 | [hexgrad/Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M), GGUF from [audio-cpp](https://huggingface.co/audio-cpp/audio.cpp-gguf) |
-| Ming-3.0-tts 0.5B | Premium voice, graphics card | MIT | [inclusionAI/Ming-3.0-tts](https://github.com/inclusionAI/Ming-3.0-tts), GGUF from [audio-cpp](https://huggingface.co/audio-cpp/Ming-3.0-TTS-0.5B-GGUF) |
+| Ming-3.0-tts 0.5B | Premium voice, graphics card; downloaded only when the user chooses it (`ming-3.0-tts-0.5b-q8_0.gguf`, 1.74 GB, pinned by commit and SHA-256) | MIT | [inclusionAI/Ming-3.0-tts](https://github.com/inclusionAI/Ming-3.0-tts), GGUF from [audio-cpp](https://huggingface.co/audio-cpp/Ming-3.0-TTS-0.5B-GGUF) |
 
 ## Optional AI cleanup models
 

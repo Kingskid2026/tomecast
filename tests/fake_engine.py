@@ -25,6 +25,7 @@ with it) change how it behaves:
                           and keep running without ever serving
 ``FAKE_OOM_LOG``          log this at start-up (a warning the engine carries on after)
 ``FAKE_BUSY``             a file it creates as each request begins (one is under way)
+``FAKE_RATE``             the sample rate it voices at (default: 24000, Kokoro's)
 
 Each voiced request is logged with the backend that voiced it.
 
@@ -120,11 +121,12 @@ FAKE_SERVER = textwrap.dedent(
         sys.exit(0)
 
     def wav_for(text):
-        frames = max(1, int(len(text) / 15 * 24000))
+        rate = int(os.environ.get("FAKE_RATE", "24000"))
+        frames = max(1, int(len(text) / 15 * rate))
         loud = 0 if os.environ.get("FAKE_SILENT") else 8000
         buf = io.BytesIO()
         with wave.open(buf, "wb") as w:
-            w.setnchannels(1); w.setsampwidth(2); w.setframerate(24000)
+            w.setnchannels(1); w.setsampwidth(2); w.setframerate(rate)
             w.writeframes(b"".join(
                 struct.pack("<h", int(loud * math.sin(i / 10))) for i in range(frames)))
         return buf.getvalue()
