@@ -121,7 +121,8 @@ def measure(engine: Tunable) -> float:
         EngineError: if the engine fails, or made no audio.
     """
     voice, speed = engine.voice, engine.speed
-    engine.voice, engine.speed = DEFAULT_VOICE, 1.0
+    # Another voice's engine (Ming) measures with its own default voice.
+    engine.voice, engine.speed = getattr(engine, "default_voice", DEFAULT_VOICE), 1.0
     try:
         with tempfile.TemporaryDirectory(prefix="tomecast-speed-") as folder:
             engine.synthesize(WARM_UP, Path(folder) / "warm-up.wav")
@@ -242,12 +243,16 @@ def known_cpu_speed(root: Path, engine: KokoroServer) -> float | None:
 
 
 def _key_of(engine: KokoroServer) -> str:
-    return speed_key(
+    key = speed_key(
         engine.executable.parent,
         backend="vulkan" if engine.backend == "vulkan" else "cpu",
         gpu_description=getattr(engine, "gpu_description", ""),
         threads=engine.threads,
     )
+    model = getattr(engine, "MODEL_ID", KokoroServer.MODEL_ID)
+    if model != KokoroServer.MODEL_ID:  # another voice (Ming) has its own speed
+        key += f"/{model}"
+    return key
 
 
 def probe(

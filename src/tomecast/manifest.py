@@ -12,7 +12,8 @@ their current build until the new one passes a self-check (:func:`tomecast.downl
 
 Which of these a run needs is decided elsewhere (``required_assets`` in
 :mod:`tomecast.engines.audiocpp`). A voice that is downloaded only when the user chooses it
-(the premium Ming-3.0-tts voice, about 1.74 GB) is pinned here too, with ``opt_in=True``.
+(the premium Ming-3.0-tts voice, about 1.74 GB) is pinned here too, with ``opt_in=True``;
+which files a Ming run needs is decided in :mod:`tomecast.engines.ming`.
 """
 
 from __future__ import annotations
@@ -23,6 +24,13 @@ AUDIOCPP_VERSION = "0.9.4"
 # Tomecast's own build of that release, published as a release of the Tomecast repo by
 # .github/workflows/engine-build.yml. A new build of the same source gets a new -tcN tag.
 AUDIOCPP_BUILD = f"audiocpp-v{AUDIOCPP_VERSION}-tc1"
+# Whether that build reads Tomecast's Ming flow-step settings (AUDIOCPP_MING_FLOW_STEPS and
+# AUDIOCPP_MING_FLOW_SCHEDULE, our own patch to Ming's flow head; upstream always takes 10
+# steps). -tc1 doesn't; the -tc2 build will, and then this becomes True in the same change
+# that moves the pins. Ming is told to take fewer steps only when it's True, because an
+# engine that ignores the settings would voice at the default while the work folder said
+# otherwise (see tomecast.engines.ming).
+AUDIOCPP_MING_FLOW_STEPS = False
 _ENGINE_DOWNLOADS = "https://github.com/Kingskid2026/tomecast/releases/download"
 
 
@@ -86,5 +94,21 @@ KOKORO_Q8 = Asset(
     path="models/kokoro-82m-q8_0.gguf",
 )
 
+# The premium voice (issue #11): audio.cpp's own Q8_0 file of Ming-3.0-tts 0.5B (MIT, from
+# inclusionAI), downloaded only after the user chooses it. It runs on the engine builds
+# above, needs no eSpeak, and is offered only with a graphics card (too slow on a CPU).
+MING_Q8 = Asset(
+    id="ming-3.0-tts-0.5b-q8_0",
+    name="Ming-3.0-tts premium voice model (0.5B, 8-bit)",
+    url=(
+        "https://huggingface.co/audio-cpp/Ming-3.0-TTS-0.5B-GGUF/resolve/"
+        "2eb8d37c7f10672e69c8aa33091baa04c461b66c/ming-3.0-tts-0.5b-q8_0.gguf"
+    ),
+    sha256="fcf2aa25e8e9cf2065a936e506581735c64d6255fb7869f09fbb61a2dde09aa1",
+    size=1_742_280_896,
+    path="models/ming-3.0-tts-0.5b-q8_0.gguf",
+    opt_in=True,
+)
+
 # Everything pinned, in the order `tomecast doctor` lists it.
-ASSETS: tuple[Asset, ...] = (AUDIOCPP_CPU, AUDIOCPP_VULKAN, ESPEAK_NG, KOKORO_Q8)
+ASSETS: tuple[Asset, ...] = (AUDIOCPP_CPU, AUDIOCPP_VULKAN, ESPEAK_NG, KOKORO_Q8, MING_Q8)
