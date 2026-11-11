@@ -19,7 +19,8 @@ from collections.abc import Iterator, Mapping
 from pathlib import Path
 
 from tomecast.downloads import Asset, build_sha256, installed_sha256
-from tomecast.engines.audiocpp import AUDIOCPP_VERSION, DEFAULT_SEED, required_assets
+from tomecast.engines.audiocpp import AUDIOCPP_VERSION, DEFAULT_SEED
+from tomecast.voices import required_assets, work_key
 
 # Unfinished conversions are kept so they can be resumed; after this long they're removed.
 STALE_WORK_DAYS = 14
@@ -57,8 +58,10 @@ def work_folder(
     # Anything that changes how the audio sounds goes in the key, so a resumed book never
     # mixes two voices, speeds or model versions. The builds are the ones in use, which are
     # the pinned ones unless an update didn't work on this computer (or isn't installed yet).
-    settings = [voice, str(speed), f"seed={DEFAULT_SEED}", f"audiocpp-{AUDIOCPP_VERSION}"]
-    settings += [_sha256_in_use(a, root, builds or {}) for a in required_assets(use_gpu)]
+    # A Kokoro voice is keyed by its name alone (as before); a Ming voice also by its flow
+    # steps, and each by the files its own engine needs (Ming's model, no eSpeak).
+    settings = [work_key(voice), str(speed), f"seed={DEFAULT_SEED}", f"audiocpp-{AUDIOCPP_VERSION}"]
+    settings += [_sha256_in_use(a, root, builds or {}) for a in required_assets(voice, use_gpu)]
     digest.update("|".join(settings).encode())
     folder = cache / f"convert-{digest.hexdigest()[:16]}"
     folder.mkdir(exist_ok=True)

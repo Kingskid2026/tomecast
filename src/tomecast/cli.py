@@ -13,11 +13,11 @@ import sys
 import tempfile
 import time
 import wave
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Literal, TextIO
 
-from tomecast import __version__, pronunciations
+from tomecast import __version__, pronunciations, voices
 from tomecast.audio import concatenate_wavs
 from tomecast.book import Book, Chapter
 from tomecast.chunking import CoverageError, chunk_paragraphs
@@ -46,6 +46,7 @@ from tomecast.downloads import (
     roll_back,
     waiting_check,
 )
+from tomecast.engines import ming
 from tomecast.engines.audiocpp import (
     AUDIOCPP_VULKAN,
     DEFAULT_VOICE,
@@ -58,8 +59,8 @@ from tomecast.engines.audiocpp import (
     EngineError,
     check_system,
     glibc_version,
-    prepare_voice,
 )
+from tomecast.engines.ming import AutoMing
 from tomecast.hardware import list_devices, vulkan_possible
 from tomecast.machine import (
     LOW_MEMORY,
@@ -130,8 +131,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="m4b: one audiobook file with chapters (default); mp3: a folder, one MP3 per chapter",
     )  # fmt: skip
     convert.add_argument(
-        "--voice", default=DEFAULT_VOICE, choices=VOICES, metavar="VOICE",
-        help=f"Kokoro voice (default: {DEFAULT_VOICE}; see `tomecast voices`)",
+        "--voice", default=DEFAULT_VOICE, choices=voices.ALL_VOICES, metavar="VOICE",
+        help=f"voice (default: {DEFAULT_VOICE}; premium voices such as {ming.DEFAULT_VOICE} "
+        "need a graphics card; see `tomecast voices`)",
     )  # fmt: skip
     convert.add_argument(
         "--speed",
@@ -223,8 +225,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     preview.add_argument("text", nargs="+", help="the word or sentence to say")
     preview.add_argument(
-        "--voice", default=DEFAULT_VOICE, choices=VOICES, metavar="VOICE",
-        help=f"Kokoro voice (default: {DEFAULT_VOICE}; see `tomecast voices`)",
+        "--voice", default=DEFAULT_VOICE, choices=voices.ALL_VOICES, metavar="VOICE",
+        help=f"voice (default: {DEFAULT_VOICE}; premium voices such as {ming.DEFAULT_VOICE} "
+        "need a graphics card; see `tomecast voices`)",
     )  # fmt: skip
     preview.add_argument(
         "--speed", type=_speed, default=1.0,
@@ -311,7 +314,11 @@ def _voices() -> int:
     for code, language in languages.items():
         names = [v for v in VOICES if v.startswith(code)]
         print(f"{language}: {', '.join(names)}")
-    print(f"\nDefault: {DEFAULT_VOICE}. Use one with `tomecast convert BOOK --voice NAME`.")
+    print(f"\nPremium (Ming, needs a graphics card): {', '.join(ming.VOICES)}")
+    print(
+        f"\nDefault: {DEFAULT_VOICE}. Use one with `tomecast convert BOOK --voice NAME`. The "
+        "premium voice is downloaded the first time it's used, after asking."
+    )
     return 0
 
 
@@ -365,15 +372,15 @@ def _convert(args: argparse.Namespace) -> int:
         print(line)
 
     use_gpu = _wants_gpu(args.gpu)
+    route = _route(args.voice, book.language, args.speed, use_gpu)
+    voice = route.voice
     root = data_dir()
     prep, warnings = _text_prep(book, book_path, root)
     for warning in warnings:
         print(f"Note: {warning}", file=sys.stderr)
     try:
-        builds = _prepare(use_gpu, root, assume_yes=args.yes).builds
-        workdir = work_folder(
-            root, book_path, args.voice, args.speed, use_gpu=use_gpu, builds=builds
-        )
+        builds = _prepare(use_gpu, root, assume_yes=args.yes, voice=voice).builds
+        workdir = work_folder(root, book_path, voice, args.speed, use_gpu=use_gpu, builds=builds)
     except OSError as error:
         raise CliError(str(error)) from error
 
@@ -381,7 +388,7 @@ def _convert(args: argparse.Namespace) -> int:
     plan = [chunk for chapter in chunked for chunk in chapter]
     print(
         f"Converting “{book.title}”: {_plural(len(chapters), 'chapter')}, "
-        f"{_plural(len(plan), 'piece')} of text, voice {args.voice}."
+        f"{_plural(len(plan), 'piece')} of text, voice {voice}."
     )
     if prep.pronunciations:
         count = len(prep.pronunciations)
@@ -399,9 +406,10 @@ def _convert(args: argparse.Namespace) -> int:
         except WorkFolderBusy as error:
             raise CliError(str(error)) from None
         try:
-            engine = AutoKokoro(
+            engine = _engine(
                 root,
-                voice=args.voice,
+                voice,
+                route.language,
                 speed=args.speed,
                 use_gpu=use_gpu,
                 builds=builds,
@@ -540,6 +548,49 @@ def _wants_gpu(requested: bool | None) -> bool:
     return possible if requested is None else requested
 
 
+def _route(voice: str, language: str | None, speed: float, use_gpu: bool) -> voices.Route:
+    """The voice for a book in ``language`` (see :func:`tomecast.voices.route`), printing why
+    if it isn't ``voice``, and refusing the premium voice without a graphics card or above
+    its top speed."""
+    route = voices.route(voice, language, premium_possible=use_gpu)
+    if route.note:
+        print(f"Note: {route.note}")
+    if ming.is_ming_voice(route.voice):
+        if not use_gpu:
+            raise CliError(voices.NEEDS_GPU)
+        if speed > ming.MAX_SPEED:
+            raise CliError(f"the premium voice goes up to speed {ming.MAX_SPEED}")
+        if ming.UNCHECKED_NOTE:
+            print(f"Note: {ming.UNCHECKED_NOTE}")
+    return route
+
+
+def _engine(
+    root: Path,
+    voice: str,
+    language: str,
+    *,
+    speed: float,
+    use_gpu: bool,
+    builds: Mapping[str, Path],
+    threads: int | None = None,
+) -> AutoKokoro:
+    """The engine for ``voice``: Ming for a premium voice, else Kokoro. Not started."""
+    if ming.is_ming_voice(voice):
+        return AutoMing(
+            root,
+            voice=voice,
+            language=language,
+            speed=speed,
+            use_gpu=use_gpu,
+            builds=builds,
+            threads=threads,
+        )
+    return AutoKokoro(
+        root, voice=voice, speed=speed, use_gpu=use_gpu, builds=builds, threads=threads
+    )
+
+
 def _hardware_line(engine: AutoKokoro, requested: bool | None) -> str:
     if engine.gpu_description:
         return f"Using the graphics card: {engine.gpu_description}."
@@ -661,7 +712,15 @@ def _scan(args: argparse.Namespace) -> int:
                 f", {speeds.gpu / speeds.cpu:.1f}\u00d7 as fast as the CPU" if speeds.cpu else ""
             )
             print(f"{speeds.gpu_description}: about {speeds.gpu:.1f}\u00d7 real time{faster}.")
+            if voices.scan_recommendation(root).voice == "ming":
+                print(PREMIUM_RECOMMENDED)
     return 0
+
+
+PREMIUM_RECOMMENDED = (
+    "This graphics card can run the premium voice (Ming): try `tomecast convert BOOK "
+    f"--voice {ming.DEFAULT_VOICE}` (about 1.8 GB to download, asked first)."
+)
 
 
 _FEWER = {ON_BATTERY: "on battery", LOW_MEMORY: "with little memory"}
@@ -794,12 +853,13 @@ def _preview(args: argparse.Namespace) -> int:
         print(f"Saying: {spoken}")
 
     use_gpu = _wants_gpu(args.gpu)
-    builds = _prepare(use_gpu, root, assume_yes=args.yes).builds
+    _route(args.voice, None, args.speed, use_gpu)  # the premium voice needs the card
+    builds = _prepare(use_gpu, root, assume_yes=args.yes, voice=args.voice).builds
     with tempfile.TemporaryDirectory(prefix="tomecast-preview-") as folder:
         wav = Path(folder) / "preview.wav"
         try:
-            with AutoKokoro(
-                root, voice=args.voice, speed=args.speed, use_gpu=use_gpu, builds=builds
+            with _engine(
+                root, args.voice, "en", speed=args.speed, use_gpu=use_gpu, builds=builds
             ) as engine:
                 notes = _EngineNotes(engine)
                 notes.say(sys.stderr)
@@ -907,7 +967,14 @@ def _saved_note(workdir: Path) -> str:
     return ""
 
 
-def _prepare(use_gpu: bool, root: Path, *, assume_yes: bool, take_over: bool = False) -> Prepared:
+def _prepare(
+    use_gpu: bool,
+    root: Path,
+    *,
+    assume_yes: bool,
+    take_over: bool = False,
+    voice: str = DEFAULT_VOICE,
+) -> Prepared:
     """Download what a run needs (after asking), and switch to new engine builds only once
     they pass their self-check. Prints a note when an update was kept back. ``take_over``
     (``tomecast scan``) checks this Tomecast's own builds even where a newer one chose."""
@@ -922,6 +989,8 @@ def _prepare(use_gpu: bool, root: Path, *, assume_yes: bool, take_over: bool = F
         for asset in missing:
             print(f"  • {asset.name} ({_megabytes(asset.size)})")
         print(f"Total: {_megabytes(total)}, saved in {root}")
+        if premium := voices.premium_note(missing):
+            print(premium)
         if assume_yes:
             return True
         # Only asked where the question can be seen: with the output going to a file, it
@@ -950,8 +1019,9 @@ def _prepare(use_gpu: bool, root: Path, *, assume_yes: bool, take_over: bool = F
         print("Checking the new voice engine on this computer (a few seconds)…")
 
     try:
-        prepared = prepare_voice(
+        prepared = voices.prepare_voice(
             root,
+            voice,
             use_gpu,
             consent=consent,
             on_download=_download_printer,

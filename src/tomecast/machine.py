@@ -9,8 +9,8 @@ threads.
 * :func:`scan_machine` reads the CPU count, the memory and the power state into a
   :class:`Machine`.
 * :func:`recommend` turns that into a :class:`Recommendation`: the voice and its thread count.
-  Kokoro is the only voice for now; recommending Ming on a graphics card with 4 GB or more
-  (docs/architecture.md, section 5) is added there with issue #11.
+  Given the graphics card the engine would use, it recommends the premium voice (Ming) on a
+  card with 4 GB or more and room for it (docs/architecture.md, section 5; issue #11).
 * :func:`memory_note` warns when too little memory is free to voice comfortably.
 """
 
@@ -19,7 +19,10 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from tomecast.hardware import GpuDevice
 
 # Where the scan looks. Read when called, so tests can point them at a fake tree.
 MEMINFO = Path("/proc/meminfo")
@@ -38,6 +41,11 @@ LOW_MEMORY_BYTES = 6 * 2**30
 # Less free memory than this before voicing gets a warning: the voice's peak, plus about 200 MB
 # for packaging with ffmpeg and for the system, which otherwise starts swapping.
 MIN_FREE_BYTES = 2_000_000_000
+# The premium voice (Ming Q8_0) took about 1.45 GB of graphics memory on audio.cpp 0.9.4. It's
+# recommended on a card with at least this much in all ("NVIDIA or AMD graphics, 4 GB+") and
+# at least this much free when the scan looks; otherwise the card would run out mid-book.
+PREMIUM_MIN_GPU_BYTES = 4 * 2**30
+PREMIUM_MIN_FREE_GPU_BYTES = 2_000_000_000
 
 # Outside power supplies (the charger, USB-C, wireless charging). "UPS" isn't one: a desktop on
 # a UPS isn't a laptop, so a UPS never counts either way.
@@ -81,7 +89,7 @@ class Machine:
 class Recommendation:
     """The setting the scan picks (docs/architecture.md, section 5)."""
 
-    voice: Literal["kokoro"]  # the only one for now; Ming comes with issue #11
+    voice: Literal["kokoro", "ming"]  # Ming only with a graphics card that has room for it
     threads: int  # CPU threads the voice engine is told to use
     usual_threads: int  # what it would use plugged in, with enough memory
     fewer_because: tuple[str, ...] = ()  # ON_BATTERY and/or LOW_MEMORY, when threads < usual
@@ -188,8 +196,14 @@ def usual_threads(cpus: int) -> int:
     return max(1, min(MAX_THREADS, cpus // 2))
 
 
-def recommend(machine: Machine) -> Recommendation:
+def recommend(machine: Machine, gpu: GpuDevice | None = None) -> Recommendation:
     """The voice and its thread count for ``machine``.
+
+    The voice is the premium one (``"ming"``) only when ``gpu``, the graphics card the
+    engine would use (:func:`tomecast.hardware.pick_device`), has at least
+    :data:`PREMIUM_MIN_GPU_BYTES` in all and :data:`PREMIUM_MIN_FREE_GPU_BYTES` free; with no
+    card it's always Kokoro, which runs everywhere. Recommending isn't choosing: the premium
+    voice is a download the user agrees to first.
 
     The usual count is :func:`usual_threads`. On battery, or with less than
     :data:`LOW_MEMORY_BYTES` in total ("Old or low-RAM laptop: Kokoro, fewer threads"), it's
@@ -200,7 +214,17 @@ def recommend(machine: Machine) -> Recommendation:
     if machine.low_memory:
         reasons += (LOW_MEMORY,)
     threads = (usual + 1) // 2 if reasons else usual
-    return Recommendation("kokoro", threads, usual, reasons if threads < usual else ())
+    voice: Literal["kokoro", "ming"] = "ming" if premium_fits(gpu) else "kokoro"
+    return Recommendation(voice, threads, usual, reasons if threads < usual else ())
+
+
+def premium_fits(gpu: GpuDevice | None) -> bool:
+    """True if the premium voice is worth recommending on ``gpu`` (see :func:`recommend`)."""
+    return (
+        gpu is not None
+        and gpu.total_bytes >= PREMIUM_MIN_GPU_BYTES
+        and gpu.free_bytes >= PREMIUM_MIN_FREE_GPU_BYTES
+    )
 
 
 def voice_threads() -> int:

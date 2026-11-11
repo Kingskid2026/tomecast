@@ -310,6 +310,10 @@ def _checked_speed(speed: float) -> float:
 class KokoroServer:
     """A running audio.cpp server with Kokoro loaded. Use it as a context manager."""
 
+    # The model's id in the server config, requests and /v1/models. Another voice on the same
+    # server (Ming, in tomecast.engines.ming) changes it with the config and the request.
+    MODEL_ID = "kokoro"
+
     def __init__(
         self,
         root: Path,
@@ -670,17 +674,19 @@ class KokoroServer:
         self._process.wait()
         self._process = None
 
+    def _request_body(self, text: str) -> dict[str, object]:
+        """The JSON body of one request to voice ``text``."""
+        return {
+            "model": "kokoro",
+            "input": text,
+            "voice": self.voice,
+            "speed": self.voice_speed,
+            "response_format": "wav",
+            "options": {"seed": self.seed},
+        }
+
     def _request(self, text: str) -> bytes:
-        body = json.dumps(
-            {
-                "model": "kokoro",
-                "input": text,
-                "voice": self.voice,
-                "speed": self.voice_speed,
-                "response_format": "wav",
-                "options": {"seed": self.seed},
-            }
-        ).encode()
+        body = json.dumps(self._request_body(text)).encode()
         request = urllib.request.Request(
             f"{self._base_url}/v1/audio/speech",
             data=body,
@@ -721,7 +727,7 @@ class KokoroServer:
             return None
         models = payload.get("data") if isinstance(payload, dict) else None
         for model in models if isinstance(models, list) else ():
-            if isinstance(model, dict) and model.get("id") == "kokoro" and model.get("loaded"):
+            if isinstance(model, dict) and model.get("id") == self.MODEL_ID and model.get("loaded"):
                 device = model.get("device")
                 return device if isinstance(device, int) and not isinstance(device, bool) else None
         return None
@@ -999,6 +1005,7 @@ def check_build(
     backend: Literal["cpu", "vulkan"],
     device: int | None = None,
     cancelled: IsCancelled | None = None,
+    server: type[KokoroServer] = KokoroServer,
 ) -> CheckResult:
     """Try the engine build in the folder ``engine``: ``None`` if it works, else why not.
 
@@ -1011,11 +1018,12 @@ def check_build(
     rather than report a failure. If the graphics card runs out of memory (other programs
     are using it), that says nothing about the build: the result is
     :class:`~tomecast.downloads.Inconclusive`, so nothing is switched or recorded.
+    ``server`` is the voice to check with (Ming's check passes its own).
     """
     with tempfile.TemporaryDirectory(prefix="tomecast-check-") as folder:
         wav = Path(folder) / "check.wav"
         try:
-            with KokoroServer(
+            with server(
                 root,
                 executable=engine / EXECUTABLE,
                 espeak=espeak,
@@ -1040,8 +1048,15 @@ def check_build(
         return audio_problem(wav, SELF_CHECK_TEXT) or None
 
 
-def self_check(root: Path, use_gpu: bool, cancelled: IsCancelled | None = None) -> SelfCheck:
+def self_check(
+    root: Path,
+    use_gpu: bool,
+    cancelled: IsCancelled | None = None,
+    *,
+    server: type[KokoroServer] = KokoroServer,
+) -> SelfCheck:
     """Kokoro's check of new engine and eSpeak builds, for a run with or without the card.
+    (``server`` makes it another voice's check: Ming's, in :mod:`tomecast.engines.ming`.)
 
     Without the graphics card, the new builds must voice on the CPU. With it, they must voice
     on the card a run would use. If they fail there, the builds in use are tried on the card
@@ -1086,6 +1101,7 @@ def self_check(root: Path, use_gpu: bool, cancelled: IsCancelled | None = None) 
                     backend="vulkan",
                     device=device.index,
                     cancelled=cancelled,
+                    server=server,
                 )
                 if problem is None or isinstance(problem, Inconclusive) or old_engine is None:
                     return problem  # out of memory on the card says nothing about any build
@@ -1096,11 +1112,14 @@ def self_check(root: Path, use_gpu: bool, cancelled: IsCancelled | None = None) 
                     backend="vulkan",
                     device=device.index,
                     cancelled=cancelled,
+                    server=server,
                 )
                 if old_problem is None:
                     return problem  # the card worked with the builds in use, not these
                 return Inconclusive(f"the graphics card didn't work with any build: {problem}")
-        return check_build(root, new_engine, new_espeak, backend="cpu", cancelled=cancelled)
+        return check_build(
+            root, new_engine, new_espeak, backend="cpu", cancelled=cancelled, server=server
+        )
 
     return check
 
