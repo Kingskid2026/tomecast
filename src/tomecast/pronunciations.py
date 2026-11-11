@@ -12,6 +12,9 @@ A list is a text file with one fix per line::
 * Matching is by whole word. A left side written in lowercase matches the word in any case
   ("kernel", "Kernel", "KERNEL"). A left side with a capital letter matches that exact
   spelling, and its ALL-CAPS version (for headings).
+* Apostrophe-like marks touching a letter count as apostrophes on both sides
+  (:func:`tomecast.marks.speakable`), so ``Qurʾān`` matches the book's ``Qur'ān`` and the
+  other way round, and a fix for ``Siobhan`` covers ``Siobhanʼs``.
 * Several words work too: ``New Zealand → noo zee-lund``.
 * Lines starting with ``#`` are comments, and so is anything after `` #`` on a line.
 
@@ -102,10 +105,10 @@ def phonetic_notation(spoken: str) -> Notation | None:
 
     * ``"IPA"``: IPA symbols (the letters ``ə ɪ ʃ ɔ``..., ``β θ χ``, stress and length marks
       ``ˈ ˌ ː ˑ``, raised letters ``ʰ ʲ ʷ``, tone letters, tie bars and the Phonetic
-      Extensions such as ``ᵻ``): ``ʃɪˈvɔːn``, ``shiv-ˈawn``, ``/ʃɪˈvɔːn/``, ``[ʃɪˈvɔːn]``.
+      Extensions such as ``ᵻ``): ``ʃɪˈvɔːn``, ``shi-ˈvawn``, ``/ʃɪˈvɔːn/``, ``[ʃɪˈvɔːn]``.
     * ``"markup"``: eSpeak's ``[[phoneme]]`` markup, anywhere in the value.
     * ``"slashes"`` or ``"brackets"``: plain letters wrapped in one pair of slashes or
-      square brackets (``/shiv-awn/``, ``[shiv-AWN]``), the way phonetic spellings are
+      square brackets (``/shi-vawn/``, ``[shi-vawn]``), the way phonetic spellings are
       written. Slashes or brackets inside a respelling (``a/b``, ``ay [bee] see``,
       ``[ay] bee [see]``) are fine.
 
@@ -195,7 +198,11 @@ class Pronunciations:
         Where several entries match the same words (say a global ``alice`` and a book's
         ``Alice``), the last one in the list wins, so the book's own list beats the global
         one. A capitalised entry's ALL-CAPS form gives way to an entry written in capitals.
+
+        The text is matched, and comes back, with its apostrophe-like marks as apostrophes
+        (:func:`tomecast.marks.speakable`), the way the left sides are matched.
         """
+        text = speakable(text)
         if self._pattern is None:
             return text
 
@@ -224,7 +231,9 @@ class Pronunciations:
 
 
 def _normalise_key(text: str) -> str:
-    return " ".join(text.split())
+    """A left side or word as it is compared: spacing evened out, and apostrophe-like marks
+    as apostrophes."""
+    return speakable(" ".join(text.split()))
 
 
 def _literal(key: str) -> str:
@@ -237,13 +246,17 @@ def _lines(text: str) -> Iterator[tuple[int, Pronunciation | None]]:
     for a line without an arrow and something on each side)."""
     for number, raw in enumerate(text.splitlines(), start=1):
         line = _COMMENT.sub("", raw).strip()
-        if not line:
-            continue
-        parts = _SEPARATOR.split(line, maxsplit=1)
-        if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
-            yield number, None
-        else:
-            yield number, Pronunciation(parts[0].strip(), parts[1].strip())
+        if line:
+            yield number, _fix_on(line)
+
+
+def _fix_on(line: str) -> Pronunciation | None:
+    """The fix on a line with its comment taken off, or None if it has no arrow with something
+    on each side."""
+    parts = _SEPARATOR.split(line, maxsplit=1)
+    if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
+        return None
+    return Pronunciation(parts[0].strip(), parts[1].strip())
 
 
 _SKIPPED = {
@@ -270,7 +283,7 @@ def parse(text: str, source: str = "pronunciations") -> tuple[Pronunciations, li
             warnings.append(
                 f"{source}, line {number}: '{entry.spoken}' {_SKIPPED[notation]}, so the line "
                 f"is skipped; {leave_out}write a respelling for '{entry.written}' instead, "
-                f"the way it sounds in plain letters, like shiv-AWN"
+                f"the way it sounds in plain letters, like shi-vawn"
             )
             continue
         entries.append(entry)
@@ -284,6 +297,17 @@ def phonetic_lines(text: str) -> tuple[Pronunciation, ...]:
     return tuple(
         entry for _, entry in _lines(text) if entry is not None and is_phonetic(entry.spoken)
     )
+
+
+def without_phonetic(text: str, word: str) -> str:
+    """``text`` without the lines for ``word`` that :func:`parse` skips as phonetic spellings
+    (matched as :func:`matches` does). Every other line and comment is kept as it is."""
+
+    def phonetic_for_word(line: str) -> bool:
+        entry = _fix_on(_COMMENT.sub("", line.rstrip("\r\n")).strip())
+        return entry is not None and is_phonetic(entry.spoken) and matches(entry.written, word)
+
+    return "".join(line for line in text.splitlines(keepends=True) if not phonetic_for_word(line))
 
 
 def read_list(path: Path) -> str:
@@ -320,7 +344,8 @@ def load_for_book(data_folder: Path, book: Path | None) -> tuple[Pronunciations,
 
 
 def same_written(written: str, other: str) -> bool:
-    """True if the left sides ``written`` and ``other`` are the same, apart from spacing."""
+    """True if the left sides ``written`` and ``other`` are the same, apart from spacing (and
+    apostrophe-like marks, which count as apostrophes)."""
     return _normalise_key(written) == _normalise_key(other)
 
 
@@ -355,7 +380,7 @@ def edit(text: str, written: str, spoken: str | None) -> str:
     newline = "\r\n" if "\r\n" in text else "\n"
     if text and not text.endswith(("\n", "\r")):
         text += newline
-    return f"{text}{_normalise_key(written)} → {spoken}{newline}"
+    return f"{text}{' '.join(written.split())} → {spoken}{newline}"
 
 
 def _left_side(line: str) -> str | None:

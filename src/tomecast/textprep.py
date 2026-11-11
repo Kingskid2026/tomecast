@@ -10,10 +10,12 @@ It is deterministic (the same text always gives the same result) and it never re
 Rules only replace a written form with words that say the same thing, and :func:`words_lost`
 double-checks every paragraph: if a paragraph would lose a word, it is left as written.
 
-Before the rules, apostrophe-like marks that eSpeak would read out by name (the hamza and
-ayin of transliterated Arabic, the Russian soft sign...) become plain apostrophes
-(:func:`tomecast.marks.speakable`), in the book's text and in the respellings alike, whatever
-the language.
+First, apostrophe-like marks that eSpeak would read out by name (the hamza and ayin of
+transliterated Arabic, the Russian soft sign...) become plain apostrophes where they touch a
+letter (:func:`tomecast.marks.speakable`), whatever the language. The pronunciation lists'
+left sides are compared the same way, so a fix for "Siobhan" covers a book's possessive
+written with U+02BC, and their right sides are made speakable too. A mark standing on its
+own is left as it is.
 
 Language comes from the book. English has rules (:mod:`tomecast.textprep_en`); a book in a
 language without rules is voiced as written, apart from the pronunciation lists. A new language
@@ -103,8 +105,8 @@ def words_lost(before: str, after: str, consumed: Iterable[str] = ()) -> list[st
 
 @dataclass(frozen=True, slots=True)
 class TextPrep:
-    """Prepares the text of a book for the voice: pronunciation fixes first, then marks the
-    voice would read out by name made speakable, then the language's rules. Build one with
+    """Prepares the text of a book for the voice: marks the voice would read out by name
+    made speakable, then the pronunciation fixes, then the language's rules. Build one with
     :meth:`for_language`."""
 
     rules: TextRules
@@ -133,16 +135,23 @@ class TextPrep:
         return tuple(prepared)
 
     def _prepare(self, text: str, rule: _Rule) -> str:
-        # The fixes see the text as the book has it, so a left side with such a mark matches.
-        fixed = speakable(self.pronunciations.apply(text))
+        # Taken from the text as written, before any step: a paragraph that says something
+        # (even just a hamza sign, in a transliteration table) must not become a scene break.
+        has_content = _has_content(text)
+        # The marks first, so the fixes see them as apostrophes, as the lists' left sides are.
+        fixed = self.pronunciations.apply(speakable(text))
         prepared = rule(fixed)
         if prepared == fixed:
             return fixed
         lost = words_lost(fixed, prepared, self.rules.consumed_words)
-        has_content = any(c.isalnum() for c in fixed)
-        if lost or (has_content and not any(c.isalnum() for c in prepared)):
+        if lost or (has_content and not _has_content(prepared)):
             return fixed  # a rule went wrong: speak it as written rather than lose a word
         return prepared
+
+
+def _has_content(text: str) -> bool:
+    """True if ``text`` has something to say (a letter or a digit), so it isn't a pause."""
+    return any(character.isalnum() for character in text)
 
 
 class _Rule(Protocol):

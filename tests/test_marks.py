@@ -32,9 +32,56 @@ def test_apostrophe_like_marks_become_apostrophes(written: str, spoken: str) -> 
 
 
 def test_every_listed_mark_is_mapped_one_for_one() -> None:
-    text = "a".join(APOSTROPHE_LIKE)
-    assert speakable(text) == "a".join("'" * len(APOSTROPHE_LIKE))
+    text = "a" + "a".join(APOSTROPHE_LIKE) + "a"
+    assert speakable(text) == "a" + "a".join("'" * len(APOSTROPHE_LIKE)) + "a"
     assert len(speakable(text)) == len(text)  # a mark for a mark: nothing is lost
+    assert speakable("Ka\u02bc\u02bfa") == "Ka''a"  # a run of marks touching letters
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "\u02be",  # a transliteration table's row: the sign on its own...
+        "\u02be \u02bf",
+        "\u02be\u02bf",  # ...or a run of them
+        "The sign \u02bc. Next one.",
+        "Write \u02bf for ayin and \u02be for hamza.",
+        "(\u02b9)",
+        "5\u02b910\u02ba",  # digits aren't letters: primes for feet and inches stay
+        "A B A\u02b9",  # a lone capital before it: a label ("A prime"), not a word
+        "Part D\u02bc",
+    ],
+)
+def test_marks_not_touching_a_word_are_left_as_they_are(text: str) -> None:
+    """An apostrophe says nothing: a lone mark would turn into silence, or a scene break."""
+    assert speakable(text) == text
+
+
+@pytest.mark.parametrize(
+    ("written", "spoken"),
+    [
+        ("Siobhan\u02bcs", "Siobhan's"),  # at the edge of a word
+        ("\u02bfAli", "'Ali"),
+        ("I\u02bcm", "I'm"),  # a lone capital with a letter after it is a word
+        ("cup o\u02bc tea", "cup o' tea"),  # a lone small letter: dialect, not a label
+        ("goin\u02bc home", "goin' home"),
+    ],
+)
+def test_marks_at_the_edge_of_a_word_become_apostrophes(written: str, spoken: str) -> None:
+    assert speakable(written) == spoken
+
+
+def test_no_text_with_something_to_say_is_left_with_nothing() -> None:
+    """Every mark, alone or next to letters, digits, spaces and punctuation in every order:
+    whatever had a letter or digit still has one, and the length never changes."""
+    pieces = ["", " ", "a", "A", "5", ".", "(", *APOSTROPHE_LIKE]
+    for mark in APOSTROPHE_LIKE:
+        for before in pieces:
+            for after in pieces:
+                text = before + mark + after
+                result = speakable(text)
+                assert len(result) == len(text)
+                assert any(c.isalnum() for c in result), repr(text)
 
 
 @pytest.mark.parametrize(

@@ -8,13 +8,28 @@ reads each of these out by name, and spells the word it sits in letter by letter
 was "H A W A I ejective I", and "Ilʹich" "I L letter-two-B-nine I C H". The ʻokina (U+02BB)
 and the ordinary and curly apostrophes are read as intended (all four give həwˈaɪiː).
 
-So :func:`speakable` turns the troublesome marks into an ASCII apostrophe, which reads best
-(measured with eSpeak's own phonemes, no audio): "Il'ich" gives ˈɪlɪtʃ where "Ilich" gives
-ˈɪlɪx, and "Mar'ya" gives mˈɑːɹjə where "Marya" gives mˈɛɹɪə. Nothing else changes, so no
-word is lost; the text keeps the same letters, just a different apostrophe.
+So :func:`speakable` turns these marks into an ASCII apostrophe where they touch a letter
+(inside a word or at its edge). Measured with eSpeak's own phonemes (no audio), an
+apostrophe usually reads as well as dropping the mark or better: "Il'ich" gives ˈɪlɪtʃ where
+"Ilich" gives ˈɪlɪx, "Mar'ya" mˈɑːɹjə where "Marya" gives mˈɛɹɪə, and Olga, Kazan or Gogol
+read the same either way. It is worse after a single letter at the start of a word, which
+eSpeak then reads as a letter name: "K'iche'" is kˈeɪˈɪtʃ ("kay-itch") where "Kiche" is
+kˈɪtʃ, and "L'vov" ˈɛlvˈɑːv where "Lvov" is ləvˈɑːv. Dropping the mark there would break
+the far commoner apostrophes of a book that uses U+02BC for them ("I'm" is aɪm but "Im" is
+ˈɪm; "O'Brien" and "d'Artagnan" lose a letter name too), and a letter name is still far
+better than the whole word spelled out, so it stays an apostrophe.
+
+A mark standing on its own, as in a transliteration table ("ʾ  hamza"), is left as it is:
+it is the only thing to say there, and an apostrophe would say nothing at all. So is a mark
+after a lone capital letter at the end of a word, a label such as "Aʹ" (A prime) or
+"Part Dʼ": as "D'" the English rules would read it as a Roman numeral ("five hundred").
+Nothing else changes, and each mark becomes exactly one apostrophe, so the text keeps its
+length.
 """
 
 from __future__ import annotations
+
+import re
 
 # Each of these is read out by name, and spells its word out, in eSpeak NG 1.52 (en-us).
 APOSTROPHE_LIKE = (
@@ -29,10 +44,31 @@ APOSTROPHE_LIKE = (
     "ꞌ"  # ꞌ latin small letter saltillo
 )
 
-_TO_APOSTROPHE = str.maketrans(dict.fromkeys(APOSTROPHE_LIKE, "'"))
+_MARKS = re.compile(f"[{APOSTROPHE_LIKE}]+")
+
+
+def _is_letter(character: str) -> bool:
+    return character.isalpha() and character not in APOSTROPHE_LIKE
+
+
+def _lone_capital(text: str, index: int) -> bool:
+    """True if ``text[index]`` is a capital letter that is a word on its own so far."""
+    return text[index].isupper() and (index == 0 or not _is_letter(text[index - 1]))
 
 
 def speakable(text: str) -> str:
     """``text`` with every apostrophe-like mark eSpeak would read out by name turned into an
-    ASCII apostrophe: ``"Qurʾān"`` -> ``"Qur'ān"``. Everything else is left as it is."""
-    return text.translate(_TO_APOSTROPHE)
+    ASCII apostrophe where it touches a letter: ``"Qurʾān"`` -> ``"Qur'ān"``,
+    ``"Siobhanʼs"`` -> ``"Siobhan's"``. A mark (or a run of them) with no letter on either
+    side is left as it is, and so is one whose only letter is a lone capital before it
+    (``"Aʹ"``); everything else is too. The result is as long as ``text``."""
+
+    def replace(match: re.Match[str]) -> str:
+        start, end = match.span()
+        before = start > 0 and _is_letter(text[start - 1])
+        after = end < len(text) and _is_letter(text[end])
+        if not (before or after) or (not after and _lone_capital(text, start - 1)):
+            return match.group()
+        return "'" * (end - start)
+
+    return _MARKS.sub(replace, text)

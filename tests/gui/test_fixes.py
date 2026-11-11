@@ -208,6 +208,33 @@ def test_the_books_ipa_line_is_replaced_before_the_global_one(folders: tuple[Pat
     assert _global_text(data) == "Dinah → ˈdaɪnə\n"  # another book's business
 
 
+def test_every_skipped_line_for_the_name_goes_and_the_one_that_wins_is_replaced(
+    folders: tuple[Path, Path],
+) -> None:
+    """Two IPA lines for Dinah: the later one (which would win) gets the respelling, in place,
+    and the earlier one goes, so no note is left."""
+    book, data = folders
+    path = pronunciations.book_list_path(book)
+    path.write_text(
+        f"{BOOK_LIST}dinah → /ˈdaɪnə/  # first try\nDinah → ˈdiːnə  # second\n", encoding="utf-8"
+    )
+    lists = _lists(book, data)
+    lists.set_for_name("Dinah", "DIE-nuh")
+    assert _book_text(book) == f"{BOOK_LIST}Dinah → DIE-nuh  # second\n"
+    assert lists.fix_for("Dinah") == Fix("Dinah", "DIE-nuh", "book")
+    assert pronunciations.load_for_book(data, book)[1] == []
+
+
+def test_a_fix_typed_with_either_apostrophe_is_the_names_fix(folders: tuple[Path, Path]) -> None:
+    book, data = folders
+    path = pronunciations.book_list_path(book)
+    path.write_text(f"{BOOK_LIST}Qur'an → kur-AHN\n", encoding="utf-8")
+    lists = _lists(book, data)
+    assert lists.fix_for("Qurʾan") == Fix("Qur'an", "kur-AHN", "book")  # the book's spelling
+    lists.set_for_name("Qurʾan", "kur-AAN")  # changed on its own line, not added again
+    assert _book_text(book) == f"{BOOK_LIST}Qur'an → kur-AAN\n"
+
+
 def test_a_list_with_a_byte_order_mark_shows_and_keeps_its_first_fix(tmp_path: Path) -> None:
     path = tmp_path / "book.pronunciations.txt"
     path.write_bytes(b"\xef\xbb\xbf" + "Zorp → zawrp\nAda -> ay-da\n".encode())

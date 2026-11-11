@@ -11,6 +11,7 @@ from tomecast.pronunciations import (
     phonetic_lines,
     phonetic_notation,
     respelling,
+    without_phonetic,
 )
 
 
@@ -74,13 +75,13 @@ IPA = [
     pytest.param("/ʃɪˈvɔːn/", id="IPA in slashes"),
     pytest.param("[ʃɪˈvɔːn]", id="IPA in brackets, as Wikipedia writes it"),
     pytest.param("[ ʃɪˈvɔːn ]", id="brackets with spaces"),
-    pytest.param("shiv-awn (ʃɪˈvɔːn)", id="IPA after a respelling"),
+    pytest.param("shi-vawn (ʃɪˈvɔːn)", id="IPA after a respelling"),
     pytest.param("ɡal", id="IPA g, not the letter g"),
     pytest.param("ʃiv-awn", id="one IPA letter"),
-    pytest.param("shiv-ˈawn", id="primary stress mark only"),
-    pytest.param("ˌshiv-awn", id="secondary stress mark only"),
-    pytest.param("shiv-awːn", id="length mark only"),
-    pytest.param("shiv-awˑn", id="half-length mark only"),
+    pytest.param("shi-ˈvawn", id="primary stress mark only"),
+    pytest.param("ˌshi-vawn", id="secondary stress mark only"),
+    pytest.param("shi-vawːn", id="length mark only"),
+    pytest.param("shi-vawˑn", id="half-length mark only"),
     pytest.param("tʰom", id="aspiration mark"),
     pytest.param("kaˀta", id="glottal stop modifier"),
     pytest.param("kaˁta", id="reversed glottal stop modifier"),
@@ -105,11 +106,11 @@ def test_ipa_is_skipped_with_advice(say: str) -> None:
     assert warnings == [
         f"x.txt, line 1: '{say}' looks like IPA, and the voice can't use phonetic symbols, "
         "so the line is skipped; write a respelling for 'Siobhan' instead, the way it sounds "
-        "in plain letters, like shiv-AWN"
+        "in plain letters, like shi-vawn"
     ]
 
 
-@pytest.mark.parametrize("say", ["[[S@v'O:n]]", "shiv-[[A:n]]"])
+@pytest.mark.parametrize("say", ["[[S@v'O:n]]", "shi-[[vA:n]]"])
 def test_espeak_markup_is_skipped_with_advice(say: str) -> None:
     assert phonetic_notation(say) == "markup"
     found, warnings = parse(f"Siobhan → {say}\n", "x.txt")
@@ -117,17 +118,17 @@ def test_espeak_markup_is_skipped_with_advice(say: str) -> None:
     assert warnings == [
         f"x.txt, line 1: '{say}' is eSpeak phoneme markup, which the voice can't use, so the "
         "line is skipped; write a respelling for 'Siobhan' instead, the way it sounds in plain "
-        "letters, like shiv-AWN"
+        "letters, like shi-vawn"
     ]
 
 
 @pytest.mark.parametrize(
     ("say", "notation"),
     [
-        ("/shiv-awn/", "slashes"),
+        ("/shi-vawn/", "slashes"),
         ("/SH IH V AO N/", "slashes"),  # ARPAbet: plain letters, but not a respelling
         ("//", "slashes"),
-        ("[shiv-AWN]", "brackets"),
+        ("[shi-vawn]", "brackets"),
         ("[sic]", "brackets"),
         ("[]", "brackets"),
     ],
@@ -141,15 +142,15 @@ def test_plain_letters_in_slashes_or_brackets_say_what_to_leave_out(
     assert warnings == [
         f"x.txt, line 1: '{say}' is in {notation}, the way phonetic spellings are written, so "
         f"the line is skipped; leave the {notation} out and write a respelling for 'Siobhan' "
-        "instead, the way it sounds in plain letters, like shiv-AWN"
+        "instead, the way it sounds in plain letters, like shi-vawn"
     ]
 
 
 def test_spaces_around_a_value_dont_hide_its_slashes_or_brackets() -> None:
-    assert phonetic_notation("  /shiv-awn/ ") == "slashes"
-    assert phonetic_notation("\t[shiv-AWN]  ") == "brackets"
+    assert phonetic_notation("  /shi-vawn/ ") == "slashes"
+    assert phonetic_notation("\t[shi-vawn]  ") == "brackets"
     assert phonetic_notation(" [[S@v'O:n]] ") == "markup"
-    assert phonetic_notation("  shiv-AWN  ") is None
+    assert phonetic_notation("  shi-vawn  ") is None
 
 
 RESPELLINGS = [
@@ -187,10 +188,10 @@ def test_respellings_and_the_letters_names_use_are_kept(say: str) -> None:
 
 
 def test_the_skipped_phonetic_lines_can_be_found() -> None:
-    text = "# mine\nSiobhan → ʃɪˈvɔːn  # wiki\nZorp → zawrp\nno arrow\nsiobhan → /shiv-awn/\n"
+    text = "# mine\nSiobhan → ʃɪˈvɔːn  # wiki\nZorp → zawrp\nno arrow\nsiobhan → /shi-vawn/\n"
     assert phonetic_lines(text) == (
         Pronunciation("Siobhan", "ʃɪˈvɔːn"),
-        Pronunciation("siobhan", "/shiv-awn/"),
+        Pronunciation("siobhan", "/shi-vawn/"),
     )
 
 
@@ -222,6 +223,49 @@ def test_a_list_with_phonetic_lines_keeps_its_other_fixes(tmp_path: Path) -> Non
         "book.pronunciations.txt, line 1",
     ]
     assert found.apply("Siobhan met Galadriel.") == "Siobhan met Galadriel."
+
+
+@pytest.mark.parametrize(
+    ("written", "text", "spoken"),
+    [
+        ("Qur\u02bean", "The Qur\u02bean.", "The kur-ahn."),  # the same mark both sides
+        ("Qur\u02bean", "The Qur'an.", "The kur-ahn."),  # the list's mark, the book's '
+        ("Qur'an", "The Qur\u02bean.", "The kur-ahn."),  # the other way round
+        ("Siobhan", "Siobhan\u02bcs hat", "shi-vawn's hat"),  # a possessive with U+02BC
+        ("siobhan", "SIOBHAN\u02bcS HAT", "shi-vawn'S HAT"),
+        ("\u02be", "\u02be is hamza", "kur-ahn is hamza"),  # a lone mark matches itself
+    ],
+)
+def test_apostrophe_like_marks_match_as_apostrophes_on_both_sides(
+    written: str, text: str, spoken: str
+) -> None:
+    say = "shi-vawn" if written.lower() == "siobhan" else "kur-AHN"
+    assert fixes((written, say)).apply(text) == spoken
+
+
+def test_marks_count_as_apostrophes_when_comparing_left_sides() -> None:
+    assert pronunciations.matches("Qur\u02bean", "Qur'an")
+    assert pronunciations.matches("qur'an", "Qur\u02bean")
+    assert pronunciations.same_written("Qur\u02bean", "Qur'an")
+    assert fixes(("Qur\u02bean", "x")).written_words() == {"qur'an"}
+    # A line for the same left side is found and changed whichever way it was written...
+    assert pronunciations.edit("Qur\u02bean → x\n", "Qur'an", "y") == "Qur\u02bean → y\n"
+    # ...and a new line keeps the spelling it was given.
+    assert pronunciations.edit("", "Qur\u02bean", "kur-AHN") == "Qur\u02bean → kur-AHN\n"
+
+
+def test_the_skipped_lines_for_a_word_can_be_taken_out() -> None:
+    text = (
+        "# mine\n"
+        "dinah → /\u02c8da\u026an\u0259/  # wiki\n"
+        "Zorp → zawrp\n"
+        "Dinah → \u02c8di\u02d0n\u0259\n"
+        "Dinah → DIE-nuh\n"
+        "Dina → \u02c8di\u02d0n\u0259\n"
+    )
+    assert without_phonetic(text, "Dinah") == (
+        "# mine\nZorp → zawrp\nDinah → DIE-nuh\nDina → \u02c8di\u02d0n\u0259\n"
+    )
 
 
 def test_a_slash_inside_a_respelling_is_fine() -> None:

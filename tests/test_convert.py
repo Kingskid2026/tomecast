@@ -272,6 +272,20 @@ def test_scene_breaks_become_silence_instead_of_failing(tmp_path: Path) -> None:
     assert (tmp_path / "b.m4b").is_file()
 
 
+def test_a_transliteration_table_is_voiced_row_by_row(tmp_path: Path) -> None:
+    """A paragraph that is only an apostrophe-like mark (a sign in a transliteration table) is
+    voiced as written: made an apostrophe, it would say nothing and become a silent pause."""
+    paragraphs = ("\u02be", "hamza", "\u02bf", "ayin", "The sign \u02bc. Next one.")
+    book = Book("B", ("A",), "en", (Chapter("Table", paragraphs),))
+    engine = FakeEngine()
+    result = convert_book(book, engine, tmp_path / "b.m4b", workdir=tmp_path / "w")
+    assert engine.texts == [
+        "Table", "\u02be", "hamza", "\u02bf", "ayin", "The sign \u02bc.", "Next one."
+    ]  # fmt: skip
+    assert all(chunk.speakable for chunk in plan_chunks(book, engine.max_chars)[0])
+    assert result.warnings == ()
+
+
 def test_an_interrupted_conversion_resumes_without_redoing_work(tmp_path: Path) -> None:
     book = _book()
     workdir = tmp_path / "work"

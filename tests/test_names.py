@@ -92,3 +92,19 @@ def test_find_book_names_reads_titles_and_paragraphs_of_every_chapter() -> None:
 def test_contractions_are_not_names() -> None:
     text = ["I\u2019m here. I\u2019ll go. I\u2019ve gone. Then I\u2019d stay. Then I'm done."]
     assert find_names(text * 3, min_count=1) == []
+
+
+def test_a_possessive_written_with_a_modifier_apostrophe_is_the_same_name() -> None:
+    """Some ebooks use U+02BC as their apostrophe: the possessive is Siobhan, listed once."""
+    paragraphs = [
+        "Then Siobhan\u02bcs boat came in, and Siobhan waved.",
+        "Later Siobhan sang. It was Siobhan\u02bcs song.",
+    ]
+    assert find_names(paragraphs, common=frozenset()) == [Name("Siobhan", 4)]
+
+
+def test_a_name_is_shown_as_the_book_spells_it() -> None:
+    paragraphs = ["Then the Qur\u02bean was read, and the Qur\u02bean was kept. The Qur'an too."]
+    assert find_names(paragraphs, common=frozenset()) == [Name("Qur\u02bean", 3)]
+    # A list's fix for it hides it, whichever apostrophe the list was typed with.
+    assert find_names(paragraphs, common=frozenset(), skip={"qur'an"}) == []

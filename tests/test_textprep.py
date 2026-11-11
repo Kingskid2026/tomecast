@@ -412,6 +412,20 @@ def test_roman_numerals(written: str, spoken: str) -> None:
 
 
 @pytest.mark.parametrize(
+    ("written", "spoken"),
+    [
+        ("Chapter L\u02b9vov", "Chapter L'vov"),
+        ("Book I\u02bcm here", "Book I'm here"),
+        ("Henry V\u02bcs army", "Henry the fifth's army"),
+        ("Part D\u02bc", "Part D\u02bc"),  # a label: the mark stays, so it's no "five hundred"
+        ("Volume C\u02b9", "Volume C\u02b9"),
+    ],
+)
+def test_marks_made_apostrophes_dont_make_roman_numerals(written: str, spoken: str) -> None:
+    assert TextPrep.for_language("en").body(written) == spoken
+
+
+@pytest.mark.parametrize(
     ("heading", "spoken"),
     [
         ("XIV", "fourteen"),
