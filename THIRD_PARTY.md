@@ -17,15 +17,15 @@ This list reflects the current design ([docs/architecture.md](docs/architecture.
 |---|---|---|---|
 | Docling Heron | PDF page layout | Apache 2.0 | [docling-project/docling-layout-heron](https://huggingface.co/docling-project/docling-layout-heron) |
 | PaddleOCR-VL-1.6 | Scanned PDF pages | Apache 2.0 | [PaddlePaddle/PaddleOCR-VL-1.6-GGUF](https://huggingface.co/PaddlePaddle/PaddleOCR-VL-1.6-GGUF) |
-| LFM3-1.7B | Spotting front/back matter and chapter starts | LFM Open License v1.0 (free for personal use and for organizations under US$10M annual revenue) | [LiquidAI/LFM3-1.7B-GGUF](https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF) |
-| MiniCPM5-2B | Backup for LFM3 | Apache 2.0 | [openbmb/MiniCPM5-2B](https://huggingface.co/OpenBMB/MiniCPM5-2B) |
+| LFM3-1.7B (`LFM3-1.7B-QAD-Q4_0.gguf`, 1.05 GB) | Judgment calls: lines to skip and where chapters start | **LFM Open License v1.0** (not an OSI license). Use, changes and sharing are allowed, but **commercial use is only licensed for a person or company with annual revenue under US$10M** (US$10M or more is outside the license). Non-commercial use has no revenue limit, and qualifying non-profits are exempt for non-commercial or research use. Anyone sharing the file must pass the license on. Tomecast never ships the file: each user downloads it from Liquid AI on first use | [LiquidAI/LFM3-1.7B-GGUF](https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF), [license](https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF/blob/main/LICENSE) |
+| MiniCPM5-2B (`MiniCPM5-2B-Q4_K_M.gguf`, 1.56 GB) | Backup for LFM3 | Apache 2.0 | [openbmb/MiniCPM5-2B-GGUF](https://huggingface.co/openbmb/MiniCPM5-2B-GGUF) |
 
 ## Engines and tools
 
 | Component | Used for | License | Source |
 |---|---|---|---|
 | audio.cpp | Running the voice models: a CPU build, and a Vulkan build for graphics cards (through the installed driver; downloaded only when the graphics card is used) | Apache 2.0 | Built by Tomecast from [0xShug0/audio.cpp](https://github.com/0xShug0/audio.cpp), see [below](#audiocpp-builds-distributed-by-tomecast) |
-| llama.cpp | Running the text and OCR models | MIT | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) |
+| llama.cpp | Running the text and OCR models: ggml-org's official prebuilt CPU build (`llama-server`), pinned by release and SHA-256 | MIT | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) |
 | ONNX Runtime | Running Docling Heron | MIT | [microsoft/onnxruntime](https://github.com/microsoft/onnxruntime) |
 | python-docx | Reading DOCX documents (it also installs typing-extensions, PSF-2.0) | MIT | [python-openxml/python-docx](https://github.com/python-openxml/python-docx) |
 | pypdfium2 5.14+ / PDFium | Reading PDFs. A Python dependency, installed from PyPI; its wheel carries a PDFium build | pypdfium2: Apache 2.0 or BSD-3-Clause. PDFium: BSD-3-Clause. The PDFium build also includes FreeType (FreeType License), ICU (Unicode License v3), libjpeg-turbo, OpenJPEG, libpng, Little CMS, zlib, Abseil and others under permissive licences, listed in the wheel's `licenses` folder | [pypdfium2](https://github.com/pypdfium2-team/pypdfium2), [PDFium](https://pdfium.googlesource.com/pdfium/), [pdfium-binaries](https://github.com/bblanchon/pdfium-binaries) |
