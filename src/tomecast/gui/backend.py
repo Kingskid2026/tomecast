@@ -972,11 +972,12 @@ class Backend(QObject):
     def _on_speeds(self, speeds: Speeds) -> None:
         """The start-up scan's speeds. A speed this session measured converting is better,
         so it isn't replaced."""
-        # The CPU was measured with the thread count of a moment ago (the probe reads it
-        # itself), so it's kept under the count read now.
+        # Kept under the thread count the CPU was measured with (the probe reads it once, on
+        # the worker), not the one read now: a charger pulled meanwhile changes that.
         self._rescan_machine()
         if speeds.cpu is not None:
-            self._speeds.setdefault(self._speed_key("CPU"), speeds.cpu)
+            key = f"CPU/{speeds.cpu_threads}" if speeds.cpu_threads else self._speed_key("CPU")
+            self._speeds.setdefault(key, speeds.cpu)
         if speeds.gpu is not None and speeds.gpu_description:
             self._speeds.setdefault(short_name(speeds.gpu_description), speeds.gpu)
             if not self._gpuName and self._gpuAvailable:

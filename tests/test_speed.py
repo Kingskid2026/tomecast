@@ -184,6 +184,24 @@ def test_the_probe_measures_the_cpu_and_the_card_once(
     assert len(_starts(tmp_path)) == 2
 
 
+def test_the_probe_reads_the_thread_count_once_and_says_which_it_used(
+    tmp_path: Path, installed: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The charger is pulled while the probe runs: the count it read first is the one it
+    # measures with, files the speed under, and tells the window (#53).
+    counts = iter([8, 4, 4, 4])
+    monkeypatch.setattr(speed_module, "default_threads", lambda: next(counts))
+    monkeypatch.setattr(audiocpp, "default_threads", lambda: 4)
+
+    found = probe(installed, gpu=False)
+
+    assert found.cpu is not None and found.cpu_threads == 8
+    config = _starts(tmp_path)[0]["config"]
+    assert isinstance(config, dict) and config["threads"] == 8
+    saved = json.loads((installed / "speeds.json").read_text())["speeds"]
+    assert [key.split("/", 1)[1] for key in saved] == ["cpu/8 threads"]
+
+
 def test_the_probe_leaves_out_a_card_that_doesnt_work(
     tmp_path: Path, installed: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

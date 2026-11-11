@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import array
+import dataclasses
 import hashlib
 import io
 import json
@@ -41,6 +42,7 @@ from tomecast.downloads import (
 from tomecast.engines.audiocpp import (
     AUDIOCPP_CPU,
     AUDIOCPP_VULKAN,
+    DEVICE_LOST_NOTE,
     ESPEAK_NG,
     KOKORO_Q8,
     OUT_OF_MEMORY_NOTE,
@@ -102,6 +104,7 @@ class Engines:
         # set: a use_gpu run starts on the card and runs out of memory on the Nth synthesize
         # call (counting every engine's), then carries on on the CPU, as AutoKokoro does
         self.oom_at: int | None = None
+        self.lost_at: int | None = None  # likewise, but the card is lost (reset by its driver)
         self.oom_at_start = False  # set: a use_gpu run runs out of memory as it starts
         self.fail_once_at: int | None = None  # the Nth synthesize call fails, once
         self.on_card: list[str] = []  # what was voiced on the graphics card
@@ -129,6 +132,7 @@ class FakeEngine:
         self.warning: str | None = None
         self.fell_back = False
         self.out_of_memory = False
+        self.device_lost = False
         self._threads = machine.voice_threads()  # read when it's made, as AutoKokoro does
         self.started = False
         self.closed = False
@@ -137,6 +141,11 @@ class FakeEngine:
 
     def pin_builds(self, builds: Mapping[str, Path]) -> None:
         self.pinned = dict(builds)
+
+    def proves(self, builds: Mapping[str, Path]) -> dict[str, Path]:
+        # As AutoKokoro: after falling back from the card, all but the engine build.
+        engine = ("engine", AUDIOCPP_VULKAN.slot)  # the test builds' slot, and the real one
+        return {s: f for s, f in builds.items() if not (self.fell_back and s in engine)}
 
     @property
     def threads(self) -> int:
@@ -179,6 +188,10 @@ class FakeEngine:
         if self.use_gpu and not self.fell_back and engines.oom_at == count:
             self.warning = RAN_OUT_OF_MEMORY_NOTE  # and it carries on on the CPU
             self.fell_back = self.out_of_memory = True
+            self.gpu_description, self.device_label = "", "CPU"
+        if self.use_gpu and not self.fell_back and engines.lost_at == count:
+            self.warning = DEVICE_LOST_NOTE  # and it carries on on the CPU
+            self.fell_back = self.device_lost = True
             self.gpu_description, self.device_label = "", "CPU"
         if self.use_gpu and not self.fell_back:
             engines.on_card.append(text)
@@ -728,6 +741,24 @@ def test_the_hardware_label_says_when_the_cpu_runs_on_battery(
     assert backend._speeds == {"CPU/4": 2.6}
     _open(qtbot, backend, _short_book(tmp_path))
     assert backend.selectionSummary == backend.chapters.summary(DEFAULT_SPEEDUP)
+
+
+def test_the_speed_test_is_kept_under_the_threads_it_measured_with(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(machine, "cpu_count", lambda: 16)
+    # The speed test measured with 8 threads, and the charger was pulled before it finished:
+    # the window now reads 4, but 4.7 is 8 threads' speed (#53).
+    pin_machine(monkeypatch, tmp_path / "laptop", supplies=ON_BATTERY)
+
+    backend = make_backend(speeds=Speeds(cpu=4.7, cpu_threads=8))
+
+    qtbot.waitUntil(lambda: bool(backend._speeds))
+    assert backend._speeds == {"CPU/8": 4.7}  # not filed as 4 threads' speed
+    assert backend.hardwareLabel == "CPU · ON BATTERY · 4 THREADS"  # 4 isn't measured yet
+    pin_machine(monkeypatch, tmp_path / "plugged", supplies=PLUGGED_IN)
+    backend.setUseGpu(not backend.useGpu)
+    assert backend.hardwareLabel == "CPU · ABOUT 4.7× REAL TIME"
 
 
 def test_each_thread_count_keeps_its_own_cpu_speed(
@@ -1875,6 +1906,30 @@ def test_the_work_folder_keeps_graphics_card_and_cpu_audio_apart(
     assert leftovers == kept  # the card's unfinished folder is still its own
 
 
+def test_a_preview_that_moves_to_the_cpu_shows_the_cpu(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    player = shutil.which("true")
+    if player is None:
+        pytest.skip("needs the `true` command as a stand-in audio player")
+    engines = Engines()
+    engines.oom_at = 1  # the card runs out of memory on the preview's first piece
+    backend = make_backend(engines, gpu=True, scan=NVIDIA, player=player)
+    qtbot.waitUntil(lambda: backend.gpuName == NVIDIA)
+    _open(qtbot, backend, _short_book(tmp_path))
+    backend.goTo("voice")
+    assert backend.hardwareLabel.startswith(short_name(NVIDIA))
+
+    backend.togglePreview()
+    qtbot.waitUntil(lambda: bool(engines.made) and engines.made[0].fell_back)
+    qtbot.waitUntil(lambda: not backend.previewPlaying)
+
+    # It carried on on the CPU, so the label says so now, not at the next conversion (#53).
+    qtbot.waitUntil(lambda: backend.hardwareLabel.startswith("CPU"))
+    assert backend.gpuName == ""
+    assert backend.errorMessage == ""
+
+
 def test_the_preview_follows_the_hardware_choice(
     qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
 ) -> None:
@@ -2772,6 +2827,37 @@ def test_a_book_made_as_asked_proves_the_build(
     qtbot.waitUntil(lambda: _installed_state(tmp_path)["slots"]["engine"]["proven"] is True)
 
 
+def test_a_book_made_on_the_cpu_fallback_still_proves_espeak(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    # The card was never tried with the engine build, but eSpeak NG voiced every sentence as
+    # in any run, so it's proven (#53).
+    asset, _ = _engine_update(tmp_path)
+    # An eSpeak NG update too, so it has something to prove (a first install doesn't).
+    legacy = tmp_path / "data" / "engines" / "espeak-0.1"
+    legacy.mkdir(parents=True)
+    (legacy / ".tomecast-sha256").write_text("f" * 64 + "\n")
+    espeak = dataclasses.replace(asset, name="eSpeak NG", path="engines/espeak",
+                                 replaces=("engines/espeak-0.1",), id=ESPEAK_NG.slot)  # fmt: skip
+    engines = Engines()
+    engines.gpu_warning = "The graphics card didn't work, so Tomecast used the CPU."
+    backend = make_backend(
+        engines, gpu=True, assets=(asset, espeak), engine_check=lambda r, g, c: lambda n, o: None
+    )
+    _open(qtbot, backend, _short_book(tmp_path))
+
+    _convert(qtbot, backend)
+
+    assert backend.screen == "done"
+
+    def slots() -> dict[str, Any]:
+        return dict(_installed_state(tmp_path)["slots"])
+
+    qtbot.waitUntil(lambda: slots()[ESPEAK_NG.slot]["proven"] is True)
+    assert slots()[ESPEAK_NG.slot]["current"] == "engines/espeak/" + espeak.sha256[:12]
+    assert slots()["engine"]["proven"] is False
+
+
 def test_stopping_doesnt_roll_back_an_update(
     qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
 ) -> None:
@@ -2975,6 +3061,30 @@ def test_a_failure_after_running_out_of_graphics_memory_doesnt_roll_back(
     assert backend.errorMessage.endswith(
         "The audio made so far is kept, so starting again continues from there."
     )
+    new_build = tmp_path / "data" / asset.path / asset.sha256[:12]
+    assert build_in_use(asset, tmp_path / "data") == new_build  # not rolled back...
+    assert failure(asset, tmp_path / "data") is None  # ...and not blamed
+
+
+def test_a_failure_after_the_card_was_lost_doesnt_roll_back(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    asset, _ = _engine_update(tmp_path)
+    engines = Engines()
+    engines.lost_at = 2  # the card is reset partway (#53)...
+    engines.fail_from = 4  # ...then the CPU fails too
+    backend = make_backend(
+        engines, gpu=True, assets=(asset,), engine_check=lambda r, g, c: lambda n, o: None
+    )
+    seen: list[str] = []
+    backend.errorMessageChanged.connect(lambda: seen.append(backend.errorMessage))
+    _open(qtbot, backend, _short_book(tmp_path))
+
+    _convert(qtbot, backend)
+
+    assert DEVICE_LOST_NOTE in seen  # in the banner when it happened
+    assert backend.screen == "voice"
+    assert UPDATE_FAILED_NOTE not in backend.errorMessage
     new_build = tmp_path / "data" / asset.path / asset.sha256[:12]
     assert build_in_use(asset, tmp_path / "data") == new_build  # not rolled back...
     assert failure(asset, tmp_path / "data") is None  # ...and not blamed

@@ -1,4 +1,5 @@
 import array
+import dataclasses
 import fcntl
 import hashlib
 import io
@@ -8,7 +9,7 @@ import tarfile
 import threading
 import time
 import wave
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from types import TracebackType
 from typing import ClassVar
@@ -42,6 +43,7 @@ class FakeKokoro:
     # set: a use_gpu run starts on the card, and it runs out of memory on this voicing (1 is
     # the first), which then carries on on the CPU, as AutoKokoro does
     oom_at: int | None = None
+    lost_at: int | None = None  # likewise, but the card is lost (reset by its driver)
     on_card: ClassVar[list[str]] = []  # what was voiced on the graphics card
     texts: ClassVar[list[str]] = []  # everything the voice was asked to say, across all instances
     on_exit: ClassVar[Callable[[], None] | None] = None  # runs when the engine stops
@@ -58,6 +60,7 @@ class FakeKokoro:
         self.warning: str | None = None
         self.fell_back = False
         self.out_of_memory = False
+        self.device_lost = False
         self.gpu_description = ""
         self.calls = 0
         FakeKokoro.made.append(self)
@@ -69,6 +72,11 @@ class FakeKokoro:
     @property
     def tempo(self) -> float:  # ...and the rest is a time-stretch, left to whoever plays it
         return audiocpp.split_speed(self.speed)[1]
+
+    def proves(self, builds: Mapping[str, Path]) -> dict[str, Path]:
+        # As AutoKokoro: after falling back from the card, all but the engine build.
+        engine_slot = audiocpp.AUDIOCPP_VULKAN.slot
+        return {s: f for s, f in builds.items() if not (self.fell_back and s == engine_slot)}
 
     def __enter__(self) -> "FakeKokoro":
         if self.use_gpu and FakeKokoro.gpu_warning:
@@ -92,6 +100,10 @@ class FakeKokoro:
         if self.use_gpu and not self.fell_back and FakeKokoro.oom_at == self.calls:
             self.warning = audiocpp.RAN_OUT_OF_MEMORY_NOTE  # and it carries on on the CPU
             self.fell_back = self.out_of_memory = True
+            self.gpu_description = ""
+        if self.use_gpu and not self.fell_back and FakeKokoro.lost_at == self.calls:
+            self.warning = audiocpp.DEVICE_LOST_NOTE  # and it carries on on the CPU
+            self.fell_back = self.device_lost = True
             self.gpu_description = ""
         if self.fail_with:
             raise EngineError(self.fail_with)
@@ -125,6 +137,7 @@ def no_real_engine(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     FakeKokoro.made = []
     FakeKokoro.gpu_warning = None
     FakeKokoro.oom_at = None
+    FakeKokoro.lost_at = None
     FakeKokoro.on_card = []
     FakeKokoro.texts = []
     FakeKokoro.on_exit = None
@@ -1342,6 +1355,20 @@ def test_scan_shows_the_machine_and_why_it_uses_fewer_threads(
     assert "CPU, 4 threads (usually 8; fewer on battery): about 2.6× real time.\n" in out
 
 
+def test_scan_gives_the_thread_count_the_cpu_was_measured_with(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(machine, "cpu_count", lambda: 16)
+    pin_machine(monkeypatch, tmp_path / "laptop", supplies=ON_BATTERY)  # 4 threads now...
+    monkeypatch.setattr(  # ...but the speed test measured with 8, before the charger went
+        cli, "probe", lambda root, gpu, cancelled=None: Speeds(cpu=4.6, cpu_threads=8)
+    )
+
+    assert cli.main(["scan"]) == 0
+
+    assert "CPU, 8 threads: about 4.6× real time.\n" in capsys.readouterr().out
+
+
 def test_an_update_that_crashes_on_the_book_is_rolled_back(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1556,6 +1583,51 @@ def test_a_book_that_ran_out_of_graphics_memory_doesnt_prove_the_build(
     slot = _slot(tmp_path, "audiocpp-vulkan")
     assert slot["proven"] is False  # the book was made on the CPU...
     assert slot["previous"] == "engines/engine-0.1"  # ...so the build that worked is kept
+
+
+def test_a_cpu_fallback_run_proves_espeak_but_not_the_engine_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    asset, _ = _engine_update(tmp_path, gpu=True)
+    # An eSpeak NG update too, so it has something to prove (a first install doesn't).
+    legacy = tmp_path / "data" / "engines" / "espeak-0.1"
+    legacy.mkdir(parents=True)
+    (legacy / ".tomecast-sha256").write_text("f" * 64 + "\n")
+    espeak = dataclasses.replace(asset, name="eSpeak NG", path="engines/espeak",
+                                 replaces=("engines/espeak-0.1",),
+                                 id=audiocpp.ESPEAK_NG.slot)  # fmt: skip
+    monkeypatch.setattr(cli, "vulkan_possible", lambda: True)
+    monkeypatch.setattr(audiocpp, "required_assets", lambda use_gpu: (asset, espeak))
+    monkeypatch.setattr(audiocpp, "self_check", lambda root, gpu, cancelled: lambda n, o: None)
+    FakeKokoro.gpu_warning = audiocpp.CPU_FALLBACK_NOTE
+
+    assert cli.main(["convert", str(_epub(tmp_path)), "--yes"]) == 0
+
+    assert _slot(tmp_path, "audiocpp-vulkan")["proven"] is False  # never tried on the card
+    espeak_slot = _slot(tmp_path, audiocpp.ESPEAK_NG.slot)
+    assert espeak_slot["current"] == "engines/espeak/" + espeak.sha256[:12]  # the update...
+    assert espeak_slot["proven"] is True  # ...used as in any run
+
+
+def test_a_failure_after_the_card_was_lost_doesnt_roll_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    asset, _ = _engine_update(tmp_path, gpu=True)
+    monkeypatch.setattr(cli, "vulkan_possible", lambda: True)
+    monkeypatch.setattr(audiocpp, "required_assets", lambda use_gpu: (asset,))
+    monkeypatch.setattr(audiocpp, "self_check", lambda root, gpu, cancelled: lambda n, o: None)
+    FakeKokoro.lost_at = 1  # the card is reset on the first piece...
+    FakeKokoro.fail_after = 1  # ...and then the CPU fails too
+    root = tmp_path / "data"
+
+    assert cli.main(["convert", str(_epub(tmp_path)), "--yes"]) == 1
+
+    out, err = capsys.readouterr()
+    assert f"Note: {audiocpp.DEVICE_LOST_NOTE}" in out  # said when it happened
+    assert UPDATE_FAILED_NOTE not in err
+    new_build = root / asset.path / asset.sha256[:12]
+    assert build_in_use(asset, root) == new_build  # not rolled back...
+    assert failure(asset, root) is None  # ...and not blamed
 
 
 def test_a_failure_after_running_out_of_graphics_memory_doesnt_roll_back(

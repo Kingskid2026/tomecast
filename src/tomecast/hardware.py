@@ -62,10 +62,12 @@ def list_devices(
     """The Vulkan devices ``executable`` (audio.cpp's Vulkan build) can see.
 
     ``[]`` means it answered and there's no device. ``None`` means it couldn't tell: the
-    program is missing, crashed, hung past ``timeout``, printed nothing usable, or
-    ``cancelled`` said the user stopped. A card that doesn't answer isn't "no card", so callers
-    must not treat ``None`` as one. Never raises. The server logs on stderr and prints one
-    JSON object on stdout; the last stdout line that parses as JSON is used.
+    program is missing, crashed before printing the list, hung past ``timeout``, printed
+    nothing usable, or ``cancelled`` said the user stopped. A card that doesn't answer isn't
+    "no card", so callers must not treat ``None`` as one. Never raises. The server logs on
+    stderr and prints one JSON object on stdout; the last stdout line that parses as JSON is
+    used, even if the program then fails (a driver that crashes as it shuts down, after
+    printing the list): the self-check and the engine's start catch a card that doesn't work.
     """
     try:
         process = subprocess.Popen(
@@ -94,8 +96,6 @@ def list_devices(
                 process.wait(timeout=5)
         if process.stdout is not None:
             process.stdout.close()
-    if process.returncode != 0:
-        return None
     payload: object = None
     for line in reversed(stdout.decode(errors="replace").splitlines()):
         try:

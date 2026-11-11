@@ -217,7 +217,11 @@ The jobs sent to the worker carry `use_gpu` (`useGpu` and `gpuAvailable`). The e
 - the backend puts the sentence in the existing error banner (`errorMessage`) while the book is made: *"The graphics card ran out of memory, so Tomecast carried on with the same voice on the CPU (slower)."*, or *"The graphics card didn't have enough free memory, so Tomecast used the CPU (slower)."* at start. The banner keeps its look; Dismiss clears it. When the book is done the backend clears it, because the done screen's `warnings` list the same sentence. A failure or Cancel replaces it as usual. A card that didn't work for another reason still shows only on the done screen, as before;
 - measures the speed and time left again from the next piece, because the card's speed says nothing about the CPU's. Until the CPU has voiced `MIN_VOICED_FOR_ESTIMATES` pieces, the speed is the CPU's as the window knows it (`ConvertJob.cpu_speedup`: its `CPU/<threads>` speed, from the speed test or a conversion this session), and the time left is the rest of the text at that speed; with no known CPU speed it shows `--:--:--` until measured.
 
-Such a run proves nothing (it's a CPU-fallback run), and a failure after it never rolls a build back: other programs used up the memory, not the build.
+Such a run doesn't prove the engine build (it's a CPU-fallback run; `Engine.proves()` leaves it out, and eSpeak NG is still proven), and a failure after it never rolls a build back: other programs used up the memory, not the build.
+
+**The card lost** (`VK_ERROR_DEVICE_LOST`, #53) partway through a book works the same way, with `Engine.device_lost` set instead of `out_of_memory`, and the banner says *"The graphics card stopped working, so Tomecast carried on with the same voice on the CPU (slower)."* Lost as the engine starts, it's the general "didn't work" note, on the done screen only (`deviceChosen("")`, no banner), though a failure after it still never rolls a build back. A preview that moves to the CPU (out of memory, or the card lost) sends `deviceChosen("")`, so the hardware label says the CPU at once.
+
+The start-up speed test's `Speeds.cpu_threads` is the thread count the CPU was measured with; the backend files the speed under `CPU/<that count>`, not the count it reads when the result arrives.
 
 On `VoiceScreen.qml`, in the preview panel below the speed meter and only when `gpuAvailable`: a `CheckRow` (the same component as "Skip front matter") labelled "Use graphics card" (`useGpuSwitch`), and a muted `MonoLabel` (`gpuNote`) showing `Backend.gpuNote`.
 

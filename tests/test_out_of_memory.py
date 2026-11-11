@@ -119,6 +119,12 @@ def test_running_out_of_graphics_memory_is_recognised(message: str) -> None:
         # The computer's own memory: the CPU needs that just the same.
         "alloc_tensor_range: failed to allocate CPU buffer of size 186707936",
         "ggml_backend_cpu_buffer_type_alloc_buffer: failed to allocate buffer of size 1024",
+        # The CPU's buffer in other capitals is still the computer's memory (#53).
+        "alloc_tensor_range: failed to allocate CPU Buffer of size 186707936",
+        "failed to allocate cpu buffer of size 1024",
+        # The word has to come soon after "failed to allocate": not a path later on (#53).
+        "audiocpp_server failed: failed to allocate a unique model installer temporary "
+        "directory in /home/reader/memory/cache",
         # Normal start-up lines.
         "ggml_vulkan: 0 = NVIDIA RTX PRO 1000 Blackwell Generation Laptop GPU (NVIDIA) | uma: 0 "
         "| fp16: 1 | bf16: 1 | warp size: 32 | shared memory: 49152 | int dot: 1 | matrix "
@@ -128,6 +134,46 @@ def test_running_out_of_graphics_memory_is_recognised(message: str) -> None:
 )
 def test_other_failures_are_not_taken_for_running_out_of_memory(message: str) -> None:
     assert not out_of_graphics_memory(message)
+
+
+def test_only_whole_lines_of_the_log_count() -> None:
+    # The engine may still be writing the last line: half of it could match (its "metadata
+    # context" still to come), so only what ends in a line break is read (#53).
+    partial = "loading\nfailed to allocate GGUF tensor"
+    assert out_of_graphics_memory(partial)  # half a line looks like the card's memory...
+    assert audiocpp._whole_lines(partial) == "loading\n"  # ...so it's left for later
+    assert not out_of_graphics_memory(audiocpp._whole_lines(partial))
+    assert not out_of_graphics_memory(partial + " metadata context\n")  # the whole line
+
+
+def test_a_half_written_line_at_start_up_isnt_taken_for_running_out(
+    tmp_path: Path, fake_server: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(
+        "FAKE_SLOW_LINE", json.dumps(["failed to allocate GGUF tensor", " metadata context"])
+    )
+    with _auto(tmp_path, fake_server) as engine:
+        assert (engine.backend, engine.out_of_memory, engine.warning) == ("vulkan", False, None)
+    assert _backends_started(tmp_path) == ["vulkan"]
+
+
+def test_a_reply_when_only_the_computers_memory_ran_out_isnt_the_card(
+    tmp_path: Path, fake_server: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The reply doesn't say whose memory it was; the log says the computer's (#53). Moving to
+    # the CPU wouldn't help, and the run must stay one that can be judged.
+    monkeypatch.setenv("FAKE_OOM_VULKAN_AFTER", "0")
+    monkeypatch.setenv(
+        "FAKE_OOM_SAYING", "alloc_tensor_range: failed to allocate CPU buffer of size 186707936"
+    )
+    with (
+        _auto(tmp_path, fake_server) as engine,
+        pytest.raises(EngineError, match="predictor tail tensors") as error,
+    ):
+        engine.synthesize("Hello there.", tmp_path / "out.wav")
+    assert not isinstance(error.value, GpuOutOfMemory)
+    assert not engine.out_of_memory
+    assert _backends_started(tmp_path) == ["vulkan"]  # not moved to the CPU
 
 
 def test_a_request_that_runs_out_of_graphics_memory_says_so_and_leaves_the_server_up(
