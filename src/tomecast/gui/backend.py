@@ -31,15 +31,16 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import QDesktopServices, QGuiApplication
 
+from tomecast import voices
 from tomecast.book import Book
 from tomecast.chunking import split_sentences
 from tomecast.cleanup import CleanupOptions, clean
 from tomecast.downloads import Asset, build_in_use, data_dir, needs_download
+from tomecast.engines import ming
 from tomecast.engines.audiocpp import (
     DEFAULT_VOICE,
     VOICES,
     check_system,
-    required_assets,
     stop_all_engines,
 )
 from tomecast.gui.fixes import BadFix, FixLists, FixNotSaved, Scope
@@ -91,6 +92,14 @@ DOWNLOAD_NOTE = "STARTING DOWNLOADS THE VOICE ONCE · {mb} MB"
 # When everything missing is a newer build of an engine that's installed (Start checks it
 # before using it, and keeps the old one if it doesn't work here).
 UPDATE_NOTE = "STARTING DOWNLOADS A VOICE ENGINE UPDATE · {mb} MB"
+# The premium voice's speed until a book has measured it here: Ming through Vulkan on the
+# maintainer's NVIDIA laptop card (local/ming-test/report.md). Kokoro's default is the CPU's.
+DEFAULT_PREMIUM_SPEEDUP = 1.8
+# When the premium voice is among the missing files (it's opt-in: Start with a premium voice
+# chosen is the asking).
+PREMIUM_DOWNLOAD_NOTE = (
+    "STARTING DOWNLOADS THE PREMIUM VOICE ONCE · {mb} MB · NEEDS A GRAPHICS CARD"
+)
 # The "Use graphics card" note, with and without a measured speed-up (the card counts as
 # faster from 1.05 times the CPU's speed).
 GPU_NOTE_ON = "FASTER · USES THE DRIVER ALREADY INSTALLED"
@@ -107,6 +116,12 @@ VOICE_GROUPS = (
     ("am", "AMERICAN · MALE"),
     ("bf", "BRITISH · FEMALE"),
     ("bm", "BRITISH · MALE"),
+)
+# The premium voices (Ming), shown after Kokoro's only when there's a graphics card. Their
+# names say the accent; British first, since UK_George is the provisional default (#11).
+PREMIUM_GROUPS = (
+    ("UK", "PREMIUM · BRITISH"),
+    ("US", "PREMIUM · AMERICAN"),
 )
 _VOICE_ORDER = (
     "af_heart", "af_bella", "af_nicole", "af_sarah", "af_sky", "af_nova", "af_river",
@@ -129,14 +144,20 @@ def _field(kind: Any, name: str, notify: Signal) -> Any:
     return Property(kind, lambda self: getattr(self, f"_{name}"), notify=notify)
 
 
-def voice_groups() -> list[dict[str, Any]]:
-    """The voice menu: American and British English, grouped by accent and gender."""
+def voice_groups(premium: bool = False) -> list[dict[str, Any]]:
+    """The voice menu: American and British English, grouped by accent and gender, then the
+    premium voices (Ming) by accent when ``premium`` (a graphics card is there to use)."""
     groups: list[dict[str, Any]] = []
     for prefix, label in VOICE_GROUPS:
         ids = [voice for voice in VOICES if voice.startswith(f"{prefix}_")]
         ids.sort(key=lambda v: (_VOICE_ORDER.index(v) if v in _VOICE_ORDER else 99, v))
-        voices = [{"id": voice, "name": voice.split("_", 1)[1].capitalize()} for voice in ids]
-        groups.append({"label": label, "voices": voices})
+        names = [{"id": voice, "name": voice.split("_", 1)[1].capitalize()} for voice in ids]
+        groups.append({"label": label, "voices": names})
+    if premium:
+        for prefix, label in PREMIUM_GROUPS:
+            ids = [voice for voice in ming.VOICES if voice.startswith(f"{prefix}_")]
+            names = [{"id": voice, "name": voice.split("_", 1)[1]} for voice in ids]
+            groups.append({"label": label, "voices": names})
     return groups
 
 
@@ -149,9 +170,9 @@ def _as_bool(value: object, *, default: bool) -> bool:
 
 
 def voice_label(voice: str) -> str:
-    """``"HEART · AMERICAN · FEMALE"``."""
+    """``"HEART · AMERICAN · FEMALE"``, or ``"GEORGE · PREMIUM · BRITISH"``."""
     prefix, _, name = voice.partition("_")
-    group = dict(VOICE_GROUPS).get(prefix)
+    group = dict(PREMIUM_GROUPS if ming.is_ming_voice(voice) else VOICE_GROUPS).get(prefix)
     return f"{name.upper()} · {group}" if group else name.upper()
 
 
@@ -303,6 +324,7 @@ class Backend(QObject):
     tryPlayingChanged = Signal()
 
     downloadNoteChanged = Signal()
+    premiumNoteChanged = Signal()
     stageChanged = Signal()
     downloadLabelChanged = Signal()
     chunksDoneChanged = Signal()
@@ -369,9 +391,12 @@ class Backend(QObject):
         self._preview_cache: Path | None = None
         self._shut_down = False
         fixed_assets = None if assets is None else tuple(assets)
-        # The files a run needs depend on whether it uses the graphics card.
-        self._assets_for: Callable[[bool], Sequence[Asset]] = (
-            required_assets if fixed_assets is None else (lambda use_gpu: fixed_assets)
+        # The files a run needs depend on the voice (Kokoro or Ming) and whether it uses the
+        # graphics card.
+        self._assets_for: Callable[[str, bool], Sequence[Asset]] = (
+            voices.required_assets
+            if fixed_assets is None
+            else (lambda voice, use_gpu: fixed_assets)
         )
 
         # App
@@ -401,16 +426,25 @@ class Backend(QObject):
         self._chapters = ChapterModel(self)
         self._chapters.selectionChanged.connect(self._on_selection_changed)
         # Voice
-        self._voiceGroups = voice_groups()
+        self._voiceGroups = voice_groups(premium=self._premium_listed)
         saved_voice = str(self._settings.value("voice", DEFAULT_VOICE))
+        # A saved premium voice counts only while it's listed (the preview opted into, and
+        # the card in use); otherwise it's the default voice.
         self._voice = saved_voice if saved_voice in self._voice_ids() else DEFAULT_VOICE
         self._speed = self._valid_speed(self._settings.value("speed", 1.0))
+        if ming.is_ming_voice(self._voice):  # a speed saved with Kokoro can be above 2x
+            self._speed = ming.capped_speed(self._speed)
+        # Which voice family the conversion in progress is measuring ("kokoro" or "ming"):
+        # each has its own speeds (see _speed_key). Kokoro, once it takes over from Ming.
+        self._voicing_family = "kokoro"
         saved_format = str(self._settings.value("outputFormat", "m4b"))
         self._outputFormat = saved_format if saved_format in OUTPUT_FORMATS else "m4b"
         self._convert_format = self._outputFormat  # the format of the run in progress
         self._previewText = ""
         self._previewPlaying = False
         self._downloadNote = ""
+        self._premiumNote = ""
+        self._refresh_premium_note()
         # Names
         self._names: list[dict[str, Any]] = []
         self._nameFixes: dict[str, str] = {}
@@ -517,8 +551,13 @@ class Backend(QObject):
     footnotesAtEnd: bool = _field(bool, "footnotesAtEnd", footnotesAtEndChanged)
 
     def _get_selection_summary(self) -> dict[str, str]:
-        speedup = self._speeds.get(self._speed_key(self._device_label()), DEFAULT_SPEEDUP)
-        return self._chapters.summary(speedup, self._speed)
+        family = voices.engine_of(self._voice)
+        speedup = self._speeds.get(self._speed_key(self._device_label(), family))
+        if speedup is None:
+            speedup = DEFAULT_SPEEDUP if family == "kokoro" else DEFAULT_PREMIUM_SPEEDUP
+        # The premium voice always speaks at 1.0 (all of its speed is the stretch).
+        voice_speed = 1.0 if family == "ming" else None
+        return self._chapters.summary(speedup, self._speed, voice_speed=voice_speed)
 
     selectionSummary = _property(dict, _get_selection_summary, selectionSummaryChanged)
 
@@ -540,6 +579,7 @@ class Backend(QObject):
     previewText: str = _field(str, "previewText", previewTextChanged)
     previewPlaying: bool = _field(bool, "previewPlaying", previewPlayingChanged)
     downloadNote: str = _field(str, "downloadNote", downloadNoteChanged)
+    premiumNote: str = _field(str, "premiumNote", premiumNoteChanged)
 
     def _get_preview_available(self) -> bool:
         return self._player is not None
@@ -600,6 +640,13 @@ class Backend(QObject):
         self._update("useGpu", on)
         self._settings.setValue("useGpu", on)
         self._settings.sync()
+        # The premium voices run only on the card, so they're listed only while it's in use;
+        # turning it off while one is chosen goes back to the default voice.
+        if not self._premium_listed and ming.is_ming_voice(self._voice):
+            self._update("voice", DEFAULT_VOICE)
+            self.voiceLabelChanged.emit()
+            self._settings.setValue("voice", DEFAULT_VOICE)
+        self._update("voiceGroups", voice_groups(premium=self._premium_listed))
         self.selectionSummaryChanged.emit()  # each device has its own speed
         self._refresh_hardware_label()
         self._refresh_download_note()
@@ -707,10 +754,14 @@ class Backend(QObject):
         self.voiceLabelChanged.emit()
         self._settings.setValue("voice", voice)
         self._settings.sync()
+        self.setSpeed(self._speed)  # the premium voice goes up to 2x
+        self._refresh_download_note()  # each voice has its own files
 
     @Slot(float)
     def setSpeed(self, value: float) -> None:
         speed = self._valid_speed(value)
+        if ming.is_ming_voice(self._voice):
+            speed = min(speed, ming.MAX_SPEED)
         if speed == self._speed:
             return
         self._stop_preview()
@@ -811,6 +862,7 @@ class Backend(QObject):
         self._chapter_labels = [sections[r].label for r in rows]
         self._control = TimedControl()
         self._convert_job = next(self._jobs)
+        self._voicing_family = voices.engine_of(self._voice)
         self._reset_progress()
         self._update("chapterLabel", self._chapter_labels[0])
         self._update("errorMessage", "")
@@ -1054,6 +1106,9 @@ class Backend(QObject):
             return
         self._cpu_threads = threads
         self._update("gpuName", "")
+        # A notice in a premium-voice book means Kokoro took over (the window's default when
+        # the card fails): what's measured from here is Kokoro's speed.
+        self._voicing_family = "kokoro"
         self._refresh_hardware_label()
         self.selectionSummaryChanged.emit()
         if message:
@@ -1116,17 +1171,42 @@ class Backend(QObject):
             self._refresh_download_note()
         self._update("screen", screen)
 
+    def _refresh_premium_note(self) -> None:
+        """The muted line under the premium voices (``""`` while they aren't listed): what
+        choosing one downloads, if anything, that they need the graphics card, and that
+        they're a preview while no spoken-text check is plugged in."""
+        if not self._premium_listed:
+            self._update("premiumNote", "")
+            return
+        parts = ["PREMIUM VOICES"]
+        missing = [
+            asset
+            for asset in self._assets_for(ming.DEFAULT_VOICE, True)
+            if self._needs_download(asset)
+        ]
+        if missing:
+            size = sum(asset.size for asset in missing) / 1e9
+            parts.append(f"{size:.1f} GB DOWNLOAD")
+        parts.append("NEED A GRAPHICS CARD")
+        if ming.preview_note():
+            parts.append("PREVIEW")
+        self._update("premiumNote", " · ".join(parts))
+
     def _refresh_download_note(self) -> None:
         """Say what Start will download: nothing when every required file is installed."""
-        missing = [a for a in self._assets_for(self._using_gpu) if self._needs_download(a)]
+        assets = self._assets_for(self._voice, self._using_gpu)
+        missing = [a for a in assets if self._needs_download(a)]
         if not missing:
             self._update("downloadNote", "")
+            self._refresh_premium_note()
             return
         mb = math.ceil(sum(asset.size for asset in missing) / 1_000_000)
         updates = all(a.archive and build_in_use(a, self._data_root) is not None for a in missing)
-        self._update(
-            "downloadNote", (UPDATE_NOTE if updates else DOWNLOAD_NOTE).format(mb=f"{mb:,}")
-        )
+        note = UPDATE_NOTE if updates else DOWNLOAD_NOTE
+        if any(asset.opt_in for asset in missing):
+            note = PREMIUM_DOWNLOAD_NOTE
+        self._update("downloadNote", note.format(mb=f"{mb:,}"))
+        self._refresh_premium_note()
 
     def _needs_download(self, asset: Asset) -> bool:
         """``needs_download`` without hashing anything: this runs on the GUI thread, and a
@@ -1212,16 +1292,26 @@ class Backend(QObject):
         """True when the graphics card is both there and switched on."""
         return self._gpuAvailable and self._useGpu
 
+    @property
+    def _premium_listed(self) -> bool:
+        """The premium voices are listed: the graphics card is in use, and they're offered
+        (until a spoken-text check is plugged in, only with TOMECAST_PREMIUM_PREVIEW=1)."""
+        return self._using_gpu and ming.preview_enabled()
+
     def _device_label(self) -> str:
         """What is voicing, short: ``"NVIDIA RTX PRO 1000"`` or ``"CPU"``."""
         if self._using_gpu and self._gpuName:
             return short_name(self._gpuName)
         return "CPU"
 
-    def _speed_key(self, device: str) -> str:
+    def _speed_key(self, device: str, family: str = "kokoro") -> str:
         """Where a device's speed is kept: the card's short name, or ``"CPU/<threads>"``, since
-        the CPU's speed depends on how many threads it voices with (fewer on battery)."""
-        return f"CPU/{self._cpu_threads}" if device == "CPU" else device
+        the CPU's speed depends on how many threads it voices with (fewer on battery). The
+        premium voice's speeds are kept apart, with ``/ming`` added (as in speeds.json): it's
+        several times slower than Kokoro on the same card. The hardware label and the "Use
+        graphics card" note show Kokoro's, the hardware's own speed test."""
+        key = f"CPU/{self._cpu_threads}" if device == "CPU" else device
+        return f"{key}/ming" if family == "ming" else key
 
     def _rescan_machine(self) -> bool:
         """Read the thread count the voice would use now and whether the computer runs on
@@ -1260,8 +1350,9 @@ class Backend(QObject):
         return note.format(ratio=f"{ratio:.1f}")
 
     def _measured(self, speedup: float) -> None:
-        """A conversion measured the speed on what it ran on (the CPU if the card fell back)."""
-        self._speeds[self._speed_key(self._device_label())] = speedup
+        """A conversion measured the speed on what it ran on (the CPU if the card fell back),
+        with the voice it was voicing (Kokoro once it took over from the premium voice)."""
+        self._speeds[self._speed_key(self._device_label(), self._voicing_family)] = speedup
         self._refresh_hardware_label()
         self.selectionSummaryChanged.emit()
 

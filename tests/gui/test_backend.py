@@ -25,6 +25,7 @@ from pytestqt.qtbot import QtBot
 
 from tomecast import convert as convert_module
 from tomecast import machine, packaging, pronunciations
+from tomecast import voices as voices_module
 from tomecast.audio import wav_info
 from tomecast.book import Book, Chapter
 from tomecast.cleanup import is_numbered_chapter
@@ -38,9 +39,11 @@ from tomecast.downloads import (
     mark_verified,
     waiting_check,
 )
+from tomecast.engines import ming
 from tomecast.engines.audiocpp import (
     AUDIOCPP_CPU,
     AUDIOCPP_VULKAN,
+    DEFAULT_VOICE,
     ESPEAK_NG,
     KOKORO_Q8,
     OUT_OF_MEMORY_NOTE,
@@ -54,12 +57,15 @@ from tomecast.gui.backend import STOPPED_MESSAGE, Backend, safe_file_name, uniqu
 from tomecast.gui.models import DEFAULT_SPEEDUP, ChapterModel, display_title, summarize
 from tomecast.gui.worker import BookRead, SelfCheckFor, TimedControl, preview_file
 from tomecast.hardware import GpuDevice, short_name
+from tomecast.manifest import MING_Q8
 from tomecast.names import Name
+from tomecast.readers import read_book
 from tomecast.speed import Speeds
 from tomecast.textprep import TextPrep
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # for epub_factory, pdf_factory
 from epub_factory import NavPoint, Page, build_epub, tiny_png
+from fake_engine import write_fake_server
 from format_factory import book_in_format
 from machine_factory import ON_BATTERY, PLUGGED_IN, pin_machine
 from pdf_factory import SAMPLE_CHAPTERS, build_sample_book, plain
@@ -3026,3 +3032,311 @@ def test_the_cpus_speed_after_the_switch_is_kept_under_the_engines_threads(
 
     assert "CPU/8" in backend._speeds  # what the engine voiced with
     assert "CPU/4" not in backend._speeds
+
+
+# --- The premium voice (Ming, issue #11) --------------------------------------------------
+
+
+@pytest.fixture
+def premium_preview(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The premium voices are a preview for now: these tests opt in."""
+    monkeypatch.setenv("TOMECAST_PREMIUM_PREVIEW", "1")
+
+
+def _premium_labels(backend: Backend) -> list[str]:
+    return [group["label"] for group in backend.voiceGroups if "PREMIUM" in group["label"]]
+
+
+@pytest.mark.usefixtures("premium_preview")
+def test_the_premium_voices_are_listed_only_while_the_card_is_in_use(
+    make_backend: MakeBackend,
+) -> None:
+    assert _premium_labels(make_backend(gpu=False)) == []
+    backend = make_backend(gpu=True)
+    assert _premium_labels(backend) == ["PREMIUM · BRITISH", "PREMIUM · AMERICAN"]
+    names = [v["id"] for g in backend.voiceGroups if "PREMIUM" in g["label"] for v in g["voices"]]
+    assert sorted(names) == sorted(ming.VOICES)
+    backend.setUseGpu(False)
+    assert _premium_labels(backend) == []
+
+
+@pytest.mark.usefixtures("premium_preview")
+def test_choosing_a_premium_voice(make_backend: MakeBackend) -> None:
+    backend = make_backend(gpu=True)
+    backend.setSpeed(3.0)
+    backend.setVoice("UK_George")
+    assert backend.voice == "UK_George"
+    assert backend.voiceLabel == "GEORGE · PREMIUM · BRITISH"
+    assert backend.speed == ming.MAX_SPEED  # all of Ming's speed is the stretch, up to 2x
+    backend.setSpeed(2.5)
+    assert backend.speed == ming.MAX_SPEED
+    backend.setVoice("af_heart")
+    backend.setSpeed(2.5)
+    assert backend.speed == 2.5  # Kokoro still goes to 3x
+
+
+@pytest.mark.usefixtures("premium_preview")
+def test_turning_the_card_off_goes_back_to_a_kokoro_voice(make_backend: MakeBackend) -> None:
+    backend = make_backend(gpu=True)
+    backend.setVoice("US_Emma")
+    backend.setUseGpu(False)
+    assert backend.voice == DEFAULT_VOICE
+    backend.setVoice("US_Emma")  # not listed without the card
+    assert backend.voice == DEFAULT_VOICE
+
+
+@pytest.mark.usefixtures("premium_preview")
+def test_the_download_note_says_when_start_downloads_the_premium_voice(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    backend = make_backend(gpu=True, assets=None)
+    _open(qtbot, backend, _short_book(tmp_path))
+    backend.goTo("voice")
+    assert backend.downloadNote == _note_for(GPU_DOWNLOADS)
+    # The engine build and Ming, and Kokoro's files for when the card fails (nothing is
+    # installed here, so they're missing too).
+    backend.setVoice("UK_George")
+    mb = math.ceil(sum(a.size for a in (*GPU_DOWNLOADS, MING_Q8)) / 1_000_000)
+    assert backend.downloadNote == (
+        f"STARTING DOWNLOADS THE PREMIUM VOICE ONCE · {mb:,} MB · NEEDS A GRAPHICS CARD"
+    )
+
+
+@pytest.mark.usefixtures("premium_preview")
+def test_a_premium_voice_converts_with_ming_and_says_it_is_a_preview(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    engines = Engines()
+    backend = make_backend(engines, gpu=True)
+    _open(qtbot, backend, _short_book(tmp_path))
+    backend.setVoice("UK_Charlotte")
+    _convert(qtbot, backend)
+    assert backend.screen == "done"
+    assert [engine.voice for engine in engines.made] == ["UK_Charlotte"]
+    assert ming.UNCHECKED_NOTE in backend.warnings
+
+
+@pytest.mark.usefixtures("premium_preview")
+def test_the_premium_note_says_what_they_need_while_they_are_listed(
+    make_backend: MakeBackend,
+) -> None:
+    assert make_backend(gpu=False).premiumNote == ""
+    backend = make_backend(gpu=True)  # nothing to download (the test's files are "installed")
+    assert backend.premiumNote == "PREMIUM VOICES · NEED A GRAPHICS CARD · PREVIEW"
+    backend.setUseGpu(False)
+    assert backend.premiumNote == ""
+
+
+@pytest.mark.usefixtures("premium_preview")
+def test_the_premium_note_gives_the_download_size(make_backend: MakeBackend) -> None:
+    backend = make_backend(gpu=True, assets=None)  # nothing installed yet
+    # The engine, Ming, and Kokoro's files for when the card fails: about 2 GB in all here.
+    size = sum(a.size for a in (AUDIOCPP_VULKAN, MING_Q8, ESPEAK_NG, KOKORO_Q8)) / 1e9
+    assert backend.premiumNote == (
+        f"PREMIUM VOICES · {size:.1f} GB DOWNLOAD · NEED A GRAPHICS CARD · PREVIEW"
+    )
+
+
+_ONE_CARD = json.dumps(
+    {"devices": [{"backend": "vulkan", "index": 0, "name": "Vulkan0", "type": "gpu",
+                  "description": "NVIDIA RTX PRO 1000 Blackwell Generation Laptop GPU",
+                  "memory": {"free_bytes": 7_000_000_000, "total_bytes": 8_000_000_000}}]}
+)  # fmt: skip
+
+
+@pytest.mark.usefixtures("premium_preview")
+def test_when_the_card_fails_kokoro_finishes_the_book_and_the_window_says_so(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real AutoMing, on the fake engine: Ming runs out of graphics memory on the first
+    piece of chapter 2, and Kokoro's George finishes the book on the card."""
+    monkeypatch.setenv("FAKE_LOG", str(tmp_path / "fake.log"))
+    monkeypatch.setenv("FAKE_DEVICES", _ONE_CARD)
+    monkeypatch.setenv("FAKE_ONLY_MODEL", "ming")
+    server = write_fake_server(tmp_path / "audiocpp_server")
+    made: list[ming.AutoMing] = []
+
+    def engines(root: Path, voice: str, speed: float, use_gpu: bool) -> ming.AutoMing:
+        engine = ming.AutoMing(
+            root, voice=voice, speed=speed, use_gpu=use_gpu, executable=server, startup_timeout=20
+        )
+        made.append(engine)
+        return engine
+
+    book = _short_book(tmp_path)
+    pieces = [c for chunks in plan_chunks(read_book(book), ming.MAX_CHARS) for c in chunks]
+    first_of_two = next(i for i, c in enumerate(pieces) if c.chapter != pieces[0].chapter)
+    monkeypatch.setenv("FAKE_OOM_VULKAN_AFTER", str(first_of_two))
+    backend = make_backend(engines, gpu=True)
+    _open(qtbot, backend, book)
+    backend.setVoice("UK_George")
+    _convert(qtbot, backend)
+
+    assert backend.screen == "done"
+    note = (
+        "The graphics card stopped working, so the rest of this book uses Kokoro's George "
+        "(similar British voice). Chapter 1 is in the premium voice."
+    )
+    assert note in backend.warnings
+    assert backend.errorMessage == ""  # shown in the banner while it was made, then listed
+    (engine,) = made
+    assert engine.switched_to == "bm_george"
+    assert backend.gpuName  # Kokoro carried on on the card, and the window says the card
+    events = [json.loads(line) for line in (tmp_path / "fake.log").read_text().splitlines()]
+    voiced = [e for e in events if e["event"] == "voiced"]
+    models = [e["model"] for e in voiced]
+    assert models == ["ming"] * first_of_two + ["kokoro"] * (len(models) - first_of_two)
+    # Each piece voiced once (the window voices the text as prepared, so count rather than
+    # compare it), and the piece the card refused was voiced again by Kokoro.
+    texts = [e["body"]["input"] for e in voiced]
+    assert len(texts) == len(set(texts)) == sum(1 for c in pieces if c.speakable)
+    (refused,) = [e for e in events if e["event"] == "out of memory"]
+    assert refused["body"]["input"] == texts[first_of_two]
+
+
+# --- The premium voice: the preview opt-in, speeds, checks and rollbacks (review of #62) -------
+
+
+def test_without_the_opt_in_no_premium_voice_is_listed(make_backend: MakeBackend) -> None:
+    backend = make_backend(gpu=True)  # a card, but TOMECAST_PREMIUM_PREVIEW isn't set
+    assert _premium_labels(backend) == []
+    assert backend.premiumNote == ""
+    backend.setVoice("UK_George")
+    assert backend.voice == DEFAULT_VOICE
+
+
+def _saved(tmp_path: Path, **values: object) -> None:
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    for key, value in values.items():
+        settings.setValue(key, value)
+    settings.sync()
+
+
+@pytest.mark.usefixtures("premium_preview")
+def test_a_saved_premium_voice_without_a_card_is_the_default_voice(
+    make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    _saved(tmp_path, voice="UK_George")
+    assert make_backend(gpu=False).voice == DEFAULT_VOICE
+
+
+def test_a_saved_premium_voice_without_the_opt_in_is_the_default_voice(
+    make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    _saved(tmp_path, voice="UK_George")
+    assert make_backend(gpu=True).voice == DEFAULT_VOICE
+
+
+@pytest.mark.usefixtures("premium_preview")
+def test_a_saved_speed_above_2x_is_capped_for_a_saved_premium_voice(
+    make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    _saved(tmp_path, voice="UK_George", speed=2.5)
+    backend = make_backend(gpu=True)
+    assert (backend.voice, backend.speed) == ("UK_George", ming.MAX_SPEED)
+
+
+@pytest.mark.usefixtures("premium_preview")
+def test_the_premium_voices_speed_is_kept_apart_from_kokoros(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Measured on the same card, the premium voice's speed never replaces Kokoro's (it's
+    several times slower), and its estimate never uses Kokoro's."""
+    card = "NVIDIA RTX PRO 1000 Blackwell Generation Laptop GPU"
+    backend = make_backend(
+        gpu=True, scan=card, speeds=Speeds(cpu=4.6, gpu=19.0, gpu_description=card)
+    )
+    _open(qtbot, backend, _short_book(tmp_path))
+    qtbot.waitUntil(lambda: "NVIDIA RTX PRO 1000" in backend._speeds)
+    used: list[tuple[float, float | None]] = []
+    summary = backend._chapters.summary
+
+    def recording(speedup: float, speed: float = 1.0, *, voice_speed: float | None = None) -> Any:
+        used.append((speedup, voice_speed))
+        return summary(speedup, speed, voice_speed=voice_speed)
+
+    monkeypatch.setattr(backend._chapters, "summary", recording)
+    assert backend.selectionSummary
+    backend.setVoice("UK_George")
+    assert backend.selectionSummary
+    # Kokoro's card speed for Kokoro; the premium voice's own (its default until measured),
+    # at its own voice speed of 1.0, for the premium voice.
+    assert used[0] == (19.0, None)
+    assert used[-1] == (backend_module.DEFAULT_PREMIUM_SPEEDUP, 1.0)
+    _convert(qtbot, backend)
+    assert backend.screen == "done"
+    assert backend._speeds["NVIDIA RTX PRO 1000"] == 19.0  # Kokoro's, untouched
+    assert "NVIDIA RTX PRO 1000/ming" in backend._speeds
+
+
+@pytest.mark.usefixtures("premium_preview")
+def test_the_window_checks_a_new_engine_build_with_the_jobs_own_voice(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tomecast.gui import worker as worker_module
+
+    asked: list[str] = []
+
+    def recording(root: Path, voice: str, use_gpu: bool, cancelled: object) -> list[object]:
+        asked.append(voice)
+        return []
+
+    monkeypatch.setattr(worker_module, "voice_checks", recording)
+    backend = make_backend(gpu=True)  # the real checks: no engine_check given
+    _open(qtbot, backend, _short_book(tmp_path))
+    backend.setVoice("UK_George")
+    _convert(qtbot, backend)
+    assert asked == ["UK_George"]
+
+
+class _FakePremium(FakeEngine):
+    """A fake engine the worker takes for the premium voice (see the test below)."""
+
+
+@pytest.mark.usefixtures("premium_preview")
+def test_a_premium_voice_failure_never_rolls_the_engine_build_back(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same failure that rolls a just-switched build back under Kokoro
+    (test_an_update_that_fails_on_the_book_is_rolled_back) doesn't under the premium voice:
+    what fails there is the voice's, not the shared build's."""
+    monkeypatch.setattr(ming, "MingServer", _FakePremium)
+    asset, _legacy = _engine_update(tmp_path)
+    engines = Engines()
+    engines.start_error = "the voice engine keeps crashing. Its log:\nSegmentation fault"
+
+    def factory(root: Path, voice: str, speed: float, use_gpu: bool = False) -> FakeEngine:
+        engine = _FakePremium(engines, voice, speed, use_gpu)
+        engines.made.append(engine)
+        return engine
+
+    backend = make_backend(
+        factory, gpu=True, assets=(asset,), engine_check=lambda r, g, c: lambda n, o: None
+    )
+    _open(qtbot, backend, _short_book(tmp_path))
+    backend.setVoice("UK_George")
+    _convert(qtbot, backend)
+
+    assert backend.screen == "voice"
+    assert "didn't work on this computer" not in backend.errorMessage
+    new_build = tmp_path / "data" / asset.path / asset.sha256[:12]
+    assert build_in_use(asset, tmp_path / "data") == new_build  # kept, not rolled back
+
+
+@pytest.mark.usefixtures("premium_preview")
+def test_a_routed_book_above_2x_is_made_at_2x_and_says_so(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Kokoro book at 2.5x that goes to the premium voice: never refused, made at 2x."""
+    monkeypatch.setattr(ming, "CHECKED_LANGUAGES", frozenset({"en", "de"}))
+    monkeypatch.setattr(voices_module, "premium_can_take", lambda root, use_gpu: True)
+    engines = Engines()
+    backend = make_backend(engines, gpu=True)
+    pages = [Page("c1.xhtml", "<p>Es war einmal. Es war spät. Alle schliefen.</p>")]
+    book = build_epub(tmp_path / "de.epub", pages, title="Buch", language="de")
+    _open(qtbot, backend, book)
+    backend.setSpeed(2.5)
+    _convert(qtbot, backend)
+    assert backend.screen == "done"
+    assert [(e.voice, e.speed) for e in engines.made] == [("UK_George", 2.0)]
+    assert ming.CAPPED_NOTE in backend.warnings

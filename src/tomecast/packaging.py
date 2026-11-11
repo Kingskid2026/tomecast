@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import hashlib
 import math
 import os
 import re
@@ -72,8 +73,10 @@ class OutputExistsError(PackagingError):
 class ChapterAudio:
     """One chapter's audio: WAV segments in reading order, each followed by some silence.
 
-    Every segment must be a mono, 16-bit PCM WAV file, and all segments in a book must share
-    one sample rate. ``gaps_after[i]`` is the silence, in seconds, inserted after
+    Every segment must be a mono, 16-bit PCM WAV file. A book's segments normally share one
+    sample rate; when they don't (the premium voice at 44.1 kHz gave way to Kokoro at 24 kHz
+    partway, because the graphics card failed), the others are resampled to the highest one
+    first (:func:`resample_wav`). ``gaps_after[i]`` is the silence, in seconds, inserted after
     ``segments[i]``.
     """
 
@@ -174,6 +177,7 @@ def write_m4b(
     """
     if not 0.5 <= tempo <= 2.0:  # the range atempo handles in one step
         raise PackagingError(f"tempo must be between 0.5 and 2.0, not {tempo!r}")
+    chapters = _one_rate(chapters, workdir, ffmpeg)
     sample_rate, planned = _plan(chapters)
     cover_suffix = _cover_suffix(info.cover)
     if not output.parent.is_dir():
@@ -260,6 +264,7 @@ def write_mp3s(
     """
     if not 0.5 <= tempo <= 2.0:
         raise PackagingError(f"tempo must be between 0.5 and 2.0, not {tempo!r}")
+    chapters = _one_rate(chapters, workdir, ffmpeg)
     sample_rate, planned = _plan(chapters)
     cover_suffix = _cover_suffix(info.cover)
     if not folder.parent.is_dir():
@@ -474,6 +479,48 @@ def _publish_without_overwriting(partial: Path, target: Path, *, rename: bool) -
         return candidate
 
 
+def _one_rate(
+    chapters: Sequence[ChapterAudio], workdir: Path, ffmpeg: str | None
+) -> Sequence[ChapterAudio]:
+    """``chapters`` with every segment at one sample rate, the highest any segment has.
+
+    A book is voiced at one rate, except when the premium voice (44.1 kHz) gave way to Kokoro
+    (24 kHz) partway because the graphics card failed. Then each segment at another rate is
+    resampled with ffmpeg into ``workdir/resampled-<rate>/``, once: the copy is named after
+    the segment's path, size and modification time, so packaging again (a retry, or MP3s
+    after an M4B) reuses it, and a segment voiced again gets a new one. Upsampling Kokoro's
+    24 kHz loses nothing it has. Anything unreadable is left for :func:`_plan` to report.
+    """
+    rates: dict[Path, int] = {}
+    for chapter in chapters:
+        for path in chapter.segments:
+            try:
+                rates[path] = _read_wav_header(path)[0]
+            except PackagingError:
+                return chapters
+    if len(set(rates.values())) <= 1:
+        return chapters
+    target = max(rates.values())
+    folder = workdir / f"resampled-{target}"
+    folder.mkdir(parents=True, exist_ok=True)
+    executable = ffmpeg or _bundled_ffmpeg()
+
+    def at_target(path: Path) -> Path:
+        if rates[path] == target:
+            return path
+        stat = path.stat()
+        source = f"{path.resolve()}|{stat.st_size}|{stat.st_mtime_ns}"
+        copy = folder / f"{hashlib.sha256(source.encode()).hexdigest()[:16]}.wav"
+        if not copy.is_file():
+            resample_wav(path, copy, target, executable)
+        return copy
+
+    return [
+        ChapterAudio(chapter.title, tuple(map(at_target, chapter.segments)), chapter.gaps_after)
+        for chapter in chapters
+    ]
+
+
 def _plan(chapters: Sequence[ChapterAudio]) -> tuple[int, list[_PlannedChapter]]:
     """Validate every chapter and segment, and place the chapters on the timeline.
 
@@ -685,6 +732,27 @@ def stretch_wav(source: Path, output: Path, tempo: float, ffmpeg: str | None = N
     if result.returncode != 0:
         detail = result.stderr.decode(errors="replace").strip()[-500:]
         raise PackagingError(f"ffmpeg couldn't speed up the preview: {detail}")
+
+
+def resample_wav(source: Path, output: Path, rate: int, ffmpeg: str | None = None) -> None:
+    """Write ``source`` to ``output`` as a mono 16-bit WAV at ``rate`` Hz (ffmpeg's resampler).
+    ``output`` only appears once it's complete."""
+    partial = output.with_name(f".{output.name}.partial")
+    command = [
+        ffmpeg or _bundled_ffmpeg(), "-hide_banner", "-nostats", "-loglevel", "error", "-y",
+        "-i", _ffmpeg_path(source), "-map_metadata", "-1", "-ac", "1", "-ar", str(rate),
+        "-c:a", "pcm_s16le", "-f", "wav", _ffmpeg_path(partial),
+    ]  # fmt: skip
+    try:
+        result = subprocess.run(command, capture_output=True, check=False, timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        partial.unlink(missing_ok=True)
+        raise PackagingError(f"couldn't run ffmpeg: {error}") from error
+    if result.returncode != 0:
+        partial.unlink(missing_ok=True)
+        detail = result.stderr.decode(errors="replace").strip()[-500:]
+        raise PackagingError(f"ffmpeg couldn't resample {source.name}: {detail}")
+    partial.replace(output)
 
 
 def cover_is_usable(cover: Cover, ffmpeg: str | None = None) -> bool:

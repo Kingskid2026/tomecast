@@ -101,11 +101,15 @@ def audio_minutes(words: int, speed: float = 1.0) -> float:
     return words / WORDS_PER_MINUTE / speed
 
 
-def make_minutes(words: int, speed: float, speedup: float) -> float:
+def make_minutes(
+    words: int, speed: float, speedup: float, *, voice_speed: float | None = None
+) -> float:
     """How long voicing ``words`` takes at ``speedup`` times real time. ``speedup`` is measured on
-    the voice's own audio, so what counts is the voice's speed, which stops at 1.5x (the
-    time-stretch on top is quick)."""
-    voiced = words / WORDS_PER_MINUTE / split_speed(speed)[0]
+    the voice's own audio, so what counts is the voice's own speed: ``voice_speed`` if given
+    (the premium voice's is always 1.0), else Kokoro's, which stops at 1.5x (the time-stretch
+    on top is quick)."""
+    own = split_speed(speed)[0] if voice_speed is None else voice_speed
+    voiced = words / WORDS_PER_MINUTE / own
     return voiced / speedup if speedup > 0 else 0.0
 
 
@@ -121,7 +125,8 @@ def measure(engine: Tunable) -> float:
         EngineError: if the engine fails, or made no audio.
     """
     voice, speed = engine.voice, engine.speed
-    engine.voice, engine.speed = DEFAULT_VOICE, 1.0
+    # Another voice's engine (Ming) measures with its own default voice.
+    engine.voice, engine.speed = getattr(engine, "default_voice", DEFAULT_VOICE), 1.0
     try:
         with tempfile.TemporaryDirectory(prefix="tomecast-speed-") as folder:
             engine.synthesize(WARM_UP, Path(folder) / "warm-up.wav")
@@ -228,6 +233,13 @@ def engine_speed(
     return None
 
 
+def known_card_speed(root: Path, engine: KokoroServer) -> float | None:
+    """The speed measured before for ``engine`` as it runs now on the graphics card (its
+    build, card and voice model), if it has been. For the new estimate once Kokoro has taken
+    over from the premium voice on the card."""
+    return known_speed(root, _key_of(engine))
+
+
 def known_cpu_speed(root: Path, engine: KokoroServer) -> float | None:
     """The speed measured before on the CPU for ``engine``'s build, or else for the CPU build
     (the same code: a CPU run hides the card from the graphics-card build), with the engine's
@@ -236,18 +248,27 @@ def known_cpu_speed(root: Path, engine: KokoroServer) -> float | None:
     for build in (engine.executable.parent, build_in_use(AUDIOCPP_CPU, root)):
         if build is not None:
             key = speed_key(build, backend="cpu", gpu_description="", threads=engine.threads)
+            key += _model_suffix(engine)
             if (known := known_speed(root, key)) is not None:
                 return known
     return None
 
 
 def _key_of(engine: KokoroServer) -> str:
-    return speed_key(
+    key = speed_key(
         engine.executable.parent,
         backend="vulkan" if engine.backend == "vulkan" else "cpu",
         gpu_description=getattr(engine, "gpu_description", ""),
         threads=engine.threads,
     )
+    return key + _model_suffix(engine)
+
+
+def _model_suffix(engine: KokoroServer) -> str:
+    """``""`` for Kokoro (so its keys are as before), ``"/ming"`` for another voice, which has
+    speeds of its own on the same build and device."""
+    model = getattr(engine, "MODEL_ID", KokoroServer.MODEL_ID)
+    return "" if model == KokoroServer.MODEL_ID else f"/{model}"
 
 
 def probe(

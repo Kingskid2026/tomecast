@@ -19,12 +19,13 @@ import threading
 import time
 import wave
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, Protocol
 
 from PySide6.QtCore import QObject, QThread, Signal, Slot
 
+from tomecast import voices
 from tomecast.audio import concatenate_wavs, wav_info
 from tomecast.book import Book
 from tomecast.chunking import Chunk, CoverageError, chunk_paragraphs
@@ -56,12 +57,12 @@ from tomecast.downloads import (
     run_builds,
     waiting_check,
 )
+from tomecast.engines import ming
 from tomecast.engines.audiocpp import (
     AUDIOCPP_VULKAN,
+    DEFAULT_VOICE,
     EXECUTABLE,
-    AutoKokoro,
     EngineError,
-    kokoro_check,
 )
 from tomecast.gui.fixes import FixLists, ListFile
 from tomecast.hardware import GpuDevice, list_devices, pick_device
@@ -118,10 +119,16 @@ class Engine(VoiceEngine, Protocol):
     def close(self) -> None: ...
 
 
+# Previews never download, and the premium voice is only voiced on the graphics card.
+PREMIUM_PREVIEW_NOTE = (
+    "The premium voice downloads once, when you start converting a book with it on the "
+    "graphics card. Previews work after that."
+)
+
 # (data folder, voice, speed, use the graphics card if possible)
 EngineFactory = Callable[[Path, str, float, bool], Engine]
-# (use the graphics card) -> the files that choice needs installed
-AssetsFor = Callable[[bool], Sequence[Asset]]
+# (voice, use the graphics card) -> the files that choice needs installed
+AssetsFor = Callable[[str, bool], Sequence[Asset]]
 # (data folder, has the user stopped?) -> the graphics cards the installed Vulkan build sees:
 # [] for none, None if there's no such build or it didn't answer
 DeviceScanner = Callable[[Path, IsCancelled], list[GpuDevice] | None]
@@ -134,9 +141,10 @@ SelfCheckFor = Callable[[Path, bool, IsCancelled], SelfCheck | Sequence[VoiceChe
 
 
 def kokoro_engine(root: Path, voice: str, speed: float, use_gpu: bool) -> Engine:
-    """The real engine: Kokoro through audio.cpp, with its files under ``root``. It uses the
-    graphics card when asked to and able, and falls back to the CPU."""
-    return AutoKokoro(root, voice=voice, speed=speed, use_gpu=use_gpu)
+    """The real engine: Kokoro through audio.cpp, with its files under ``root`` (or Ming, for
+    a premium voice, made where every engine is: :func:`tomecast.voices.make_engine`). It uses
+    the graphics card when asked to and able, and falls back to the CPU."""
+    return voices.make_engine(root, voice, speed=speed, use_gpu=use_gpu)
 
 
 def scan_devices(root: Path, cancelled: IsCancelled) -> list[GpuDevice] | None:
@@ -155,9 +163,11 @@ def probe_speeds(
     return probe(root, gpu=gpu, cancelled=cancelled, devices=devices, listed=gpu)
 
 
-def voice_checks(root: Path, use_gpu: bool, cancelled: IsCancelled) -> list[VoiceCheck]:
-    """The real self-checks: one per voice that runs on the engine builds (Kokoro today)."""
-    return [kokoro_check(root, use_gpu, cancelled)]
+def voice_checks(root: Path, voice: str, use_gpu: bool, cancelled: IsCancelled) -> list[VoiceCheck]:
+    """The real self-checks for a run with ``voice``: its own voice's, plus every other
+    installed voice that runs on the same engine builds (:func:`tomecast.voices.voice_checks`).
+    So a premium-only install never runs Kokoro's check without Kokoro's model."""
+    return voices.voice_checks(root, voice, use_gpu, cancelled)
 
 
 class TimedControl(ConversionControl):
@@ -450,7 +460,7 @@ class ConversionWorker(QObject):
         system_check: Callable[[], None],
         device_scanner: DeviceScanner = scan_devices,
         speed_probe: SpeedProbe = probe_speeds,
-        engine_check: SelfCheckFor = voice_checks,
+        engine_check: SelfCheckFor | None = None,
     ) -> None:
         super().__init__()
         self._engine_factory = engine_factory
@@ -459,12 +469,15 @@ class ConversionWorker(QObject):
         self._system_check = system_check
         self._device_scanner = device_scanner
         self._speed_probe = speed_probe
-        self._self_check = engine_check
+        self._self_check = engine_check  # None: the real checks, for the job's own voice
         self._stopping = threading.Event()
-        self._assets_ready: dict[bool, bool] = {}  # per "use the graphics card": prepared
-        self._assets_usable: dict[bool, bool] = {}  # some build of each is there (previews)
+        # Per (voice engine, "use the graphics card"): prepared, and some build of each file
+        # is there (previews). Kokoro and Ming need different files.
+        self._assets_ready: dict[tuple[str, bool], bool] = {}
+        self._assets_usable: dict[tuple[str, bool], bool] = {}
         self._preview_engine: Engine | None = None
         self._preview_gpu = False
+        self._preview_kind = ""  # which engine the preview engine is: "kokoro" or "ming"
 
     def stop(self) -> None:
         """Skip every job that hasn't started yet. Safe to call from any thread."""
@@ -543,8 +556,13 @@ class ConversionWorker(QObject):
             self._system_check()
             # Use the graphics card's engine for the preview only if it's installed already
             # (previews never download); otherwise the CPU engine will do.
-            use_gpu = job.use_gpu and self._have_usable(True)
-            if not use_gpu and not self._have_usable(False):
+            if ming.is_ming_voice(job.voice) and not (
+                job.use_gpu and self._have_usable(True, job.voice)
+            ):
+                self.failed.emit(job.job, PREMIUM_PREVIEW_NOTE)
+                return
+            use_gpu = job.use_gpu and self._have_usable(True, job.voice)
+            if not use_gpu and not self._have_usable(False, job.voice):
                 self.failed.emit(
                     job.job,
                     "The voice model downloads once, when you start converting a book. "
@@ -560,6 +578,7 @@ class ConversionWorker(QObject):
             PackagingError,
             OSError,
             wave.Error,
+            ming.CardStopped,
         ) as error:
             self._close_preview_engine()  # start afresh next time
             self.failed.emit(job.job, _as_sentence(f"The preview failed: {error}"))
@@ -567,13 +586,19 @@ class ConversionWorker(QObject):
         self.previewReady.emit(job.job, str(job.output))
 
     def _preview_engine_for(self, voice: str, speed: float, use_gpu: bool) -> Engine:
-        if self._preview_engine is not None and use_gpu != self._preview_gpu:
+        kind = voices.engine_of(voice)
+        if self._preview_engine is not None and (
+            use_gpu != self._preview_gpu or kind != self._preview_kind
+        ):
             self._close_preview_engine()  # the choice changed: start on the other hardware
         if self._preview_engine is None:
             engine = self._engine_factory(self._root, voice, speed, use_gpu)
+            if isinstance(engine, ming.AutoMing):
+                engine.if_card_fails = "stop"  # a premium preview never turns into Kokoro
             engine.start()
             self._preview_engine = engine
             self._preview_gpu = use_gpu
+            self._preview_kind = kind
             self.deviceChosen.emit(engine.gpu_description, use_gpu)
         self._preview_engine.voice = voice
         self._preview_engine.speed = speed
@@ -617,7 +642,34 @@ class ConversionWorker(QObject):
         try:
             self._close_preview_engine()  # one model in memory at a time
             self._system_check()
+            # A book in a language the chosen voice doesn't speak (or the premium voice isn't
+            # checked for) may go to the other engine; it goes to the premium voice only if
+            # that's opted into, installed and fits the card: routing never downloads it.
+            route = voices.route(
+                job.voice,
+                job.book.language,
+                premium_ok=lambda: voices.premium_can_take(self._root, job.use_gpu),
+            )
+            if route.voice != job.voice:
+                job = replace(job, voice=route.voice)
+            capped = None
+            if ming.is_ming_voice(job.voice):
+                if job.speed > ming.MAX_SPEED:  # a routed book, or a speed saved before
+                    capped = ming.CAPPED_NOTE
+                # The window knows only Kokoro's CPU speed, and the premium voice stops at 2x.
+                job = replace(job, cpu_speedup=None, speed=ming.capped_speed(job.speed))
             engine = self._engine_factory(self._root, job.voice, job.speed, job.use_gpu)
+            if isinstance(engine, ming.MingServer):
+                engine.language = route.language
+            route_notes = tuple(
+                note
+                for note in (
+                    route.note,
+                    capped,
+                    ming.preview_note() if ming.is_ming_voice(job.voice) else None,
+                )
+                if note
+            )
             fixes, notes = (
                 (job.fixes, [])
                 if job.fixes is not None
@@ -631,6 +683,7 @@ class ConversionWorker(QObject):
                 job.job, ConvertUpdate(0, len(chunks), first_chapter, "", "starting", None, None)
             )
             install_notes, builds = self._prepare(job)
+            install_notes = (*route_notes, *install_notes)
             if job.control.cancelled:
                 raise ConversionCancelled
             # The work folder and the engine use exactly the builds prepare() chose, so a
@@ -649,7 +702,7 @@ class ConversionWorker(QObject):
             return
         except (
             EngineError, MissingAudioError, PackagingError, CoverageError, DownloadError,
-            WorkFolderBusy, OSError, wave.Error,
+            WorkFolderBusy, OSError, wave.Error, ming.CardStopped,
         ) as error:  # fmt: skip
             message = _as_sentence(str(error))
             # A switched-to update that crashes (or makes no usable audio) on its first book.
@@ -659,7 +712,12 @@ class ConversionWorker(QObject):
             # graphics chip built into the processor, the card's memory is the computer's).
             failed_voicing = isinstance(error, EngineError | MissingAudioError)
             stopped = job.control.cancelled or self._stopping.is_set()
-            blameless = stopped or (engine is not None and engine.out_of_memory)
+            # Nor after a premium-voice run: what fails under the premium voice (words left
+            # out, an error its model answers with) is that voice's, not the shared build's,
+            # which Kokoro's own check judges; and when the card failed it fell back anyway.
+            blameless = stopped or (
+                engine is not None and (engine.out_of_memory or isinstance(engine, ming.MingServer))
+            )
             if failed_voicing and builds and not blameless and self._roll_back(job, builds, error):
                 message += f" {UPDATE_FAILED_NOTE} Start again to make the book with it."
             elif workdir is not None and any((workdir / "chunks").glob("*.wav")):
@@ -680,7 +738,8 @@ class ConversionWorker(QObject):
         except (Cancelled, OSError):
             return False
         if rolled:
-            self._assets_ready.pop(job.use_gpu, None)
+            for kind in ("kokoro", "ming"):  # every voice on that build prepares again
+                self._assets_ready.pop((kind, job.use_gpu), None)
             self._close_preview_engine()  # it may be running the build that failed
         return rolled
 
@@ -704,8 +763,17 @@ class ConversionWorker(QObject):
         def tell_out_of_memory() -> None:
             """The card ran out of memory, so the CPU is in use: say so in the banner now,
             not only on the done screen, with the thread count the engine really uses (the
-            window would otherwise read today's, which on battery may differ)."""
+            window would otherwise read today's, which on battery may differ). When Kokoro
+            took over from the premium voice and still runs on the card, the card is named
+            again after that."""
             self.noticed.emit(job.job, engine.warning or "", engine.threads)
+            if engine.gpu_description:
+                self.deviceChosen.emit(engine.gpu_description, job.use_gpu)
+
+        # Which chapter the book is in, so a takeover's note says which are premium.
+        position = ming.BookPosition(chunks)
+        if isinstance(engine, ming.AutoMing):
+            engine.where = position.where
 
         try:
             engine.start()
@@ -720,6 +788,7 @@ class ConversionWorker(QObject):
             )
 
             def report(progress: ConversionProgress) -> None:
+                position.update(progress.chunks_done)
                 self._report(job.job, meter, progress)
 
             result = convert_book(
@@ -759,14 +828,15 @@ class ConversionWorker(QObject):
             ),
         )
 
-    def _have_usable(self, use_gpu: bool) -> bool:
+    def _have_usable(self, use_gpu: bool, voice: str = DEFAULT_VOICE) -> bool:
         """Some build of every file the choice needs is installed (previews never download,
         and use an older engine build while an update waits)."""
-        if not self._assets_usable.get(use_gpu):
-            self._assets_usable[use_gpu] = all(
-                is_usable(asset, self._root) for asset in self._assets_for(use_gpu)
+        key = (voices.engine_of(voice), use_gpu)
+        if not self._assets_usable.get(key):
+            self._assets_usable[key] = all(
+                is_usable(asset, self._root) for asset in self._assets_for(voice, use_gpu)
             )
-        return self._assets_usable[use_gpu]
+        return self._assets_usable[key]
 
     def _prepare(self, job: ConvertJob) -> tuple[tuple[str, ...], dict[str, Path]]:
         """Download what's missing and switch to new engine builds once they pass their
@@ -775,8 +845,9 @@ class ConversionWorker(QObject):
         Returns the notes to show on the done screen (an update kept back), and the builds
         this run uses. Waiting for another Tomecast, downloading and checking all stop when
         the conversion is cancelled or the window closes."""
-        assets = self._assets_for(job.use_gpu)
-        if self._assets_ready.get(job.use_gpu):
+        assets = self._assets_for(job.voice, job.use_gpu)
+        key = (voices.engine_of(job.voice), job.use_gpu)
+        if self._assets_ready.get(key):
             return (), run_builds(assets, self._root)
         kind = "DOWNLOADING ONCE"
 
@@ -801,7 +872,11 @@ class ConversionWorker(QObject):
         prepared = prepare(
             assets,
             self._root,
-            check=self._self_check(self._root, job.use_gpu, cancelled),
+            check=(
+                voice_checks(self._root, job.voice, job.use_gpu, cancelled)
+                if self._self_check is None
+                else self._self_check(self._root, job.use_gpu, cancelled)
+            ),
             consent=consent,
             on_download=on_download,
             on_check=on_check,
@@ -809,11 +884,11 @@ class ConversionWorker(QObject):
         )
         # Done for this session only if nothing is left to try: a download that failed, or a
         # check with no verdict, is tried again by the next conversion.
-        self._assets_ready[job.use_gpu] = not any(
+        self._assets_ready[key] = not any(
             needs_download(asset, self._root) or waiting_check(asset, self._root)
             for asset in assets
         )
-        self._assets_usable[job.use_gpu] = True
+        self._assets_usable[key] = True
         return prepared.notes, dict(prepared.builds)
 
     def _download_reporter(self, job: ConvertJob, label: str) -> Callable[[int, int], None]:
