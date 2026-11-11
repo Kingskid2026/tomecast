@@ -58,12 +58,14 @@ jobs:
       - run: uv run pytest
 
   windows:
-    # Groundwork for the Windows version (#39): shows what already works on Windows without
-    # failing CI while the port is unfinished. Every check runs even if an earlier one fails.
-    # tests/conftest.py lists the tests that can't load on Windows yet, and why.
-    name: Windows (port in progress)
+    # Groundwork for the Windows version (#39): shows what already works on Windows. While the
+    # port is unfinished the checks are expected to fail, so they never fail the job: each one
+    # runs whatever happened before it, and the last step lists the results in the run's
+    # summary and as warnings, so the PR shows a passing job, not a red mark everyone learns
+    # to ignore. tests/conftest.py lists the tests that can't load on Windows yet, and why.
+    name: Windows (experimental)
     runs-on: windows-latest
-    continue-on-error: true
+    continue-on-error: true  # only setting up (checkout, uv sync) can fail the job
     timeout-minutes: 30  # a test that hangs on Windows mustn't hold a runner for 6 hours
     steps:
       # Keep LF line endings, as on Linux: some tests compare files byte for byte.
@@ -72,35 +74,67 @@ jobs:
         with:
           persist-credentials: false
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
-      - id: sync
-        run: uv sync --locked
-      - name: ruff check
-        if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+      - run: uv sync --locked
+      - id: ruff
+        name: ruff check
+        continue-on-error: true
         run: uv run ruff check
-      - name: ruff format --check
-        if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+      - id: format
+        name: ruff format --check
+        continue-on-error: true
         run: uv run ruff format --check
-      - name: mypy (checks the Windows branches of tomecast.oslayer)
-        if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+      - id: mypy
+        name: mypy (checks the Windows branches of tomecast.oslayer)
+        continue-on-error: true
         run: uv run mypy
-      - name: pytest
-        if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+      - id: pytest
+        name: pytest
+        continue-on-error: true
         run: uv run pytest
-      - name: Lint install.ps1
-        if: ${{ !cancelled() }}
+      - id: pssa
+        name: Lint install.ps1
+        continue-on-error: true
         shell: pwsh
         run: |
           $found = Invoke-ScriptAnalyzer -Path install.ps1 -Severity Warning, Error
           $found | Format-Table -AutoSize | Out-String -Width 200
           if ($found) { exit 1 }
-      - name: Run install.ps1 against this checkout
-        if: ${{ !cancelled() }}
+      - id: install
+        name: Run install.ps1 against this checkout
+        continue-on-error: true
         shell: pwsh
         env:
           TOMECAST_PACKAGE: ${{ github.workspace }}
         run: |
           ./install.ps1
           & "$(uv tool dir --bin)\tomecast.exe" --version
+      - name: Results (they don't fail CI while the port is in progress)
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        env:
+          RUFF: ${{ steps.ruff.outcome }}
+          FORMAT: ${{ steps.format.outcome }}
+          MYPY: ${{ steps.mypy.outcome }}
+          PYTEST: ${{ steps.pytest.outcome }}
+          PSSA: ${{ steps.pssa.outcome }}
+          INSTALL: ${{ steps.install.outcome }}
+        run: |
+          $checks = [ordered]@{
+            'ruff check' = $env:RUFF
+            'ruff format --check' = $env:FORMAT
+            'mypy' = $env:MYPY
+            'pytest' = $env:PYTEST
+            'PSScriptAnalyzer on install.ps1' = $env:PSSA
+            'install.ps1 against this checkout' = $env:INSTALL
+          }
+          $table = @('### Windows (experimental, #39)', '', '| Check | Result |', '|---|---|')
+          foreach ($check in $checks.GetEnumerator()) {
+            $table += "| $($check.Key) | $($check.Value) |"
+            if ($check.Value -ne 'success') {
+              Write-Output "::warning title=Windows (experimental)::$($check.Key): $($check.Value) (see that step's log; expected while #39 is in progress)"
+            }
+          }
+          $table -join "`n" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
 
   install:
     # Proves the one-line installer works on a clean copy of each distro.
