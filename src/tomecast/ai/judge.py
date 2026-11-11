@@ -16,10 +16,14 @@ below limit which lines it may drop:
   numbers, running headers, contents entries and footnote markers are short; a paragraph of
   the story is not. So the worst a confused model can do is drop a short line.
 - **Sentences are never dropped**, however short: a line with lowercase letters that ends like
-  a sentence (".", "!", "?", "…", maybe inside quotes), such as the dialogue line
-  "“Yes.”", is kept (:func:`looks_like_sentence`). Junk rarely ends that way: page numbers
-  and contents entries end in a number, running headers have no full stop, and notes like
+  a sentence or a piece of one (".", "!", "?", "…", ",", ":", ";", a dash, maybe inside
+  quotes), or opens with a quotation mark, such as "“Yes.”" or "“But your client—”", is
+  kept (:func:`looks_like_sentence`). Junk rarely looks like that: page numbers and contents
+  entries end in a number, running headers have no punctuation, and notes like
   "[Illustration]" end in a bracket.
+- **Chapter headings are never dropped**: a line the cleanup rules read as a chapter heading
+  ("CHAPTER II.", "I. A SCANDAL IN BOHEMIA") is kept, since its words are spoken as the
+  chapter's title (:func:`looks_like_heading`).
 - **Only short lines can start a chapter**, and a blank line can't.
 - **Anything unexpected keeps the text.** A reply that isn't valid JSON, names a line that
   doesn't exist or fails twice leaves that window of lines exactly as it was.
@@ -31,12 +35,14 @@ prompt small, but the edits are always made on the full, original lines.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Protocol
 
 from tomecast.book import Book, Chapter
+from tomecast.cleanup import is_chapter_heading, is_numbered_chapter, is_page_number
 
 
 class Verdict(StrEnum):
@@ -249,17 +255,39 @@ def words(line: str) -> int:
     return len(line.split())
 
 
-_SENTENCE_END = frozenset(".!?…")
-# Closing quotes (curly and straight), a bracket and emphasis marks after a full stop.
+# A sentence, or a piece of one, ends with one of these: a full stop, a question or an
+# exclamation, an ellipsis, or a comma, colon, semicolon or dash where it carries on.
+_SENTENCE_END = frozenset(".!?…,:;\u2014\u2013-")
+# Closing quotes (curly and straight), a bracket and emphasis marks after the punctuation.
 _CLOSERS = "\u201d\u2019\"')_*"
+_OPENING_QUOTES = "\u201c\u2018\"'"
+_PAGE_NUMBER_END = re.compile(r"\s(?:\d+|[ivxlcdm]+)$", re.IGNORECASE)
 
 
 def looks_like_sentence(line: str) -> bool:
-    """Whether a line reads as a sentence: it has a lowercase letter and ends with ".", "!",
-    "?" or "…", perhaps followed by closing quotes. "“Yes.”" and "So Della did it." do;
-    "12", "THE GIFT OF THE MAGI", "Mr. and Mrs. Bennet 5" and "[Illustration.]" don't."""
-    text = line.strip().rstrip(_CLOSERS).rstrip()
-    return bool(text) and text[-1] in _SENTENCE_END and any(char.islower() for char in text)
+    """Whether a line reads as a sentence or part of one, so it must never be dropped.
+
+    It needs a lowercase letter, and either ends with sentence punctuation (".", "!", "?",
+    "…", or "," ":" ";" "—" where it carries on), perhaps followed by closing quotes, or
+    opens with a quotation mark (dialogue) without ending in a page number. "“Yes.”",
+    "So Della did it.", "“Very truly yours," and "“But your client—”" are sentences;
+    "12", "THE GIFT OF THE MAGI", "Mr. and Mrs. Bennet 5", "“The arrival” 9" (a list of
+    illustrations), "[Illustration:" and "[Illustration.]" aren't.
+    """
+    text = line.strip()
+    if not any(char.islower() for char in text) or text.startswith("["):
+        return False  # no lowercase: a heading or a number; "[...": an editor's note
+    if text[0] in _OPENING_QUOTES and not _PAGE_NUMBER_END.search(text):
+        return True
+    text = text.rstrip(_CLOSERS).rstrip()
+    return bool(text) and text[-1] in _SENTENCE_END
+
+
+def looks_like_heading(line: str) -> bool:
+    """Whether Tomecast's own rules read the line as a chapter heading ("CHAPTER II.",
+    "I. A SCANDAL IN BOHEMIA", "Part Two"), but not as a page number ("12")."""
+    text = line.strip()
+    return (is_chapter_heading(text) or is_numbered_chapter(text)) and not is_page_number(text)
 
 
 def guard(
@@ -277,6 +305,8 @@ def guard(
             refused.append(Refusal(index, verdict, f"{count} words is too long to drop"))
         elif verdict is Verdict.DROP and options.keep_sentences and looks_like_sentence(line):
             refused.append(Refusal(index, verdict, "it looks like a sentence"))
+        elif verdict is Verdict.DROP and looks_like_heading(line):
+            refused.append(Refusal(index, verdict, "it looks like a chapter heading"))
         elif verdict is Verdict.CHAPTER_START and not line.strip():
             refused.append(Refusal(index, verdict, "a blank line can't be a heading"))
         elif verdict is Verdict.CHAPTER_START and count > options.max_heading_words:
@@ -371,6 +401,8 @@ def check_edit(edit: Edit, options: JudgeOptions | None = None) -> None:
             raise EditCheckError(f"line {index + 1} is too long to have been dropped")
         if options.keep_sentences and looks_like_sentence(line):
             raise EditCheckError(f"line {index + 1} is a sentence, so it can't be dropped")
+        if looks_like_heading(line):
+            raise EditCheckError(f"line {index + 1} is a chapter heading, so it can't be dropped")
     before = [word for line in edit.original for word in line.split()]
     after = [word for line in rebuilt for word in line.split()]
     gone = [word for index in edit.dropped for word in edit.original[index].split()]

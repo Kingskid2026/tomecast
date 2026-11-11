@@ -24,6 +24,7 @@ from tomecast.ai.judge import (
     check_edit,
     judge_book,
     judge_lines,
+    looks_like_heading,
     looks_like_sentence,
     max_tokens,
     parse_reply,
@@ -300,7 +301,7 @@ def test_judge_book_splits_chapters_and_proves_every_kept_line_is_spoken() -> No
 
 
 def test_judge_book_keeps_a_title_whose_lines_were_all_dropped() -> None:
-    chapter = Chapter("Contents", ("I. The Gift 1", "II. The Combs 9", "CHAPTER I.", "Text."))
+    chapter = Chapter("Contents", ("The Gift 1", "The Combs 9", "CHAPTER I.", "Text."))
     model = FakeModel([{"drop": [1, 2], "chapter_start": [3]}])
     judged = judge_book(Book("T", (), None, (chapter,)), model)
     assert [(c.title, c.paragraphs) for c in judged.book.chapters] == [
@@ -317,7 +318,7 @@ def test_judge_book_with_an_untitled_chapter_starting_with_a_heading() -> None:
 
 
 def test_check_chapters_catches_a_lost_title() -> None:
-    chapter = Chapter("Contents", ("I. The Gift 1", "Text."))
+    chapter = Chapter("Contents", ("The Gift 1", "Text."))
     edit = apply_verdicts(chapter.paragraphs, {0: Verdict.DROP})
     assert chapters_from(chapter, edit) == [Chapter("Contents", ("Text.",))]
     with pytest.raises(EditCheckError):
@@ -330,9 +331,25 @@ def test_a_model_that_drops_everything_only_loses_short_lines() -> None:
     model = FakeModel([{"drop": list(range(1, len(STORY) + 1)), "chapter_start": []}])
     judged = judge_book(Book("T", (), None, (chapter,)), model)
     kept = [p for c in judged.book.chapters for p in c.spoken_paragraphs()]
-    assert kept == [STORY[1], STORY[3], STORY[6], STORY[7]]  # every sentence stays
-    assert [line for line in STORY if line not in kept] == [STORY[0], "12", "*", "CHAPTER II."]
-    assert judged.refused == 4
+    # Every sentence stays, and so does the chapter heading.
+    assert kept == [STORY[1], STORY[3], "CHAPTER II.", STORY[6], STORY[7]]
+    assert [line for line in STORY if line not in kept] == [STORY[0], "12", "*"]
+    assert judged.refused == 5
+
+
+@pytest.mark.parametrize(
+    ("line", "heading"),
+    [
+        ("CHAPTER II.", True),
+        ("I. A SCANDAL IN BOHEMIA", True),
+        ("Part Two", True),
+        ("12", False),  # a page number
+        ("THE GIFT OF THE MAGI", False),  # a running header
+        ("Heading to Chapter I. 1", False),
+    ],
+)
+def test_looks_like_heading(line: str, heading: bool) -> None:
+    assert looks_like_heading(line) is heading
 
 
 @pytest.mark.parametrize(
@@ -344,6 +361,15 @@ def test_a_model_that_drops_everything_only_loses_short_lines() -> None:
         ("Well…", True),
         ("_She stopped._", True),
         ("(See the note.)", True),
+        ("“But your client—”", True),
+        ("“Precisely so. But how—”", True),
+        ("“Very truly yours,", True),
+        ("I took the paper from him and read as follows:", True),
+        ("“He came down to see the place”", True),  # dialogue, even with no full stop
+        ("“I’m the tallest” 9", False),  # a list of illustrations: ends in a page number
+        ("[Illustration:", False),
+        ("Heading to Chapter XXX. 209", False),
+        ("Frontispiece iv", False),
         ("12", False),
         ("THE GIFT OF THE MAGI", False),
         ("CHAPTER II.", False),  # no lowercase: a heading
@@ -351,7 +377,6 @@ def test_a_model_that_drops_everything_only_loses_short_lines() -> None:
         ("Mr. and Mrs. Bennet 5", False),
         ("[Illustration: The arrival.]", False),
         ("[_Copyright 1894 by George Allen._]]", False),
-        ("“He came down to see the place”", False),
         ("*", False),
         ("", False),
     ],
