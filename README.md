@@ -25,7 +25,7 @@ Then open **Tomecast** from your app launcher, or run `tomecast --help`. Run the
 | Alpine, NixOS, ARM computers | Not supported yet |
 | Windows and Mac | Windows is planned for 1.0. A Mac version isn't planned yet |
 
-The voice uses about 1.8 GB of memory while it works on the CPU, and Tomecast warns you if less than 2 GB is free.
+The voice uses about 1.8 GB of memory while it works on the CPU. `tomecast convert` and `tomecast scan` warn you if less than 2 GB is free; the window doesn't yet.
 
 ## Try it
 
@@ -71,7 +71,7 @@ The window never overwrites a file: it picks a free name ("book (2)").
 | `tomecast scan` | Checks this computer again: retries engine updates that failed here before (after installing a graphics driver, say), and measures how fast it voices on the CPU and the graphics card (`--no-gpu` skips the card) |
 | `tomecast desktop-entry install` | Adds Tomecast to your app launcher, if the installer couldn't (`uninstall` removes it) |
 
-`--format mp3` writes `book/01 - Chapter title.mp3`, `02 - …` and so on, for players and car stereos that don't know `.m4b`. Each file is tagged (album, author, track n/total, chapter title) and carries the cover. MP3 is 64 kbps mono, about 29 MB per hour, the same as the M4B. Like the M4B, it never overwrites without `--force`.
+`--format mp3` writes `book/01 - Chapter title.mp3`, `02 - …` and so on, for players and car stereos that don't know `.m4b`. Each file is tagged (album, author, track n/total, chapter title) and carries the cover. MP3 is 64 kbps mono, about 29 MB per hour, the same as the M4B. Like the M4B, it never overwrites without `--force`, not even something that appears there while the book is being made (another run's book, say): the command stops with an error instead, and keeps the voiced audio, so running it again with another `-o` is quick.
 
 If a conversion stops (you press Ctrl-C, or the computer crashes), run the same command again: it picks up where it left off.
 
