@@ -278,15 +278,20 @@ def _find_furniture(raw: Sequence[RawChapter]) -> set[tuple[int, int]]:
 
     Only blocks the reader found on their own at the top or bottom of a page count. A block
     is furniture if it's a page number, or if its text (digits ignored) is in the same band
-    on at least three pages (two, in a book of four pages or fewer).
+    on at least three pages (two, in a book of four pages or fewer), or if a layout model
+    marked it as a page header or footer (:attr:`Block.furniture`).
     """
     pages_by_key: dict[tuple[Band, str], set[int]] = {}
     candidates: list[tuple[int, int, Band, str, str]] = []
+    marked: set[tuple[int, int]] = set()  # page headers and footers a layout model found
     pages: set[int] = set()
     for chapter_index, chapter in enumerate(raw):
         for block_index, block in enumerate(chapter.blocks):
             if block.page is not None:
                 pages.add(block.page)
+            if block.furniture:
+                marked.add((chapter_index, block_index))
+                continue
             if block.band is None or block.page is None or block.role is not Role.BODY:
                 continue
             text = join_lines(block.lines)
@@ -294,7 +299,7 @@ def _find_furniture(raw: Sequence[RawChapter]) -> set[tuple[int, int]]:
             pages_by_key.setdefault((block.band, key), set()).add(block.page)
             candidates.append((chapter_index, block_index, block.band, key, text))
     repeats = 2 if len(pages) <= 4 else 3
-    return {
+    return marked | {
         (chapter_index, block_index)
         for chapter_index, block_index, band, key, text in candidates
         if is_page_number(text) or (key and len(pages_by_key[(band, key)]) >= repeats)

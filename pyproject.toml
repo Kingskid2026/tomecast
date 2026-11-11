@@ -41,6 +41,12 @@ Changelog = "https://github.com/Kingskid2026/tomecast/blob/main/CHANGELOG.md"
 [project.scripts]
 tomecast = "tomecast.cli:main"
 
+[project.optional-dependencies]
+layout = [
+    "numpy>=2.1",
+    "onnxruntime>=1.31.1",
+]
+
 [build-system]
 requires = ["uv_build>=0.13.7,<0.14"]
 build-backend = "uv_build"
@@ -48,6 +54,8 @@ build-backend = "uv_build"
 [dependency-groups]
 dev = [
     "mypy>=2.4.1",
+    "numpy>=2.1",
+    "onnxruntime>=1.31.1",
     "pytest>=9.2.0",
     "pytest-qt>=4.5.0",
     "ruff>=0.17.3",
@@ -84,8 +92,16 @@ files = ["src", "tests"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = ["-ra", "--strict-markers", "--strict-config"]
+markers = [
+    "integration: needs files downloaded from the network (a model); skipped unless present",
+]
 
 [[tool.mypy.overrides]]
 # pypdfium2 ships no type information; its values are checked where they enter our code.
 module = ["pypdfium2", "pypdfium2.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# onnxruntime (the optional "layout" extra) ships no type information either.
+module = ["onnxruntime", "onnxruntime.*"]
 ignore_missing_imports = true
