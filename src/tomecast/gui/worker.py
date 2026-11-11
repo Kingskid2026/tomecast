@@ -645,6 +645,8 @@ class ConversionWorker(QObject):
             route = voices.route(job.voice, job.book.language, premium_possible=job.use_gpu)
             if route.voice != job.voice:
                 job = replace(job, voice=route.voice)
+            if ming.is_ming_voice(job.voice):  # the window knows only Kokoro's CPU speed
+                job = replace(job, cpu_speedup=None)
             engine = self._engine_factory(self._root, job.voice, job.speed, job.use_gpu)
             if isinstance(engine, ming.MingServer):
                 engine.language = route.language
@@ -719,7 +721,8 @@ class ConversionWorker(QObject):
         except (Cancelled, OSError):
             return False
         if rolled:
-            self._assets_ready.pop(job.use_gpu, None)
+            for kind in ("kokoro", "ming"):  # every voice on that build prepares again
+                self._assets_ready.pop((kind, job.use_gpu), None)
             self._close_preview_engine()  # it may be running the build that failed
         return rolled
 

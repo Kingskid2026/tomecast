@@ -56,7 +56,6 @@ from tomecast.gui.backend import STOPPED_MESSAGE, Backend, safe_file_name, uniqu
 from tomecast.gui.models import DEFAULT_SPEEDUP, ChapterModel, display_title, summarize
 from tomecast.gui.worker import BookRead, SelfCheckFor, TimedControl, preview_file
 from tomecast.hardware import GpuDevice, short_name
-from tomecast.hardware import GpuDevice
 from tomecast.manifest import MING_Q8
 from tomecast.names import Name
 from tomecast.speed import Speeds
@@ -3030,6 +3029,8 @@ def test_the_cpus_speed_after_the_switch_is_kept_under_the_engines_threads(
 
     assert "CPU/8" in backend._speeds  # what the engine voiced with
     assert "CPU/4" not in backend._speeds
+
+
 # --- The premium voice (Ming, issue #11) --------------------------------------------------
 
 

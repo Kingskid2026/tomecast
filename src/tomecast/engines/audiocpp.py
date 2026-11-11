@@ -1005,7 +1005,7 @@ def check_build(
     backend: Literal["cpu", "vulkan"],
     device: int | None = None,
     cancelled: IsCancelled | None = None,
-    server: type[KokoroServer] = KokoroServer,
+    server: type[KokoroServer] | None = None,
 ) -> CheckResult:
     """Try the engine build in the folder ``engine``: ``None`` if it works, else why not.
 
@@ -1018,27 +1018,27 @@ def check_build(
     rather than report a failure. If the graphics card runs out of memory (other programs
     are using it), that says nothing about the build: the result is
     :class:`~tomecast.downloads.Inconclusive`, so nothing is switched or recorded.
-    ``server`` is the voice to check with (Ming's check passes its own).
+    ``server`` is the voice to check with (``None``: Kokoro; Ming's check passes its own).
     """
     with tempfile.TemporaryDirectory(prefix="tomecast-check-") as folder:
         wav = Path(folder) / "check.wav"
         try:
-            with server(
+            with (server or KokoroServer)(
                 root,
                 executable=engine / EXECUTABLE,
                 espeak=espeak,
                 backend=backend,
                 device=device,
                 cancelled=cancelled,
-            ) as server:
+            ) as running:
                 if backend == "vulkan":
-                    loaded = server.loaded_device()
+                    loaded = running.loaded_device()
                     if loaded is not None and loaded != device:
                         return (
                             f"the voice model was loaded on device {loaded}, not on the "
                             f"graphics card (device {device})"
                         )
-                server.synthesize(SELF_CHECK_TEXT, wav)
+                running.synthesize(SELF_CHECK_TEXT, wav)
         except (EngineError, OSError) as error:
             if cancelled is not None and cancelled():
                 raise Cancelled from error
@@ -1053,7 +1053,7 @@ def self_check(
     use_gpu: bool,
     cancelled: IsCancelled | None = None,
     *,
-    server: type[KokoroServer] = KokoroServer,
+    server: type[KokoroServer] | None = None,
 ) -> SelfCheck:
     """Kokoro's check of new engine and eSpeak builds, for a run with or without the card.
     (``server`` makes it another voice's check: Ming's, in :mod:`tomecast.engines.ming`.)

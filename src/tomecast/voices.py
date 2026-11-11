@@ -11,7 +11,7 @@ self-checks a new engine build must pass.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -128,7 +128,7 @@ def work_key(voice: str) -> str:
     return ming.work_key(voice) if engine_of(voice) == "ming" else voice
 
 
-def premium_note(missing: tuple[Asset, ...] | list[Asset]) -> str | None:
+def premium_note(missing: Sequence[Asset]) -> str | None:
     """The one sentence to show before downloading the premium voice, if it's among
     ``missing``: "The premium voice is about 1.8 GB to download and needs a graphics card."
     """

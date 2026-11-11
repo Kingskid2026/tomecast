@@ -243,7 +243,7 @@ class AutoMing(MingServer, AutoKokoro):
     else AutoKokoro learns (running out of graphics memory, #49) comes with it."""
 
     def __init__(self, root: Path, *, use_gpu: bool = True, **kwargs: object) -> None:
-        super().__init__(root, use_gpu=use_gpu, **kwargs)
+        super().__init__(root, use_gpu=use_gpu, **kwargs)  # type: ignore[arg-type]
 
     def __enter__(self) -> AutoMing:
         self.start()

@@ -237,6 +237,7 @@ def known_cpu_speed(root: Path, engine: KokoroServer) -> float | None:
     for build in (engine.executable.parent, build_in_use(AUDIOCPP_CPU, root)):
         if build is not None:
             key = speed_key(build, backend="cpu", gpu_description="", threads=engine.threads)
+            key += _model_suffix(engine)
             if (known := known_speed(root, key)) is not None:
                 return known
     return None
@@ -249,10 +250,14 @@ def _key_of(engine: KokoroServer) -> str:
         gpu_description=getattr(engine, "gpu_description", ""),
         threads=engine.threads,
     )
+    return key + _model_suffix(engine)
+
+
+def _model_suffix(engine: KokoroServer) -> str:
+    """``""`` for Kokoro (so its keys are as before), ``"/ming"`` for another voice, which has
+    speeds of its own on the same build and device."""
     model = getattr(engine, "MODEL_ID", KokoroServer.MODEL_ID)
-    if model != KokoroServer.MODEL_ID:  # another voice (Ming) has its own speed
-        key += f"/{model}"
-    return key
+    return "" if model == KokoroServer.MODEL_ID else f"/{model}"
 
 
 def probe(
