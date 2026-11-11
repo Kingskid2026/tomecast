@@ -413,9 +413,10 @@ def _convert(args: argparse.Namespace) -> int:
             with engine as running:
                 print(_hardware_line(running, args.gpu))
 
-                def threads_line() -> None:
+                def threads_line() -> None:  # on the CPU with fewer threads than usual
                     if not running.gpu_description and choice.fewer_because:
-                        print(f"Using {_plural(choice.threads, 'CPU thread')}{_fewer_text(choice)}.")
+                        threads = _plural(choice.threads, "CPU thread")
+                        print(f"Using {threads}{_fewer_text(choice)}.")
 
                 threads_line()
                 notes = _EngineNotes(running)

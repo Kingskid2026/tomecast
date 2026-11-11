@@ -814,7 +814,7 @@ class Backend(QObject):
             ConvertJob(
                 self._convert_job, book, tuple(rows), self._book_path, output, self._voice,
                 self._speed, self._control, self._using_gpu, output_format, fixes,
-                self._speeds.get("CPU"),
+                self._speeds.get(self._speed_key("CPU")),
             )
         )  # fmt: skip
 
@@ -1034,11 +1034,19 @@ class Backend(QObject):
         self._notice = ""
         self._show("done")
 
-    @Slot(int, str)
-    def _on_notice(self, job: int, message: str) -> None:
-        """The graphics card ran out of memory and the book goes on on the CPU: say so in
-        the banner while it's being made (the done screen lists it with the other notes)."""
-        if job == self._convert_job:
+    @Slot(int, str, int)
+    def _on_notice(self, job: int, message: str, threads: int) -> None:
+        """The graphics card ran out of memory and the book goes on on the CPU, with
+        ``threads``: say so in the banner while it's being made (the done screen lists it with
+        the other notes), and show the CPU. The thread count is the engine's own, not read
+        again, so the speed this run measures is kept under the count that made it."""
+        if job != self._convert_job:
+            return
+        self._cpu_threads = threads
+        self._update("gpuName", "")
+        self._refresh_hardware_label()
+        self.selectionSummaryChanged.emit()
+        if message:
             self._notice = message
             self._update("errorMessage", message)
 

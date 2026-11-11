@@ -1299,3 +1299,20 @@ def test_a_failure_after_running_out_of_graphics_memory_doesnt_roll_back(
     new_build = root / asset.path / asset.sha256[:12]
     assert build_in_use(asset, root) == new_build  # not rolled back...
     assert failure(asset, root) is None  # ...and not blamed
+
+
+def test_the_threads_line_follows_a_switch_to_the_cpu_partway(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(machine, "cpu_count", lambda: 16)
+    pin_machine(monkeypatch, tmp_path / "laptop", supplies=ON_BATTERY)
+    monkeypatch.setattr(cli, "vulkan_possible", lambda: True)
+    FakeKokoro.oom_at = 2
+
+    assert cli.main(["convert", str(_epub(tmp_path))]) == 0
+
+    out = capsys.readouterr().out
+    threads = "Using 4 CPU threads (usually 8; fewer on battery).\n"
+    assert out.count(threads) == 1  # not at first: it began on the card
+    assert f"Note: {audiocpp.RAN_OUT_OF_MEMORY_NOTE}\n{threads}" in out  # right after the note
+    assert FakeKokoro.made[-1].kwargs["threads"] == 4

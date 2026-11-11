@@ -158,26 +158,41 @@ _PORT_TAKEN = re.compile(
 )
 _PHONEME_LIMIT_MESSAGE = "exceeds 510"
 
-# How audio.cpp says the graphics card is out of memory, seen on the maintainer's laptop with
-# another program holding most of the card's memory (#49): Kokoro starts, and then requests
-# fail with HTTP 500 and a ggml message containing "failed to allocate" while the server stays
-# up; the heavier Ming fails while loading, with Vulkan's ErrorOutOfDeviceMemory in its log.
-# The other two are the same failure in Vulkan's and ggml's other words.
+# How audio.cpp 0.9.4 says the graphics card is out of memory, seen on the maintainer's laptop
+# with 7.1 of the NVIDIA card's 7.6 GiB in use by other programs (#49). Kokoro starts, then every
+# request answers HTTP 500 "failed to allocate Kokoro predictor tail tensors" and the server
+# stays up; Ming exits within a second of starting, with "audiocpp_server failed: failed to
+# allocate ming3_tts.ar.weights backend weight buffer". Either way the log has these first:
+#
+#     ggml_vulkan: Device memory allocation of size 186707936 failed.
+#     ggml_vulkan: vk::Device::allocateMemory: ErrorOutOfDeviceMemory
+#     alloc_tensor_range: failed to allocate Vulkan0 buffer of size 186707936
+#
+# "failed to allocate" alone isn't enough: audio.cpp says it about things that aren't memory
+# too ("failed to allocate a unique model installer temporary directory", when the disk is
+# full), so it has to be about what lives in the card's memory: a buffer, memory, tensors,
+# weights or a compute graph. (The binary's other Kokoro replies are all "failed to allocate
+# Kokoro ... tensors" or "... graph".) The log written during the request is the surer sign.
 _OUT_OF_MEMORY = re.compile(
-    r"failed to allocate|ErrorOutOfDeviceMemory|VK_ERROR_OUT_OF_DEVICE_MEMORY"
-    r"|memory allocation of size \d+ failed",
+    r"ErrorOutOfDeviceMemory|VK_ERROR_OUT_OF_DEVICE_MEMORY"
+    r"|device memory allocation of size \d+ failed"
+    r"|failed to allocate\b.*\b(?:buffers?|memory|tensors?|weights?|graph)\b",
     re.IGNORECASE,
 )
 # Not the card's memory: ggml recovers from a failed pinned-memory allocation by using
-# ordinary memory (it says so and carries on), and a CPU buffer is the computer's own memory,
-# which the CPU would need just the same.
-_NOT_THE_CARDS_MEMORY = re.compile(r"pinned memory|\bCPU\b|_cpu_", re.IGNORECASE)
+# ordinary memory (it says so and carries on); a CPU buffer, or bookkeeping ("metadata"), is
+# the computer's own memory, which the CPU would need just the same. ggml names that buffer
+# type "CPU" (or "CPU_Mapped") in capitals, so a path such as .../audiocpp-0.9.4-cpu/...
+# doesn't count as one.
+_NOT_THE_CARDS_MEMORY = re.compile(
+    r"(?i:pinned memory|metadata)|\bCPU(?:_\w+)? buffer\b|ggml_backend_cpu_"
+)
 
 
 def out_of_graphics_memory(message: str) -> bool:
-    """Whether ``message`` (an error reply from audio.cpp, or its log) says the graphics card
-    ran out of memory. Only out-of-memory counts, not every failure: an engine that fails for
-    another reason must not be moved to the CPU as if it were short of memory."""
+    """Whether ``message`` (an error reply from audio.cpp, or what it logged) says the
+    graphics card ran out of memory. Only out-of-memory counts, not every failure: an engine
+    that fails for another reason must not be moved to the CPU as if it were short of memory."""
     return any(
         _OUT_OF_MEMORY.search(line) and not _NOT_THE_CARDS_MEMORY.search(line)
         for line in message.splitlines()
@@ -528,6 +543,12 @@ class KokoroServer:
         assert self._tempdir is not None
         return Path(self._tempdir.name) / "server.log"
 
+    def _log_size(self) -> int:
+        try:
+            return self._log_path.stat().st_size
+        except (OSError, AssertionError):
+            return 0
+
     def _log_since(self, offset: int) -> str:
         """What the engine logged from byte ``offset`` on (one process's part of the log)."""
         try:
@@ -598,6 +619,13 @@ class KokoroServer:
                         "backend, not the graphics card"
                     )
                 return
+            if self.backend == "vulkan" and out_of_graphics_memory(self._log_since(log_start)):
+                # It said so and is still going (stuck, or about to exit): don't wait for the
+                # whole start-up time.
+                raise GpuOutOfMemory(
+                    f"the graphics card ran out of memory while the voice engine started:\n"
+                    f"{_tail(self._log_path)}"
+                )
             time.sleep(0.2)
         problem = f"the voice engine didn't start within {self._startup_timeout:.0f}s"
         if self.backend == "vulkan" and out_of_graphics_memory(self._log_since(log_start)):
@@ -641,13 +669,19 @@ class KokoroServer:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
+        log_before = self._log_size()
         try:
             with _LOCAL.open(request, timeout=self._request_timeout) as response:
                 data: bytes = response.read()
                 return data
         except urllib.error.HTTPError as error:
             message = _error_message(error)
-            if self.backend == "vulkan" and out_of_graphics_memory(message):
+            # The reply names what it couldn't allocate ("Kokoro predictor tail tensors");
+            # the log written during this request says why (ErrorOutOfDeviceMemory).
+            if self.backend == "vulkan" and (
+                out_of_graphics_memory(message)
+                or out_of_graphics_memory(self._log_since(log_before))
+            ):
                 raise GpuOutOfMemory(message) from error  # the server is still up
             raise EngineError(message) from error
         except (OSError, http.client.HTTPException) as error:

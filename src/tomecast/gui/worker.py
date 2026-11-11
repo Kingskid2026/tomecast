@@ -103,6 +103,11 @@ class Engine(VoiceEngine, Protocol):
     # using it, so a failure in this run is never blamed on the build
     out_of_memory: bool
 
+    @property
+    def threads(self) -> int:
+        """The CPU threads it voices with, decided when it's made (and kept on the CPU)."""
+        ...
+
     def pin_builds(self, builds: Mapping[str, Path]) -> None:
         """Run exactly these engine builds (``Prepared.builds``): the work folder is keyed by
         them, so crash restarts must not pick up another."""
@@ -328,15 +333,19 @@ class _Meter:
             self._started = time.monotonic()
             self._paused_before = self._control.paused_seconds
         on_the_card = not self._engine.fell_back
-        self._engine.synthesize(text, output)
-        self.voiced += 1
-        self._voiced_chars += len(text)
-        with contextlib.suppress(wave.Error, EOFError, OSError):
-            self._audio_seconds += wav_info(output).seconds
-        if on_the_card and self._engine.fell_back:  # it carried on on the CPU
-            self._restart()
-            if self._on_fallback is not None:
-                self._on_fallback()
+        try:
+            self._engine.synthesize(text, output)
+            self.voiced += 1
+            self._voiced_chars += len(text)
+            with contextlib.suppress(wave.Error, EOFError, OSError):
+                self._audio_seconds += wav_info(output).seconds
+        finally:
+            # Moved to the CPU during this call: said even if the CPU's first try then failed
+            # (the retry would find it on the CPU already, and nobody would know it moved).
+            if on_the_card and self._engine.fell_back:
+                self._restart()
+                if self._on_fallback is not None:
+                    self._on_fallback()
 
     def _restart(self) -> None:
         if self._voiced_chars and self._audio_seconds > 0:
@@ -406,9 +415,9 @@ class ConversionWorker(QObject):
     converted = Signal(int, object)  # job, ConvertResult
     cancelled = Signal(int)  # job
     failed = Signal(int, str)  # job, message for the error banner
-    # job, a sentence for the banner while the book goes on: the graphics card ran out of
-    # memory, so the engine uses the CPU
-    noticed = Signal(int, str)
+    # A sentence for the banner while the book goes on: the graphics card ran out of memory,
+    # so the engine uses the CPU (with the threads it was given when it was made).
+    noticed = Signal(int, str, int)  # job, the sentence, the CPU threads the engine uses
     deviceChosen = Signal(str)  # the graphics card's description, or "" for the CPU
     speedsKnown = Signal(object)  # Speeds, from the start-up scan
 
@@ -666,10 +675,9 @@ class ConversionWorker(QObject):
 
         def tell_out_of_memory() -> None:
             """The card ran out of memory, so the CPU is in use: say so in the banner now,
-            not only on the done screen."""
-            self.deviceChosen.emit(engine.gpu_description)  # "": the CPU
-            if engine.out_of_memory and engine.warning:
-                self.noticed.emit(job.job, engine.warning)
+            not only on the done screen, with the thread count the engine really uses (the
+            window would otherwise read today's, which on battery may differ)."""
+            self.noticed.emit(job.job, engine.warning or "", engine.threads)
 
         try:
             engine.start()

@@ -43,6 +43,7 @@ from tomecast.engines.audiocpp import (
     EXECUTABLE,
     KOKORO_Q8,
     EngineError,
+    GpuOutOfMemory,
     KokoroServer,
     default_threads,
     split_speed,
@@ -218,7 +219,7 @@ def engine_speed(
         try:
             value = round(measure(engine), 2)  # as it's remembered, so every run shows the same
         except EngineError as error:
-            if engine.backend == backend:
+            if engine.backend == backend and not isinstance(error, GpuOutOfMemory):
                 remember_failure(root, key, str(error))
             return None
         if engine.backend == backend:
@@ -319,7 +320,10 @@ def _speed_on(
     except (EngineError, OSError) as error:
         if cancelled is not None and cancelled():
             raise Cancelled from error  # stopped, not failed: nothing to remember
-        remember_failure(root, key, str(error))
+        # Out of graphics memory isn't the card failing: other programs are using it now. It's
+        # left out this time and tried again at the next start-up, not kept away for days.
+        if not isinstance(error, GpuOutOfMemory):
+            remember_failure(root, key, str(error))
         return None
     remember_speed(root, key, value)
     return value
