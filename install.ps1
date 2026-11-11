@@ -37,7 +37,9 @@ function Install-Tomecast {
         throw 'tomecast-install: error: this installer is for Windows. On Linux, use install.sh.'
     }
 
-    $uvCommand = Get-Command uv -CommandType Application -ErrorAction SilentlyContinue
+    # The first uv on PATH, as a shell would pick it (Get-Command lists every match).
+    $uvCommand = Get-Command uv -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
     if ($uvCommand) {
         $Uv = $uvCommand.Source
         Write-Step "using the uv already on your system ($(& $Uv --version))"
@@ -72,10 +74,15 @@ function Install-Tomecast {
         throw 'tomecast-install: error: uv could not install Tomecast (its message is above).'
     }
 
-    $BinDir = (& $Uv tool dir --bin | Select-Object -Last 1).Trim()
+    $BinDir = "$(& $Uv tool dir --bin | Select-Object -Last 1)".Trim()
     $Tomecast = Join-Path $BinDir 'tomecast.exe'
+    # Running a missing program doesn't stop the script or set $LASTEXITCODE, so check first:
+    # otherwise this would go on to say "done!" with no version.
+    if (-not $BinDir -or -not (Test-Path -LiteralPath $Tomecast -PathType Leaf)) {
+        throw "tomecast-install: error: uv says it installed Tomecast, but there's no $Tomecast. Please open an issue."
+    }
     $version = & $Tomecast --version  # its errors stay visible, as in install.sh
-    if ($LASTEXITCODE -ne 0) {
+    if ($LASTEXITCODE -ne 0 -or -not $version) {
         throw "tomecast-install: error: Tomecast installed, but didn't start. Please open an issue."
     }
     Write-Step "done! $version is installed."
