@@ -226,7 +226,7 @@ def test_pieces_made_without_the_spoken_check_are_never_reused_with_it(
     book.write_bytes(b"a book")
     root = tmp_path / "data"
     unchecked = work_folder(root, book, "UK_George", 1.0, use_gpu=True)
-    monkeypatch.setattr(ming, "SPOKEN_CHECK", lambda wav, text: "")
+    monkeypatch.setattr(ming, "TRANSCRIBER", lambda root: object())
     assert work_folder(root, book, "UK_George", 1.0, use_gpu=True) != unchecked
     assert ming.preview_enabled() and ming.preview_note() is None  # no preview any more
 

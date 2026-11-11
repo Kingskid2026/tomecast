@@ -13,6 +13,9 @@ the checks is reused, and anything else is voiced again.
 from __future__ import annotations
 
 import hashlib
+import itertools
+import shutil
+import tempfile
 import threading
 import wave
 from collections.abc import Callable, Sequence
@@ -20,7 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Protocol
 
-from tomecast.audio import read_wav, wav_info, write_silence
+from tomecast.audio import concatenate_wavs, read_wav, wav_info, write_silence
 from tomecast.book import Book
 from tomecast.chunking import Boundary, Chunk, chunk_paragraphs
 from tomecast.packaging import (
@@ -67,6 +70,14 @@ class VoiceEngine(Protocol):
     def synthesize(self, text: str, output: Path) -> None:
         """Write ``text`` as speech to ``output`` (mono, 16-bit PCM WAV)."""
         ...
+
+
+# A listen-back check for a voice that needs one (the premium voice: tomecast.spoken_check),
+# run from the conversion loop rather than inside the engine: (the chunk's ID, its text, a way
+# to voice any text into a new WAV) -> the WAVs that make up the chunk, in reading order, which
+# are joined. When nothing fixes a chunk it raises MissingAudioError (spoken_check's
+# WordsSkippedError), which isn't retried here: the check has already run its whole plan.
+CheckedVoicing = Callable[[str, str, Callable[[str], Path]], Sequence[Path]]
 
 
 class MissingAudioError(RuntimeError):
@@ -224,6 +235,7 @@ def convert_book(
     rename: bool = True,
     format: Literal["m4b", "mp3"] = "m4b",
     prep: TextPrep | None = None,
+    checked: CheckedVoicing | None = None,
 ) -> ConversionResult:
     """Voice ``book`` with ``engine`` and write an M4B audiobook to ``output``.
 
@@ -247,6 +259,9 @@ def convert_book(
 
     ``format="mp3"`` writes a folder of MP3 files, one per chapter, at ``output`` (which is
     then the folder's name) instead of an M4B file. Everything else is the same.
+
+    ``checked`` voices each chunk through a listen-back check (:data:`CheckedVoicing`), for
+    a voice that needs one: the premium voice's :class:`~tomecast.engines.ming.SpokenTextCheck`.
     """
     warnings: list[str] = []
     cover = book.cover
@@ -291,7 +306,7 @@ def convert_book(
             if _is_reusable(wav, chunk, voice_speed, engine.sample_rate):
                 reused += 1
             elif chunk.speakable:
-                _voice_chunk(engine, chunk, wav, retries, voice_speed)
+                _voice_chunk(engine, chunk, wav, retries, voice_speed, checked)
             else:
                 partial = wav.with_name(wav.name + ".partial")
                 write_silence(partial, SCENE_BREAK_SECONDS, engine.sample_rate)
@@ -365,16 +380,27 @@ def _gap_after(chunk: Chunk, *, is_title: bool, is_last: bool) -> float:
 
 
 def _voice_chunk(
-    engine: VoiceEngine, chunk: Chunk, wav: Path, retries: int, speed: float = 1.0
+    engine: VoiceEngine,
+    chunk: Chunk,
+    wav: Path,
+    retries: int,
+    speed: float = 1.0,
+    checked: CheckedVoicing | None = None,
 ) -> None:
-    """Voice ``chunk`` into ``wav``. The file only appears once its audio passed the checks."""
+    """Voice ``chunk`` into ``wav`` (through ``checked``, if given). The file only appears
+    once its audio passed the checks, all of it, so resuming never picks up half a chunk."""
     partial = wav.with_name(wav.name + ".partial")
     problem = ""
     failure: RuntimeError | None = None  # the engine's own error, kept as the cause
     for _attempt in range(retries + 1):
         partial.unlink(missing_ok=True)
         try:
-            engine.synthesize(chunk.text, partial)
+            if checked is None:
+                engine.synthesize(chunk.text, partial)
+            else:
+                _voice_checked(engine, chunk, partial, checked)
+        except MissingAudioError:
+            raise  # the listen-back check's verdict, after its whole retry plan
         except RuntimeError as error:
             problem, failure = str(error), error
             continue
@@ -385,6 +411,26 @@ def _voice_chunk(
     partial.unlink(missing_ok=True)
     message = f"no usable audio for {chunk.id} ({chunk.text[:80]!r}): {problem}"
     raise MissingAudioError(message) from failure
+
+
+def _voice_checked(
+    engine: VoiceEngine, chunk: Chunk, output: Path, checked: CheckedVoicing
+) -> None:
+    """Voice ``chunk`` through the listen-back check into ``output``: its pieces, joined with
+    the short gap the engine's own split uses."""
+    with tempfile.TemporaryDirectory(dir=output.parent, prefix=".checked-") as folder:
+        numbers = itertools.count()
+
+        def voice(text: str) -> Path:
+            piece = Path(folder) / f"{next(numbers)}.wav"
+            engine.synthesize(text, piece)
+            return piece
+
+        pieces = list(checked(chunk.id, chunk.text, voice))
+        if len(pieces) == 1:
+            shutil.copyfile(pieces[0], output)
+        else:
+            concatenate_wavs(pieces, output, gap_seconds=0.05)
 
 
 def audio_problem(wav: Path, text: str, speed: float = 1.0) -> str:

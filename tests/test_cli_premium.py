@@ -7,13 +7,19 @@ import pytest
 from epub_factory import NavPoint, Page, build_epub
 from test_cli import FakeKokoro
 
-from tomecast import cli, machine, voices
+from tomecast import cli, machine, spoken_check, voices
 from tomecast.downloads import Asset
 from tomecast.engines import audiocpp, ming
 from tomecast.speed import Speeds
 
 # The premium voice's real file list, before the fixture below replaces it for most tests.
 real_premium_assets = ming.required_assets
+
+
+def skipped_words(text: str) -> spoken_check.WordsSkippedError:
+    """What spoken_check raises when the premium voice keeps leaving words out of ``text``."""
+    comparison = spoken_check.compare(text, " ".join(text.split()[:1]))
+    return spoken_check.WordsSkippedError("c001-p0001-s01", text, text, comparison, 6)
 
 
 class FakeMing(FakeKokoro):
@@ -54,7 +60,7 @@ class FakeMing(FakeKokoro):
 
     def synthesize(self, text: str, output: Path) -> None:
         if FakeMing.words_left_out:
-            raise ming.WordsLeftOut(f"the premium voice left out words (skipped): {text!r}")
+            raise skipped_words(text)
         if FakeMing.fail_at == self.calls + 1 and not self.fell_back:
             if self.if_card_fails == "stop":
                 raise ming.CardStopped(ming.STOPPED_NOTE)
@@ -402,7 +408,7 @@ def test_a_premium_voice_failure_never_rolls_the_engine_build_back(
     monkeypatch.setattr(cli, "roll_back", no_rollback)
     FakeMing.words_left_out = True
     assert cli.main(["convert", str(_book(tmp_path)), "--voice", "UK_George"]) == 1
-    assert "left out words" in capsys.readouterr().err
+    assert "words were missing" in capsys.readouterr().err
 
 
 def test_a_kokoro_failure_can_still_roll_the_engine_build_back(
@@ -418,3 +424,57 @@ def test_a_kokoro_failure_can_still_roll_the_engine_build_back(
     FakeKokoro.fail_with = "the voice engine failed (HTTP 500): broken"
     assert cli.main(["convert", str(_book(tmp_path))]) == 1
     assert len(rolled) == 1
+
+
+# --- The listen-back check's failures never count against the engine build ------------------
+
+
+def _never_rolled_back(monkeypatch: pytest.MonkeyPatch) -> None:
+    def no_rollback(*args: object) -> bool:
+        raise AssertionError("the listen-back check's failures must not roll a build back")
+
+    monkeypatch.setattr(cli, "roll_back", no_rollback)
+
+
+@pytest.mark.parametrize("kind", ["skipped", "uncheckable"])
+def test_the_listen_back_checks_failures_never_roll_the_build_back(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    kind: str,
+) -> None:
+    """By their type, whatever engine raised them (here a Kokoro one, where the premium-voice
+    rule wouldn't apply): WordsSkippedError, and text the check can't read."""
+    _never_rolled_back(monkeypatch)
+
+    class Failing(FakeKokoro):
+        def synthesize(self, text: str, output: Path) -> None:
+            if kind == "skipped":
+                raise skipped_words(text)
+            try:
+                raise spoken_check.UncheckableTextError("only Latin-script text so far")
+            except spoken_check.UncheckableTextError as error:
+                raise ming.UncheckablePiece(f"can't be checked: {error}") from error
+
+    monkeypatch.setattr(cli, "AutoKokoro", Failing)
+    assert cli.main(["convert", str(_book(tmp_path))]) == 1
+    err = capsys.readouterr().err
+    assert ("words were missing" if kind == "skipped" else "can't be checked") in err
+
+
+def test_a_book_the_check_cant_read_is_refused_before_anything_is_voiced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class Unreadable:
+        note = None
+
+        def uncheckable(self, texts: object) -> str:
+            return "the listen-back check only reads Latin-script text so far ('λόγος')"
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(ming, "spoken_text_check", lambda root, engine, prep: Unreadable())
+    assert cli.main(["convert", str(_book(tmp_path)), "--voice", "UK_George"]) == 1
+    assert "the premium voice can't be checked on this book" in capsys.readouterr().err
+    assert FakeKokoro.texts == []  # nothing voiced

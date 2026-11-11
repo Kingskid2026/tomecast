@@ -23,7 +23,6 @@ from tomecast.convert import (
     ConversionCancelled,
     ConversionControl,
     ConversionProgress,
-    MissingAudioError,
     convert_book,
     plan_chunks,
 )
@@ -239,16 +238,6 @@ def test_each_premium_voice_has_a_close_kokoro_voice(premium: str, kokoro: str) 
 
 
 # --- What isn't the card failing ----------------------------------------------------------------
-
-
-def test_words_left_out_fail_the_piece_and_kokoro_doesnt_take_over(
-    tmp_path: Path, fake_server: Path, book: Book
-) -> None:
-    engine = _engine(tmp_path, fake_server, verify=lambda wav, text: "skipped a word")
-    with pytest.raises(MissingAudioError, match="left out words"):
-        _convert(book, engine, tmp_path / "alice.m4b", tmp_path / "work")
-    assert engine.switched_to is None
-    assert {model for model, _, _ in _voiced(tmp_path)} == {"ming"}
 
 
 def test_an_error_the_engine_answers_with_isnt_the_card_failing(

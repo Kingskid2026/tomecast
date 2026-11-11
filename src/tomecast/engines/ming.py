@@ -21,9 +21,11 @@ Facts this module relies on, checked against audio.cpp v0.9.4 (``local/ming-test
 * output is 44.1 kHz mono 16-bit;
 * **it skips words** in about 1-2% of text (whole repeated phrases, mostly), the same words
   whatever the seed, guidance or thread count, and audio that's merely shorter isn't caught
-  by :func:`~tomecast.convert.audio_problem`. So every chunk goes through a spoken-text
-  check (:data:`SpokenCheck`, the hook a speech-recognition check plugs into), and a chunk
-  that fails is voiced again in smaller pieces, each checked again.
+  by :func:`~tomecast.convert.audio_problem`. So every chunk goes through the listen-back
+  check (:mod:`tomecast.spoken_check`, :class:`SpokenTextCheck` here), called from the
+  conversion loop and never from inside the engine: it voices a failing chunk again with a
+  new seed, then in smaller pieces, and if nothing fixes it, does what :data:`Unfixable` says
+  (stop, by default).
 
 **If the graphics card fails** (it runs out of memory, the device is lost, or the engine
 build won't run on it, as the book starts or partway), :class:`AutoMing` does what
@@ -42,7 +44,7 @@ None of these counts against the engine build: no rollback, no "keeps crashing".
 the engine *answers* with (an HTTP error about the text), and the spoken-text check failing,
 aren't the card failing: they fail the piece as before.
 
-**A preview, for now.** Until a spoken-text check is plugged in (:data:`SPOKEN_CHECK`), the
+**A preview, for now.** Until a recogniser is plugged in (:data:`TRANSCRIBER`), the
 premium voices are offered only to someone who opts into the preview by setting
 ``TOMECAST_PREMIUM_PREVIEW=1`` (:func:`preview_enabled`): the window, ``tomecast voices``, the
 scan's recommendation and language routing leave them out otherwise, and ``--voice
@@ -55,12 +57,13 @@ from __future__ import annotations
 
 import os
 import tempfile
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from pathlib import Path
 from typing import Literal
 
-from tomecast.audio import concatenate_wavs
-from tomecast.chunking import Chunk, split_long
+from tomecast import spoken_check
+from tomecast.chunking import Chunk
+from tomecast.convert import MissingAudioError
 from tomecast.downloads import Asset, IsCancelled, VoiceCheck, local_path
 from tomecast.engines import audiocpp
 from tomecast.engines.audiocpp import (
@@ -74,6 +77,8 @@ from tomecast.engines.audiocpp import (
     self_check,
 )
 from tomecast.manifest import AUDIOCPP_MING_FLOW_STEPS, MING_Q8
+from tomecast.pronunciations import respelling
+from tomecast.textprep import TextPrep
 
 # Ming's built-in voices. The default is UK_George, which upstream labels "audiobooks"
 # (US_Emma: "narration"); the maintainer chose it (issue #11).
@@ -112,19 +117,20 @@ MAX_SPEED = 2.0  # all of it is the packager's atempo, which goes up to 2.0
 # Euler steps measured 6.5x real time against 4.2x for upstream's 10 on CUDA, with the closest
 # spectrum of every reduced setting and words lost within a chunk or two of the default.
 FLOW_SETTINGS = {"AUDIOCPP_MING_FLOW_STEPS": "5", "AUDIOCPP_MING_FLOW_SCHEDULE": "uniform"}
-# A chunk that fails the spoken-text check is split in halves at most this many times over
-# (200 characters -> about 100 -> about 50), and pieces shorter than this aren't split again.
-MAX_SPLIT_DEPTH = 2
-MIN_SPLIT_CHARS = 24
+# The recogniser the listen-back check uses: (the data folder) -> a spoken_check.Transcriber.
+# None until it's wired in: pinning Moonshine Streaming Tiny and running it on a CPU audio.cpp
+# server is the follow-up (docs/spoken-check.md, "Wiring it in"). Setting it is the one
+# switch: every premium-voice book is then checked (spoken_text_check), the preview opt-in and
+# the notes below are no longer needed, and the work folder's key changes, so pieces voiced
+# without the check are never reused as if they had been checked.
+TRANSCRIBER: Callable[[Path], spoken_check.Transcriber] | None = None
 
-# The hook for the spoken-text check: (a chunk's WAV, the text it should say) -> "" if every
-# word was heard, else a short description of what's missing ("skipped 'and the Queen'").
-SpokenCheck = Callable[[Path, str], str]
-# The speech-recognition check every premium-voice engine gets (being built separately, as
-# spoken_check). Setting it is the one switch: the engines use it (tomecast.voices.make_engine),
-# the preview opt-in and the notes below are no longer needed, and the work folder's key
-# changes, so pieces voiced without the check are never reused as if they had been checked.
-SPOKEN_CHECK: SpokenCheck | None = None
+# What happens to a chunk the premium voice still leaves words out of after every retry
+# (spoken_check's on_unfixable): "stop", the default, stops the book with the error (the audio
+# made so far is kept); "kokoro" has the closest Kokoro voice read that one chunk, and says so.
+# Not decided yet (Ambrose): this is the one argument that chooses.
+Unfixable = Literal["stop", "kokoro"]
+DEFAULT_UNFIXABLE: Unfixable = "stop"
 
 # Until then, the premium voices are a preview that has to be asked for.
 PREVIEW_ENV = "TOMECAST_PREMIUM_PREVIEW"
@@ -141,15 +147,15 @@ CAPPED_NOTE = "The premium voice goes up to 2\u00d7, so this book is made at 2\u
 
 
 def preview_enabled() -> bool:
-    """Whether the premium voices are offered: always once a spoken-text check is plugged in
-    (:data:`SPOKEN_CHECK`), and until then only to someone who opted into the preview by
-    setting ``TOMECAST_PREMIUM_PREVIEW=1``."""
-    return SPOKEN_CHECK is not None or os.environ.get(PREVIEW_ENV) == "1"
+    """Whether the premium voices are offered: always once the listen-back check has a
+    recogniser (:data:`TRANSCRIBER`), and until then only to someone who opted into the
+    preview by setting ``TOMECAST_PREMIUM_PREVIEW=1``."""
+    return TRANSCRIBER is not None or os.environ.get(PREVIEW_ENV) == "1"
 
 
 def preview_note() -> str | None:
-    """The sentence said before a premium-voice book while it has no spoken-text check."""
-    return UNCHECKED_NOTE if SPOKEN_CHECK is None else None
+    """The sentence said before a premium-voice book while it isn't checked."""
+    return UNCHECKED_NOTE if TRANSCRIBER is None else None
 
 
 def capped_speed(speed: float) -> float:
@@ -164,9 +170,25 @@ CPU_NOTE = (
 STOPPED_NOTE = "The graphics card stopped working, so Tomecast stopped."
 
 
-class WordsLeftOut(EngineError):
-    """The spoken-text check still heard words missing after re-splitting: the piece fails
-    (it isn't the graphics card failing)."""
+class UncheckablePiece(MissingAudioError):
+    """A chunk the listen-back check can't read (mostly another script): it isn't voiced at
+    all rather than going unchecked. Like spoken_check's WordsSkippedError, it's the premium
+    voice's problem, never the engine build's (:func:`not_the_builds_fault`)."""
+
+
+def not_the_builds_fault(error: BaseException) -> bool:
+    """True for failures that belong to the premium voice and its listen-back check, never to
+    the shared engine build: words it kept leaving out (``WordsSkippedError``), and text the
+    check can't read (``UncheckableTextError``, :class:`UncheckablePiece`), however they reach
+    the caller (a conversion's ``MissingAudioError`` keeps them as its cause). They never roll
+    a build back or count against it."""
+    premium = (spoken_check.WordsSkippedError, spoken_check.UncheckableTextError, UncheckablePiece)
+    seen: BaseException | None = error
+    while seen is not None:
+        if isinstance(seen, premium):
+            return True
+        seen = seen.__cause__
+    return False
 
 
 class CardStopped(Exception):
@@ -256,7 +278,7 @@ def work_key(voice: str) -> str:
         if steps
         else "default"
     )
-    checked = "on" if SPOKEN_CHECK is not None else "off"
+    checked = "on" if TRANSCRIBER is not None else "off"
     return f"{MODEL_ID}/{voice}/flow={flow}/spoken-check={checked}"
 
 
@@ -269,8 +291,8 @@ def _checked_speed(speed: float) -> float:
 class MingServer(KokoroServer):
     """A running audio.cpp server with Ming loaded. Use it as a context manager.
 
-    ``language`` is the book's language (a code from :data:`LANGUAGES`), ``verify`` the
-    spoken-text check run on every chunk (``None``: no check yet).
+    ``language`` is the book's language (a code from :data:`CHECKED_LANGUAGES`). The listen-back
+    check isn't in here: the conversion loop runs it (:class:`SpokenTextCheck`).
     """
 
     MODEL_ID = MODEL_ID
@@ -281,7 +303,6 @@ class MingServer(KokoroServer):
         *,
         voice: str = DEFAULT_VOICE,
         language: str = "en",
-        verify: SpokenCheck | None = None,
         speed: float = 1.0,
         **kwargs: object,
     ) -> None:
@@ -295,7 +316,6 @@ class MingServer(KokoroServer):
         self.voice = voice  # after Kokoro's set-up, which only knows Kokoro's voices
         self.premium_voice = voice  # kept when Kokoro takes over (AutoMing)
         self.language = language
-        self.verify = verify
         # Set once Kokoro has taken over from the premium voice (the graphics card failed):
         # from then on this server runs Kokoro, with this voice, as KokoroServer does.
         self.switched_to: str | None = None
@@ -346,34 +366,6 @@ class MingServer(KokoroServer):
         if self.switched_to is not None:
             return super().builds
         return {self._build.slot: self.executable.parent}
-
-    def synthesize(self, text: str, output: Path) -> None:
-        """Voice ``text`` into ``output`` (44.1 kHz mono 16-bit WAV), checked by ``verify``.
-        Once Kokoro has taken over, Kokoro voices it (24 kHz), unchecked: it doesn't skip."""
-        if self.switched_to is not None:
-            super().synthesize(text, output)
-            return
-        self._synthesize_checked(text, output, depth=0)
-
-    def _synthesize_checked(self, text: str, output: Path, *, depth: int) -> None:
-        super().synthesize(text, output)
-        if self.verify is None:
-            return
-        problem = self.verify(output, text)
-        if not problem:
-            return
-        # The same text skips the same words again, so a retry has to change the text: voice
-        # it in smaller pieces, each checked, and join them.
-        if depth >= MAX_SPLIT_DEPTH or len(text) < MIN_SPLIT_CHARS:
-            raise WordsLeftOut(f"the premium voice left out words ({problem}): {text[:80]!r}")
-        parts = split_long(text, max(1, len(text) // 2))
-        with tempfile.TemporaryDirectory(dir=output.parent, prefix=".checked-") as folder:
-            wavs = []
-            for index, part in enumerate(parts):
-                wav = Path(folder) / f"{index}.wav"
-                self._synthesize_checked(part, wav, depth=depth + 1)
-                wavs.append(wav)
-            concatenate_wavs(wavs, output, gap_seconds=0.05)
 
     def _request_body(self, text: str) -> dict[str, object]:
         if self.switched_to is not None:
@@ -530,6 +522,154 @@ class AutoMing(MingServer, AutoKokoro):
 class _CardFailed(GpuUnavailable):
     """The card ran out of memory partway under the premium voice, and the user's choice
     isn't to carry on with it on the CPU (raised inside :class:`AutoMing` only)."""
+
+
+# --- The listen-back check, from the conversion loop -------------------------------------------
+
+
+class SpokenTextCheck:
+    """The listen-back check for one premium-voice book (docs/spoken-check.md). It's handed to
+    :func:`tomecast.convert.convert_book` as ``checked`` and called from the conversion loop
+    for every chunk, never from inside the engine (where convert's own retry would run its
+    whole plan again). Use it as a context manager, or call :meth:`close`.
+
+    For each chunk it runs :func:`tomecast.spoken_check.speak_checked`: voice and listen; if
+    words are missing, a new seed, then smaller pieces, each checked. The engine's seed is set
+    for each request and put back. Once Kokoro has taken over from the premium voice (the card
+    failed), chunks are voiced once and not checked: Kokoro doesn't skip words.
+
+    When nothing fixes a chunk, ``on_unfixable`` decides (:data:`Unfixable`): ``"stop"`` (the
+    default) raises spoken_check's ``WordsSkippedError``, a ``MissingAudioError``, so the book
+    stops and keeps what it made; ``"kokoro"`` has the closest Kokoro voice read that whole
+    chunk (on the CPU of the same engine build, started when first needed, so the card's
+    memory stays the premium voice's), checks it too, and :attr:`note` says so. Text the check
+    can't read raises :class:`UncheckablePiece` before anything is voiced; check the whole book
+    first with :meth:`uncheckable`.
+    """
+
+    def __init__(
+        self,
+        engine: MingServer,
+        listener: spoken_check.Listener,
+        *,
+        on_unfixable: Unfixable = DEFAULT_UNFIXABLE,
+        plan: spoken_check.RetryPlan = spoken_check.DEFAULT_PLAN,
+    ) -> None:
+        self._engine = engine
+        self._listener = listener
+        self._plan = plan
+        self.on_unfixable: Unfixable = on_unfixable
+        self.read_by_kokoro: list[str] = []  # chunk IDs Kokoro read instead ("kokoro")
+        self._kokoro: KokoroServer | None = None
+        self._scratch: tempfile.TemporaryDirectory[str] | None = None
+
+    def __enter__(self) -> SpokenTextCheck:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    def uncheckable(self, texts: Iterable[str]) -> str:
+        """Why the check can't read one of ``texts`` (the book's chunks), or "" if it can
+        read them all: so a book is refused before it starts, not at that chunk."""
+        for text in texts:
+            if reason := spoken_check.uncheckable(text):
+                return reason
+        return ""
+
+    def __call__(self, chunk_id: str, text: str, voice: Callable[[str], Path]) -> list[Path]:
+        """The WAVs that make up the chunk, in reading order (convert joins them).
+        ``voice(text)`` voices any text into a new WAV with the engine as it is now."""
+        if self._engine.switched_to is not None:  # Kokoro took over: it doesn't skip
+            return [voice(text)]
+
+        def seeded(piece: str, seed: int) -> Path:
+            previous = self._engine.seed
+            self._engine.seed = seed
+            try:
+                return voice(piece)
+            finally:
+                self._engine.seed = previous
+
+        strategy: spoken_check.OnUnfixable = spoken_check.stop
+        if self.on_unfixable == "kokoro":
+            strategy = spoken_check.UseOtherVoice(
+                self._read_with_kokoro, voice="Kokoro", listener=self._listener
+            )
+        try:
+            checked = spoken_check.speak_checked(
+                chunk_id, text, seeded, self._listener, seed=self._engine.seed,
+                plan=self._plan, on_unfixable=strategy,
+            )  # fmt: skip
+        except spoken_check.UncheckableTextError as error:
+            raise UncheckablePiece(
+                f"the premium voice can't be checked on {chunk_id} ({text[:80]!r}): {error}"
+            ) from error
+        if checked.fallback is not None:
+            self.read_by_kokoro.append(chunk_id)
+        return [piece.wav for piece in checked.pieces]
+
+    @property
+    def note(self) -> str | None:
+        """What to tell the user when Kokoro read some chunks instead ("kokoro")."""
+        if not self.read_by_kokoro:
+            return None
+        _voice, name, accent = KOKORO_MATCH[self._engine.premium_voice]
+        count = len(self.read_by_kokoro)
+        pieces = "piece" if count == 1 else "pieces"
+        return (
+            f"Kokoro's {name} (similar {accent} voice) read {count} {pieces} of text the premium "
+            "voice kept leaving words out of."
+        )
+
+    def _read_with_kokoro(self, text: str) -> Path:
+        if self._kokoro is None:
+            self._scratch = tempfile.TemporaryDirectory(prefix="tomecast-kokoro-")
+            self._kokoro = KokoroServer(
+                self._engine._root,
+                voice=KOKORO_MATCH[self._engine.premium_voice][0],
+                speed=1.0,  # as the premium voice: the whole book is stretched afterwards
+                executable=self._engine.executable,  # the same build, on its CPU backend
+                backend="cpu",
+                builds=self._engine._pinned,
+                threads=self._engine.threads,
+            )
+            self._kokoro.start()
+        assert self._scratch is not None
+        wav = Path(self._scratch.name) / f"{len(self.read_by_kokoro)}-{abs(hash(text))}.wav"
+        self._kokoro.synthesize(text, wav)
+        return wav
+
+    def close(self) -> None:
+        """Stop the Kokoro engine started for "kokoro", if any, and remove its files."""
+        if self._kokoro is not None:
+            self._kokoro.close()
+            self._kokoro = None
+        if self._scratch is not None:
+            self._scratch.cleanup()
+            self._scratch = None
+
+
+def spoken_text_check(
+    root: Path,
+    engine: object,
+    *,
+    prep: TextPrep,
+    on_unfixable: Unfixable = DEFAULT_UNFIXABLE,
+) -> SpokenTextCheck | None:
+    """The listen-back check for a book voiced by ``engine`` with the text prep ``prep``, or
+    ``None``: for Kokoro (it doesn't skip words), and while there's no recogniser yet
+    (:data:`TRANSCRIBER`). The transcript goes through the book's language rules before it's
+    compared (so "1865" matches "eighteen sixty-five"), and the spoken sides of its
+    pronunciation lists count as heard when anything was heard in their place."""
+    if TRANSCRIBER is None or not isinstance(engine, MingServer):
+        return None
+    listener = spoken_check.Listener(
+        TRANSCRIBER(root),
+        prepare_heard=TextPrep(prep.rules).body,  # the language's rules, without the fixes
+        respellings=tuple(respelling(entry.spoken) for entry in prep.pronunciations.entries),
+    )
+    return SpokenTextCheck(engine, listener, on_unfixable=on_unfixable)
 
 
 def ming_check(root: Path, use_gpu: bool, cancelled: IsCancelled | None = None) -> VoiceCheck:

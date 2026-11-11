@@ -3340,3 +3340,38 @@ def test_a_routed_book_above_2x_is_made_at_2x_and_says_so(
     assert backend.screen == "done"
     assert [(e.voice, e.speed) for e in engines.made] == [("UK_George", 2.0)]
     assert ming.CAPPED_NOTE in backend.warnings
+
+
+class _SkipsWords(FakeEngine):
+    """A fake engine whose listen-back check gives up on the first piece."""
+
+    def synthesize(self, text: str, output: Path) -> None:
+        from tomecast import spoken_check
+
+        comparison = spoken_check.compare(text, "")
+        raise spoken_check.WordsSkippedError("c000-p0000-s00", text, text, comparison, 6)
+
+
+def test_words_the_listen_back_check_kept_missing_never_roll_the_build_back(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    """The failure that rolls a just-switched build back
+    (test_an_update_that_fails_on_the_book_is_rolled_back) doesn't when it's the listen-back
+    check's WordsSkippedError: that's the voice's, by its type, whatever engine raised it."""
+    asset, _legacy = _engine_update(tmp_path)
+    engines = Engines()
+
+    def factory(root: Path, voice: str, speed: float, use_gpu: bool = False) -> FakeEngine:
+        engine = _SkipsWords(engines, voice, speed, use_gpu)
+        engines.made.append(engine)
+        return engine
+
+    backend = make_backend(factory, assets=(asset,), engine_check=lambda r, g, c: lambda n, o: None)
+    _open(qtbot, backend, _short_book(tmp_path))
+    _convert(qtbot, backend)
+
+    assert backend.screen == "voice"
+    assert "words were missing" in backend.errorMessage
+    assert "didn't work on this computer" not in backend.errorMessage
+    new_build = tmp_path / "data" / asset.path / asset.sha256[:12]
+    assert build_in_use(asset, tmp_path / "data") == new_build  # kept, not rolled back

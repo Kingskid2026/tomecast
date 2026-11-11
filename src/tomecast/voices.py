@@ -237,8 +237,9 @@ def make_engine(
     premium: Callable[..., AutoKokoro] = ming.AutoMing,
 ) -> AutoKokoro:
     """The engine for ``voice``, not started: the one place an engine is made, so a premium
-    voice always gets the spoken-text check (:data:`~tomecast.engines.ming.SPOKEN_CHECK`),
-    the speed cap and the language it may read. :class:`~tomecast.engines.ming.AutoMing`
+    voice always gets the speed cap and the language it may read. (Its listen-back check
+    isn't part of the engine: the conversion loop runs it, from
+    :func:`~tomecast.engines.ming.spoken_text_check`.) :class:`~tomecast.engines.ming.AutoMing`
     for a premium voice (told to speak ``language``, doing ``if_card_fails`` if the card
     fails), else :class:`~tomecast.engines.audiocpp.AutoKokoro`. ``kokoro`` and ``premium``
     are the classes to make (the command line passes its own names, which its tests replace).
@@ -250,7 +251,6 @@ def make_engine(
             speed=ming.capped_speed(speed),
             use_gpu=use_gpu,
             language=language if language in ming.CHECKED_LANGUAGES else "en",
-            verify=ming.SPOKEN_CHECK,
             builds=builds,
             threads=threads,
             if_card_fails=if_card_fails,

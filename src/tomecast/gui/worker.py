@@ -715,8 +715,15 @@ class ConversionWorker(QObject):
             # Nor after a premium-voice run: what fails under the premium voice (words left
             # out, an error its model answers with) is that voice's, not the shared build's,
             # which Kokoro's own check judges; and when the card failed it fell back anyway.
-            blameless = stopped or (
-                engine is not None and (engine.out_of_memory or isinstance(engine, ming.MingServer))
+            # And never for words the listen-back check kept hearing missing, or text it can't
+            # read: those are the premium voice's, whatever engine raised them.
+            blameless = (
+                stopped
+                or ming.not_the_builds_fault(error)
+                or (
+                    engine is not None
+                    and (engine.out_of_memory or isinstance(engine, ming.MingServer))
+                )
             )
             if failed_voicing and builds and not blameless and self._roll_back(job, builds, error):
                 message += f" {UPDATE_FAILED_NOTE} Start again to make the book with it."
@@ -774,6 +781,17 @@ class ConversionWorker(QObject):
         position = ming.BookPosition(chunks)
         if isinstance(engine, ming.AutoMing):
             engine.where = position.where
+        # The premium voice's listen-back check, run by the conversion loop (None for Kokoro,
+        # and until a recogniser is wired in). A book it can't read is refused before anything
+        # is voiced; like words it keeps hearing missing, that never counts against the build.
+        check = ming.spoken_text_check(self._root, engine, prep=prep)
+        if check is not None and (
+            reason := check.uncheckable(c.text for c in chunks if c.speakable)
+        ):
+            check.close()
+            raise ming.UncheckablePiece(
+                f"the premium voice can't be checked on this book: {reason}"
+            )
 
         try:
             engine.start()
@@ -794,10 +812,13 @@ class ConversionWorker(QObject):
             result = convert_book(
                 job.book, meter, job.output, workdir=workdir, progress=report, control=control,
                 chapters=job.chapters, overwrite=False, format=job.format, prep=prep,
+                checked=check,
             )  # fmt: skip
             taken = time.monotonic() - started - (control.paused_seconds - paused_before)
         finally:
             engine.close()
+            if check is not None:
+                check.close()
         return ConvertResult(
             output=result.output,  # not job.output if that name was taken meanwhile
             audio_seconds=result.chapters[-1].end_seconds if result.chapters else 0.0,
@@ -807,6 +828,7 @@ class ConversionWorker(QObject):
             warnings=(
                 *install_notes,
                 *((engine.warning,) if engine.warning else ()),
+                *((check.note,) if check is not None and check.note else ()),
                 *result.warnings,
                 *(_as_sentence(f"Pronunciation list: {note}") for note in notes),
             ),

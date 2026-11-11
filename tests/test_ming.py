@@ -10,7 +10,7 @@ from epub_factory import NavPoint, Page, build_epub
 from fake_engine import write_fake_server
 
 from tomecast.audio import wav_info
-from tomecast.convert import MissingAudioError, convert_book, plan_chunks
+from tomecast.convert import convert_book, plan_chunks
 from tomecast.engines import ming
 from tomecast.engines.audiocpp import AUDIOCPP_CPU, AUDIOCPP_VULKAN, EngineError
 from tomecast.engines.ming import AutoMing, MingServer
@@ -159,44 +159,12 @@ def test_all_of_the_speed_is_the_packagers_stretch(tmp_path: Path, fake_server: 
         engine.speed = 3.0
 
 
-# --- The spoken-text check -----------------------------------------------------------------
-
-
-def test_a_chunk_that_fails_the_check_is_voiced_again_in_checked_pieces(
-    tmp_path: Path, fake_server: Path
-) -> None:
-    checked: list[str] = []
-
-    def skips_long_text(wav: Path, text: str) -> str:
-        checked.append(text)
-        return "skipped 'and of having'" if len(text) > 100 else ""
-
-    output = tmp_path / "out.wav"
-    with _server(tmp_path, fake_server, verify=skips_long_text) as engine:
-        engine.synthesize(LONG, output)
-
-    voiced = _voiced(tmp_path)
-    assert voiced[0] == LONG  # tried whole first
-    pieces = voiced[1:]
-    assert len(pieces) >= 2
-    assert all(len(piece) <= 100 for piece in pieces)
-    assert " ".join(pieces) == LONG  # nothing lost in the split
-    assert checked == voiced  # every piece was checked
-    # The joined audio holds every piece.
-    assert wav_info(output).seconds >= sum(len(p) for p in pieces) / 15 - 0.01
-
-
-def test_a_chunk_that_keeps_failing_fails_loudly(tmp_path: Path, fake_server: Path) -> None:
-    with (
-        _server(tmp_path, fake_server, verify=lambda wav, text: "skipped a word") as engine,
-        pytest.raises(EngineError, match="left out words"),
-    ):
-        engine.synthesize(LONG, tmp_path / "out.wav")
+# --- A whole book ----------------------------------------------------------------------
 
 
 def test_every_sentence_of_a_book_is_voiced_by_ming(tmp_path: Path, fake_server: Path) -> None:
-    """The same guarantees as Kokoro: size-capped chunks, the trailing fragment kept, and a
-    book whose check never passes is never shipped."""
+    """The same guarantees as Kokoro: size-capped chunks, and the trailing fragment kept.
+    (The listen-back check runs from the conversion loop: tests/test_spoken_text_check.py.)"""
     path = build_epub(
         tmp_path / "story.epub",
         [
@@ -207,7 +175,7 @@ def test_every_sentence_of_a_book_is_voiced_by_ming(tmp_path: Path, fake_server:
         title="A Story",
     )
     book = read_book(path)
-    with _server(tmp_path, fake_server, verify=lambda wav, text: "") as engine:
+    with _server(tmp_path, fake_server) as engine:
         result = convert_book(book, engine, tmp_path / "story.m4b", workdir=tmp_path / "work")
     assert result.output.is_file()
     voiced = " ".join(_voiced(tmp_path))
@@ -219,13 +187,6 @@ def test_every_sentence_of_a_book_is_voiced_by_ming(tmp_path: Path, fake_server:
     wavs = list((tmp_path / "work" / "chunks").glob("*.wav"))
     assert wavs
     assert {wav_info(wav).sample_rate for wav in wavs} == {44_100}
-
-    with (
-        _server(tmp_path, fake_server, verify=lambda wav, text: "skipped") as engine,
-        pytest.raises(MissingAudioError),
-    ):
-        convert_book(book, engine, tmp_path / "again.m4b", workdir=tmp_path / "work-2")
-    assert not (tmp_path / "again.m4b").exists()
 
 
 # --- Hardware ------------------------------------------------------------------------------
@@ -264,26 +225,3 @@ def test_ming_checks_a_new_engine_build_with_its_own_voice(tmp_path: Path) -> No
     check = ming.ming_check(tmp_path / "data", use_gpu=False)
     assert check.name == "Ming"
     assert check.uses == frozenset({AUDIOCPP_CPU.slot})
-
-
-def test_a_piece_split_twice_over_still_says_every_word(tmp_path: Path, fake_server: Path) -> None:
-    """The check fails the whole piece and its halves, and passes the quarters: every
-    quarter is voiced and checked, in order, and they join into the piece's audio."""
-    checked: list[str] = []
-
-    def passes_short_pieces(wav: Path, text: str) -> str:
-        checked.append(text)
-        return "skipped words" if len(text) > 50 else ""
-
-    output = tmp_path / "out.wav"
-    with _server(tmp_path, fake_server, verify=passes_short_pieces) as engine:
-        engine.synthesize(LONG, output)
-
-    voiced = _voiced(tmp_path)
-    assert checked == voiced  # every voicing was checked, at every depth
-    halves = [text for text in voiced[1:] if len(text) > 50]
-    quarters = [text for text in voiced if len(text) <= 50]
-    assert voiced[0] == LONG
-    assert len(halves) >= 2  # depth 1 failed too
-    assert " ".join(quarters) == LONG  # depth 2: nothing lost or repeated
-    assert wav_info(output).seconds >= sum(len(q) for q in quarters) / 15 - 0.01

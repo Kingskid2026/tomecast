@@ -433,6 +433,14 @@ def _convert(args: argparse.Namespace) -> int:
             position = ming.BookPosition(plan)  # which chapters a premium-voice note names
             if isinstance(engine, AutoMing):
                 engine.where = position.where
+            # The premium voice's listen-back check, run by the conversion loop (None for
+            # Kokoro, and until a recogniser is wired in). A book it can't read is refused
+            # before anything is voiced.
+            check = ming.spoken_text_check(root, engine, prep=prep)
+            if check is not None:
+                stack.callback(check.close)
+                if reason := check.uncheckable(c.text for c in plan if c.speakable):
+                    raise CliError(f"the premium voice can't be checked on this book: {reason}")
             with engine as running:
                 print(_hardware_line(running, args.gpu))
 
@@ -493,6 +501,7 @@ def _convert(args: argparse.Namespace) -> int:
                     # made (another run's, say) is never replaced: the run stops instead.
                     overwrite=args.force,
                     rename=False,
+                    checked=check,
                 )
         except KeyboardInterrupt:
             progress.finish()
@@ -515,8 +524,10 @@ def _convert(args: argparse.Namespace) -> int:
             # Nor after a premium-voice run: what fails under the premium voice (words left out,
             # an error its model answers with) is that voice's, not the engine build's, which
             # Kokoro's own check judges; and when the card failed it fell back anyway.
-            blameless = engine is not None and (
-                engine.out_of_memory or isinstance(engine, AutoMing)
+            # And never for words the listen-back check kept hearing missing, or text it can't
+            # read: those are the premium voice's, whatever engine raised them.
+            blameless = ming.not_the_builds_fault(error) or (
+                engine is not None and (engine.out_of_memory or isinstance(engine, AutoMing))
             )
             if not blameless and roll_back(root, builds, str(error)):
                 raise CliError(f"{error}\nNote: {UPDATE_FAILED_NOTE} {AGAIN_NOTE}") from error
@@ -536,6 +547,8 @@ def _convert(args: argparse.Namespace) -> int:
 
     for warning in result.warnings:
         print(f"Note: {warning}")
+    if check is not None and check.note:  # Kokoro read chunks the premium voice kept skipping
+        print(f"Note: {check.note}")
     if result.reused_chunks:
         print(f"Picked up where the last run stopped ({_plural(result.reused_chunks, 'piece')}).")
     length = result.chapters[-1].end_seconds if result.chapters else 0.0
