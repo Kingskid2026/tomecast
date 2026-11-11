@@ -9,6 +9,8 @@ import shutil
 import tarfile
 import threading
 import time
+import urllib.parse
+import urllib.request
 import zipfile
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
@@ -53,6 +55,11 @@ from tomecast.oslayer import FileLock
 
 def _relative(path: Path, root: Path) -> str:
     return path.relative_to(root).as_posix()
+
+
+def _source(asset: Asset) -> Path:
+    """The local file a test asset's ``file://`` URL points at (``file:///C:/...`` on Windows)."""
+    return Path(urllib.request.url2pathname(urllib.parse.urlparse(asset.url).path))
 
 
 def _install_lock_held(root: Path) -> FileLock:
@@ -163,6 +170,7 @@ def test_archives_that_escape_their_folder_are_refused(tmp_path: Path) -> None:
     assert not (root / "engines" / "evil").exists()
 
 
+@pytest.mark.posix_only  # XDG is Linux's; tests/test_oslayer.py covers Windows
 def test_data_dir_follows_xdg(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
     assert data_dir() == tmp_path / "tomecast"
@@ -314,7 +322,7 @@ def test_a_failed_build_is_not_downloaded_or_checked_again_by_this_version(
     old, new = _build(tmp_path, "v1"), _build(tmp_path, "v2")
     prepare([old], root, check=Check())
     prepare([new], root, check=Check("broken"))
-    Path(new.url.removeprefix("file://")).unlink()  # a second download would fail now
+    _source(new).unlink()  # a second download would fail now
     check = Check()
 
     prepared = prepare([new], root, check=check)
@@ -840,7 +848,7 @@ def test_an_older_tomecast_without_its_own_build_uses_the_newer_one(
     prepare([theirs], root, check=Check())
     monkeypatch.setattr(downloads, "__version__", "0.2.0")
     ours = _build(tmp_path, "ours")
-    Path(ours.url.removeprefix("file://")).unlink()  # a download would fail
+    _source(ours).unlink()  # a download would fail
 
     prepared = prepare([ours], root, check=Check())
 
