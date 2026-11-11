@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/Kingskid2026/tomecast/compare/v0.2.0...v0.2.1) (2026-11-11)
+
+
+### Documentation
+
+* mark 0.2.0 as released in the README roadmap ([#78](https://github.com/Kingskid2026/tomecast/issues/78)) ([daed18e](https://github.com/Kingskid2026/tomecast/commit/daed18eadcd774a33d1b3541c27f298e15c9834c))
+
 ## [0.2.0](https://github.com/Kingskid2026/tomecast/compare/v0.1.2...v0.2.0) (2026-11-11)
 
 

@@ -1,6 +1,6 @@
 [project]
 name = "tomecast"
-version = "0.2.0"
+version = "0.2.1"
 description = "Turn ebooks into audiobooks on Linux with local, human-sounding voices."
 readme = "README.md"
 license = "Apache-2.0"
