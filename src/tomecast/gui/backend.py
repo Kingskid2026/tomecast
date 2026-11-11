@@ -31,15 +31,16 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import QDesktopServices, QGuiApplication
 
+from tomecast import voices
 from tomecast.book import Book
 from tomecast.chunking import split_sentences
 from tomecast.cleanup import CleanupOptions, clean
 from tomecast.downloads import Asset, build_in_use, data_dir, needs_download
+from tomecast.engines import ming
 from tomecast.engines.audiocpp import (
     DEFAULT_VOICE,
     VOICES,
     check_system,
-    required_assets,
     stop_all_engines,
 )
 from tomecast.gui.fixes import BadFix, FixLists, FixNotSaved, Scope
@@ -91,6 +92,11 @@ DOWNLOAD_NOTE = "STARTING DOWNLOADS THE VOICE ONCE · {mb} MB"
 # When everything missing is a newer build of an engine that's installed (Start checks it
 # before using it, and keeps the old one if it doesn't work here).
 UPDATE_NOTE = "STARTING DOWNLOADS A VOICE ENGINE UPDATE · {mb} MB"
+# When the premium voice is among the missing files (it's opt-in: Start with a premium voice
+# chosen is the asking).
+PREMIUM_DOWNLOAD_NOTE = (
+    "STARTING DOWNLOADS THE PREMIUM VOICE ONCE · {mb} MB · NEEDS A GRAPHICS CARD"
+)
 # The "Use graphics card" note, with and without a measured speed-up (the card counts as
 # faster from 1.05 times the CPU's speed).
 GPU_NOTE_ON = "FASTER · USES THE DRIVER ALREADY INSTALLED"
@@ -107,6 +113,12 @@ VOICE_GROUPS = (
     ("am", "AMERICAN · MALE"),
     ("bf", "BRITISH · FEMALE"),
     ("bm", "BRITISH · MALE"),
+)
+# The premium voices (Ming), shown after Kokoro's only when there's a graphics card. Their
+# names say the accent; British first, since UK_George is the provisional default (#11).
+PREMIUM_GROUPS = (
+    ("UK", "PREMIUM · BRITISH"),
+    ("US", "PREMIUM · AMERICAN"),
 )
 _VOICE_ORDER = (
     "af_heart", "af_bella", "af_nicole", "af_sarah", "af_sky", "af_nova", "af_river",
@@ -129,14 +141,20 @@ def _field(kind: Any, name: str, notify: Signal) -> Any:
     return Property(kind, lambda self: getattr(self, f"_{name}"), notify=notify)
 
 
-def voice_groups() -> list[dict[str, Any]]:
-    """The voice menu: American and British English, grouped by accent and gender."""
+def voice_groups(premium: bool = False) -> list[dict[str, Any]]:
+    """The voice menu: American and British English, grouped by accent and gender, then the
+    premium voices (Ming) by accent when ``premium`` (a graphics card is there to use)."""
     groups: list[dict[str, Any]] = []
     for prefix, label in VOICE_GROUPS:
         ids = [voice for voice in VOICES if voice.startswith(f"{prefix}_")]
         ids.sort(key=lambda v: (_VOICE_ORDER.index(v) if v in _VOICE_ORDER else 99, v))
-        voices = [{"id": voice, "name": voice.split("_", 1)[1].capitalize()} for voice in ids]
-        groups.append({"label": label, "voices": voices})
+        names = [{"id": voice, "name": voice.split("_", 1)[1].capitalize()} for voice in ids]
+        groups.append({"label": label, "voices": names})
+    if premium:
+        for prefix, label in PREMIUM_GROUPS:
+            ids = [voice for voice in ming.VOICES if voice.startswith(f"{prefix}_")]
+            names = [{"id": voice, "name": voice.split("_", 1)[1]} for voice in ids]
+            groups.append({"label": label, "voices": names})
     return groups
 
 
@@ -149,9 +167,9 @@ def _as_bool(value: object, *, default: bool) -> bool:
 
 
 def voice_label(voice: str) -> str:
-    """``"HEART · AMERICAN · FEMALE"``."""
+    """``"HEART · AMERICAN · FEMALE"``, or ``"GEORGE · PREMIUM · BRITISH"``."""
     prefix, _, name = voice.partition("_")
-    group = dict(VOICE_GROUPS).get(prefix)
+    group = dict(PREMIUM_GROUPS if ming.is_ming_voice(voice) else VOICE_GROUPS).get(prefix)
     return f"{name.upper()} · {group}" if group else name.upper()
 
 
@@ -369,9 +387,12 @@ class Backend(QObject):
         self._preview_cache: Path | None = None
         self._shut_down = False
         fixed_assets = None if assets is None else tuple(assets)
-        # The files a run needs depend on whether it uses the graphics card.
-        self._assets_for: Callable[[bool], Sequence[Asset]] = (
-            required_assets if fixed_assets is None else (lambda use_gpu: fixed_assets)
+        # The files a run needs depend on the voice (Kokoro or Ming) and whether it uses the
+        # graphics card.
+        self._assets_for: Callable[[str, bool], Sequence[Asset]] = (
+            voices.required_assets
+            if fixed_assets is None
+            else (lambda voice, use_gpu: fixed_assets)
         )
 
         # App
@@ -401,7 +422,7 @@ class Backend(QObject):
         self._chapters = ChapterModel(self)
         self._chapters.selectionChanged.connect(self._on_selection_changed)
         # Voice
-        self._voiceGroups = voice_groups()
+        self._voiceGroups = voice_groups(premium=self._using_gpu)
         saved_voice = str(self._settings.value("voice", DEFAULT_VOICE))
         self._voice = saved_voice if saved_voice in self._voice_ids() else DEFAULT_VOICE
         self._speed = self._valid_speed(self._settings.value("speed", 1.0))
@@ -600,6 +621,13 @@ class Backend(QObject):
         self._update("useGpu", on)
         self._settings.setValue("useGpu", on)
         self._settings.sync()
+        # The premium voices run only on the card, so they're listed only while it's in use;
+        # turning it off while one is chosen goes back to the default voice.
+        if not self._using_gpu and ming.is_ming_voice(self._voice):
+            self._update("voice", DEFAULT_VOICE)
+            self.voiceLabelChanged.emit()
+            self._settings.setValue("voice", DEFAULT_VOICE)
+        self._update("voiceGroups", voice_groups(premium=self._using_gpu))
         self.selectionSummaryChanged.emit()  # each device has its own speed
         self._refresh_hardware_label()
         self._refresh_download_note()
@@ -707,10 +735,14 @@ class Backend(QObject):
         self.voiceLabelChanged.emit()
         self._settings.setValue("voice", voice)
         self._settings.sync()
+        self.setSpeed(self._speed)  # the premium voice goes up to 2x
+        self._refresh_download_note()  # each voice has its own files
 
     @Slot(float)
     def setSpeed(self, value: float) -> None:
         speed = self._valid_speed(value)
+        if ming.is_ming_voice(self._voice):
+            speed = min(speed, ming.MAX_SPEED)
         if speed == self._speed:
             return
         self._stop_preview()
@@ -1118,15 +1150,17 @@ class Backend(QObject):
 
     def _refresh_download_note(self) -> None:
         """Say what Start will download: nothing when every required file is installed."""
-        missing = [a for a in self._assets_for(self._using_gpu) if self._needs_download(a)]
+        assets = self._assets_for(self._voice, self._using_gpu)
+        missing = [a for a in assets if self._needs_download(a)]
         if not missing:
             self._update("downloadNote", "")
             return
         mb = math.ceil(sum(asset.size for asset in missing) / 1_000_000)
         updates = all(a.archive and build_in_use(a, self._data_root) is not None for a in missing)
-        self._update(
-            "downloadNote", (UPDATE_NOTE if updates else DOWNLOAD_NOTE).format(mb=f"{mb:,}")
-        )
+        note = UPDATE_NOTE if updates else DOWNLOAD_NOTE
+        if any(asset.opt_in for asset in missing):
+            note = PREMIUM_DOWNLOAD_NOTE
+        self._update("downloadNote", note.format(mb=f"{mb:,}"))
 
     def _needs_download(self, asset: Asset) -> bool:
         """``needs_download`` without hashing anything: this runs on the GUI thread, and a
