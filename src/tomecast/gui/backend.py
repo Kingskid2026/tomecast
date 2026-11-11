@@ -364,6 +364,7 @@ class Backend(QObject):
         self._playing = ""  # what plays: "preview", "try", "name:<word>" or "" for nothing
         self._fix_lists: FixLists | None = None
         self._fix_error = ""  # the last banner message a fix caused
+        self._notice = ""  # the banner's sentence while a book goes on (the card ran out of memory)
         self._preview_cache: Path | None = None
         self._shut_down = False
         fixed_assets = None if assets is None else tuple(assets)
@@ -458,6 +459,7 @@ class Backend(QObject):
         self._worker.progressed.connect(self._on_progress)
         self._worker.converted.connect(self._on_converted)
         self._worker.failed.connect(self._on_failed)
+        self._worker.noticed.connect(self._on_notice)
         self._worker.deviceChosen.connect(self._on_device)
         self._worker.speedsKnown.connect(self._on_speeds)
         self._thread.start()
@@ -806,11 +808,13 @@ class Backend(QObject):
         self._reset_progress()
         self._update("chapterLabel", self._chapter_labels[0])
         self._update("errorMessage", "")
+        self._notice = ""
         self._show("converting")
         self._jobRequested.emit(
             ConvertJob(
                 self._convert_job, book, tuple(rows), self._book_path, output, self._voice,
                 self._speed, self._control, self._using_gpu, output_format, fixes,
+                self._speeds.get(self._speed_key("CPU")),
             )
         )  # fmt: skip
 
@@ -1025,7 +1029,26 @@ class Backend(QObject):
         )
         self._update("warnings", list(result.warnings))
         self._update("chunksDone", self._chunksTotal)
+        if self._notice and self._errorMessage == self._notice:
+            self._update("errorMessage", "")  # the done screen's notes say it now
+        self._notice = ""
         self._show("done")
+
+    @Slot(int, str, int)
+    def _on_notice(self, job: int, message: str, threads: int) -> None:
+        """The graphics card ran out of memory and the book goes on on the CPU, with
+        ``threads``: say so in the banner while it's being made (the done screen lists it with
+        the other notes), and show the CPU. The thread count is the engine's own, not read
+        again, so the speed this run measures is kept under the count that made it."""
+        if job != self._convert_job:
+            return
+        self._cpu_threads = threads
+        self._update("gpuName", "")
+        self._refresh_hardware_label()
+        self.selectionSummaryChanged.emit()
+        if message:
+            self._notice = message
+            self._update("errorMessage", message)
 
     @Slot(int, str)
     def _on_failed(self, job: int, message: str) -> None:

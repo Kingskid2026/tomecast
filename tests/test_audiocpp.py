@@ -660,6 +660,40 @@ def test_when_the_card_fails_with_every_build_nothing_is_switched_or_blamed(
     assert again.switched == (new,)
 
 
+def test_running_out_of_graphics_memory_in_the_check_is_no_verdict(
+    tmp_path: Path, engine_root: Path, with_devices: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    old = _engine_build(tmp_path, "old", gpu=True)
+    new = _engine_build(tmp_path, "new", gpu=True)
+    install = prepare([old, ESPEAK_NG], engine_root, check=audiocpp.self_check(engine_root, True))
+    assert build_in_use(old, engine_root) == build_folder(old, engine_root), install
+    monkeypatch.setenv("FAKE_OOM_VULKAN_AFTER", "0")  # another program has the card's memory
+
+    prepared = prepare([new, ESPEAK_NG], engine_root, check=audiocpp.self_check(engine_root, True))
+
+    # Other programs did that, not the update: nothing switched, blamed or noted, the old
+    # build isn't started to compare, and the next run checks again.
+    assert prepared.switched == ()
+    assert prepared.notes == ()
+    assert failure(new, engine_root) is None
+    assert waiting_check(new, engine_root)
+    assert _checks(tmp_path)[-1:] == [(new.sha256[:12], "vulkan")]
+    assert sum(1 for build, _ in _checks(tmp_path) if build == new.sha256[:12]) == 1  # no retry
+
+    monkeypatch.delenv("FAKE_OOM_VULKAN_AFTER")  # the memory is free again
+    again = prepare([new, ESPEAK_NG], engine_root, check=audiocpp.self_check(engine_root, True))
+    assert again.switched == (new,)
+
+
+def test_check_build_says_no_verdict_when_the_card_runs_out_of_memory(
+    tmp_path: Path, fake_server: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FAKE_OOM_VULKAN_START", "1")
+    result = audiocpp.check_build(tmp_path, tmp_path, None, backend="vulkan", device=0)
+    assert isinstance(result, downloads.Inconclusive)
+    assert "ran out of memory" in result.reason
+
+
 def test_without_a_card_a_vulkan_build_is_checked_on_the_cpu(
     tmp_path: Path, engine_root: Path
 ) -> None:

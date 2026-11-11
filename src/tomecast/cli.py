@@ -79,6 +79,7 @@ from tomecast.speed import (
     audio_minutes,
     engine_speed,
     forget_speeds,
+    known_cpu_speed,
     make_minutes,
     probe,
     words_in,
@@ -379,10 +380,11 @@ def _convert(args: argparse.Namespace) -> int:
     except OSError as error:
         raise CliError(str(error)) from error
 
-    chunk_count = sum(len(chunks) for chunks in plan_chunks(book, MAX_CHARS, chapters, prep=prep))
+    chunked = plan_chunks(book, MAX_CHARS, chapters, prep=prep)
+    plan = [chunk for chapter in chunked for chunk in chapter]
     print(
         f"Converting “{book.title}”: {_plural(len(chapters), 'chapter')}, "
-        f"{_plural(chunk_count, 'piece')} of text, voice {args.voice}."
+        f"{_plural(len(plan), 'piece')} of text, voice {args.voice}."
     )
     if prep.pronunciations:
         count = len(prep.pronunciations)
@@ -393,35 +395,59 @@ def _convert(args: argparse.Namespace) -> int:
         print(f"Note: {note}")
     progress = _ProgressPrinter(sys.stderr)
     started = time.monotonic()
+    engine: AutoKokoro | None = None
     with contextlib.ExitStack() as stack:
         try:
             stack.enter_context(exclusive(workdir))
         except WorkFolderBusy as error:
             raise CliError(str(error)) from None
         try:
-            with AutoKokoro(
+            engine = AutoKokoro(
                 root,
                 voice=args.voice,
                 speed=args.speed,
                 use_gpu=use_gpu,
                 builds=builds,
                 threads=choice.threads,
-            ) as engine:
-                print(_hardware_line(engine, args.gpu))
-                if not engine.gpu_description and choice.fewer_because:
-                    print(f"Using {_plural(choice.threads, 'CPU thread')}{_fewer_text(choice)}.")
-                if engine.warning:
-                    print(f"Note: {engine.warning}")
-                speedup = engine_speed(root, engine, measuring=_measuring)
+            )
+            with engine as running:
+                print(_hardware_line(running, args.gpu))
+
+                def threads_line() -> None:  # on the CPU with fewer threads than usual
+                    if not running.gpu_description and choice.fewer_because:
+                        threads = _plural(choice.threads, "CPU thread")
+                        print(f"Using {threads}{_fewer_text(choice)}.")
+
+                threads_line()
+                notes = _EngineNotes(running)
+                notes.say()
+                speedup = engine_speed(root, running, measuring=_measuring)
+                if notes.pending:  # the card ran out of memory during the speed test
+                    notes.say()
+                    threads_line()
                 if speedup is not None:
                     print(_estimate_line(words_in(book, chapters), args.speed, speedup))
-                fell_back = engine.fell_back  # on the CPU although the card was wanted
+
+                def update(report: ConversionProgress) -> None:
+                    # Partway through, the card ran out of memory and the engine carried on
+                    # on the CPU: say so on its own line, with a new estimate for the rest.
+                    if notes.pending:
+                        progress.finish()
+                        notes.say()
+                        threads_line()
+                        if (cpu := known_cpu_speed(root, running)) is not None:
+                            rest = plan[report.chunks_done :]
+                            words = sum(len(chunk.text.split()) for chunk in rest)
+                            print(_rest_line(words, args.speed, cpu))
+                        progress.restart(report.chunks_done)
+                    progress.update(report)
+
                 result = convert_book(
                     book,
-                    engine,
+                    running,
                     output,
                     workdir=workdir,
-                    progress=progress.update,
+                    progress=update,
                     format=output_format,
                     prep=prep,
                     chapters=chapters,
@@ -435,8 +461,12 @@ def _convert(args: argparse.Namespace) -> int:
             progress.finish()
             # A switched-to update that crashes (or makes no usable audio) on the book, before
             # it has finished one: the next run uses the build that worked, in a new work
-            # folder, so nothing is mixed.
-            if roll_back(root, builds, str(error)):
+            # folder, so nothing is mixed. Not after the card ran out of memory: other
+            # programs using it did that, not the build, and what failed after it on the CPU
+            # is most likely short of memory too (on a graphics chip built into the processor,
+            # the card's memory is the computer's).
+            out_of_memory = engine is not None and engine.out_of_memory
+            if not out_of_memory and roll_back(root, builds, str(error)):
                 raise CliError(f"{error}\nNote: {UPDATE_FAILED_NOTE} {AGAIN_NOTE}") from error
             raise CliError(f"{error}\n{_saved_note(workdir)}".rstrip()) from error
         except (PackagingError, CoverageError, OSError, wave.Error) as error:
@@ -457,12 +487,31 @@ def _convert(args: argparse.Namespace) -> int:
     )
     sys.stdout.flush()
     # After "Done", and never waiting long on another Tomecast's install. A run that fell back
-    # to the CPU says nothing about how the build does on the card, so it proves nothing.
-    # The book is made either way, so a disk that won't take installed.json isn't an error.
-    if not fell_back:
+    # to the CPU (as it started, or partway) says nothing about how the build does on the
+    # card, so it proves nothing. The book is made either way, so a disk that won't take
+    # installed.json isn't an error.
+    if engine is not None and not engine.fell_back:
         with contextlib.suppress(OSError):
             mark_proven(root, builds)
     return 0
+
+
+class _EngineNotes:
+    """Prints the engine's note (why it uses the CPU although the card was wanted) once,
+    and again if it changes: when the card runs out of memory partway through."""
+
+    def __init__(self, engine: AutoKokoro) -> None:
+        self._engine = engine
+        self._said: str | None = None
+
+    @property
+    def pending(self) -> bool:
+        return self._engine.warning is not None and self._engine.warning != self._said
+
+    def say(self, stream: TextIO | None = None) -> None:
+        if self.pending:
+            self._said = self._engine.warning
+            print(f"Note: {self._said}", file=stream or sys.stdout)
 
 
 AGAIN_NOTE = "Run the same command again to make the book with it."
@@ -501,6 +550,13 @@ def _estimate_line(words: int, speed: float, speedup: float) -> str:
     audio = _rough_minutes(audio_minutes(words, speed))
     make = _rough_minutes(make_minutes(words, speed, speedup))
     return f"{audio.capitalize()} of audio, {make} to make here ({speedup:.1f}\u00d7 real time)."
+
+
+def _rest_line(words: int, speed: float, speedup: float) -> str:
+    """``"About 25 min more to make on the CPU (3.1x real time)."``: after the graphics card
+    ran out of memory partway, for the text that's left."""
+    make = _rough_minutes(make_minutes(words, speed, speedup))
+    return f"{make.capitalize()} more to make on the CPU ({speedup:.1f}\u00d7 real time)."
 
 
 def _rough_minutes(minutes: float) -> str:
@@ -737,9 +793,10 @@ def _preview(args: argparse.Namespace) -> int:
             with AutoKokoro(
                 root, voice=args.voice, speed=args.speed, use_gpu=use_gpu, builds=builds
             ) as engine:
-                if engine.warning:
-                    print(f"Note: {engine.warning}", file=sys.stderr)
+                notes = _EngineNotes(engine)
+                notes.say(sys.stderr)
                 _voice_text(engine, spoken, wav)
+                notes.say(sys.stderr)  # the card ran out of memory partway
             if problem := audio_problem(wav, spoken):
                 raise CliError(f"the voice made no usable audio: {problem}")
             if output is not None:
@@ -882,15 +939,22 @@ class _ProgressPrinter:
         self._stream = stream
         self._interactive = stream.isatty()
         self._started = time.monotonic()
+        self._counted_from = 0  # the time left is measured from this piece on
         self._last_percent = -1
         self._shown = False
 
+    def restart(self, done: int) -> None:
+        """Measure the time left again from here (the engine moved to the CPU)."""
+        self._started = time.monotonic()
+        self._counted_from = done
+
     def update(self, progress: ConversionProgress) -> None:
-        if progress.chunks_done == 0 or progress.stage == "packaging":
+        measured = progress.chunks_done - self._counted_from
+        if measured <= 0 or progress.stage == "packaging":
             return
         percent = 100 * progress.chunks_done // max(1, progress.chunks_total)
         elapsed = time.monotonic() - self._started
-        remaining = elapsed / progress.chunks_done * (progress.chunks_total - progress.chunks_done)
+        remaining = elapsed / measured * (progress.chunks_total - progress.chunks_done)
         line = (
             f"Chapter {progress.chapter_index + 1}/{progress.chapter_count} · "
             f"{progress.chunks_done:,}/{progress.chunks_total:,} pieces · {percent}% · "

@@ -20,7 +20,7 @@ from machine_factory import ON_BATTERY, PLUGGED_IN, pin_machine
 from pdf_factory import PageBuilder, build_pdf
 
 from tomecast import __version__, cli, machine
-from tomecast.downloads import Asset, build_in_use, roll_back
+from tomecast.downloads import UPDATE_FAILED_NOTE, Asset, build_in_use, failure, roll_back
 from tomecast.engines import audiocpp
 from tomecast.engines.audiocpp import EngineError
 from tomecast.hardware import GpuDevice
@@ -37,6 +37,10 @@ class FakeKokoro:
     made: ClassVar[list["FakeKokoro"]] = []
     gpu_description = "NVIDIA RTX PRO 1000 Blackwell Generation Laptop GPU"
     gpu_warning: str | None = None  # set: a use_gpu run falls back to the CPU
+    # set: a use_gpu run starts on the card, and it runs out of memory on this voicing (1 is
+    # the first), which then carries on on the CPU, as AutoKokoro does
+    oom_at: int | None = None
+    on_card: ClassVar[list[str]] = []  # what was voiced on the graphics card
     texts: ClassVar[list[str]] = []  # everything the voice was asked to say, across all instances
     on_exit: ClassVar[Callable[[], None] | None] = None  # runs when the engine stops
 
@@ -50,7 +54,9 @@ class FakeKokoro:
         self.use_gpu = use_gpu
         self.warning: str | None = None
         self.fell_back = False
+        self.out_of_memory = False
         self.gpu_description = ""
+        self.calls = 0
         FakeKokoro.made.append(self)
 
     def __enter__(self) -> "FakeKokoro":
@@ -71,12 +77,19 @@ class FakeKokoro:
             FakeKokoro.on_exit()
 
     def synthesize(self, text: str, output: Path) -> None:
+        self.calls += 1
+        if self.use_gpu and not self.fell_back and FakeKokoro.oom_at == self.calls:
+            self.warning = audiocpp.RAN_OUT_OF_MEMORY_NOTE  # and it carries on on the CPU
+            self.fell_back = self.out_of_memory = True
+            self.gpu_description = ""
         if self.fail_with:
             raise EngineError(self.fail_with)
         if FakeKokoro.fail_after is not None and FakeKokoro.voiced >= FakeKokoro.fail_after:
             raise EngineError("the voice engine failed (HTTP 500): interrupted")
         FakeKokoro.voiced += 1
         FakeKokoro.texts.append(text)
+        if self.use_gpu and not self.fell_back:
+            FakeKokoro.on_card.append(text)
         frames = round(len(text) / 15 * 24000)
         samples = array.array("h", (round(8000 * math.sin(i / 8)) for i in range(frames)))
         with wave.open(str(output), "wb") as wav:
@@ -92,6 +105,7 @@ def no_real_engine(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(cli, "check_system", lambda: None)
     monkeypatch.setattr(audiocpp, "required_assets", lambda use_gpu: ())
     monkeypatch.setattr(cli, "engine_speed", lambda root, engine, measuring=None: None)
+    monkeypatch.setattr(cli, "known_cpu_speed", lambda root, engine: None)
     monkeypatch.setattr(cli, "vulkan_possible", lambda: False)
     monkeypatch.setattr(cli, "data_dir", lambda: tmp_path / "data")
     FakeKokoro.fail_with = None
@@ -99,6 +113,8 @@ def no_real_engine(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     FakeKokoro.voiced = 0
     FakeKokoro.made = []
     FakeKokoro.gpu_warning = None
+    FakeKokoro.oom_at = None
+    FakeKokoro.on_card = []
     FakeKokoro.texts = []
     FakeKokoro.on_exit = None
 
@@ -673,6 +689,15 @@ def test_preview_says_when_it_fell_back_to_the_cpu(
     assert "the CPU is used" in capsys.readouterr().err
 
 
+def test_preview_says_when_the_card_ran_out_of_memory_partway(
+    played: list[Path], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(cli, "vulkan_possible", lambda: True)
+    FakeKokoro.oom_at = 1
+    assert cli.main(["preview", "Hi"]) == 0
+    assert capsys.readouterr().err.count(f"Note: {audiocpp.RAN_OUT_OF_MEMORY_NOTE}") == 1
+
+
 def test_preview_needs_something_to_say(
     played: list[Path], capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1193,3 +1218,101 @@ def test_scan_keeps_the_choice_when_its_own_build_fails(
 
     assert build_in_use(asset, tmp_path / "data") == theirs
     assert _slot(tmp_path, "audiocpp-cpu")["chosen_by"] == "9.9.9"  # never wiped
+
+
+# --- The graphics card running out of memory (#49) --------------------------------------------
+
+
+def test_running_out_of_graphics_memory_mid_book_is_said_and_every_piece_is_voiced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(cli, "vulkan_possible", lambda: True)
+    book = _epub(tmp_path)
+    assert cli.main(["convert", str(book)]) == 0  # on the card all the way
+    every_piece = list(FakeKokoro.texts)
+    assert FakeKokoro.on_card == every_piece
+    capsys.readouterr()
+    FakeKokoro.texts, FakeKokoro.on_card = [], []
+    FakeKokoro.oom_at = 2  # another program takes the card's memory on the second piece
+    monkeypatch.setattr(cli, "known_cpu_speed", lambda root, engine: 3.1)
+
+    assert cli.main(["convert", str(book), "--force"]) == 0
+
+    out = capsys.readouterr().out
+    assert "Using the graphics card: NVIDIA RTX PRO 1000" in out
+    note = (
+        "Note: The graphics card ran out of memory, so Tomecast carried on with the same voice "
+        "on the CPU (slower)."
+    )
+    assert out.count(note) == 1  # once, when it happened
+    assert "Under 1 min more to make on the CPU (3.1× real time)." in out
+    assert out.index(note) < out.index("Done:")
+    assert FakeKokoro.texts == every_piece  # each piece once, in order: nothing lost
+    assert FakeKokoro.on_card == every_piece[:1]  # the rest on the CPU
+
+
+def test_running_out_of_graphics_memory_at_start_is_said_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(cli, "vulkan_possible", lambda: True)
+    FakeKokoro.gpu_warning = audiocpp.OUT_OF_MEMORY_NOTE
+
+    assert cli.main(["convert", str(_epub(tmp_path))]) == 0
+
+    out = capsys.readouterr().out
+    assert "Using the CPU." in out
+    assert out.count(f"Note: {audiocpp.OUT_OF_MEMORY_NOTE}") == 1
+
+
+def test_a_book_that_ran_out_of_graphics_memory_doesnt_prove_the_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    asset, _ = _engine_update(tmp_path, gpu=True)
+    monkeypatch.setattr(cli, "vulkan_possible", lambda: True)
+    monkeypatch.setattr(audiocpp, "required_assets", lambda use_gpu: (asset,))
+    monkeypatch.setattr(audiocpp, "self_check", lambda root, gpu, cancelled: lambda n, o: None)
+    FakeKokoro.oom_at = 1
+
+    assert cli.main(["convert", str(_epub(tmp_path)), "--yes"]) == 0
+
+    slot = _slot(tmp_path, "audiocpp-vulkan")
+    assert slot["proven"] is False  # the book was made on the CPU...
+    assert slot["previous"] == "engines/engine-0.1"  # ...so the build that worked is kept
+
+
+def test_a_failure_after_running_out_of_graphics_memory_doesnt_roll_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    asset, _ = _engine_update(tmp_path, gpu=True)
+    monkeypatch.setattr(cli, "vulkan_possible", lambda: True)
+    monkeypatch.setattr(audiocpp, "required_assets", lambda use_gpu: (asset,))
+    monkeypatch.setattr(audiocpp, "self_check", lambda root, gpu, cancelled: lambda n, o: None)
+    FakeKokoro.oom_at = 1
+    FakeKokoro.fail_after = 1  # then the CPU fails too (short of memory as well)
+    root = tmp_path / "data"
+
+    assert cli.main(["convert", str(_epub(tmp_path)), "--yes"]) == 1
+
+    err = capsys.readouterr().err
+    assert "interrupted" in err
+    assert UPDATE_FAILED_NOTE not in err
+    new_build = root / asset.path / asset.sha256[:12]
+    assert build_in_use(asset, root) == new_build  # not rolled back...
+    assert failure(asset, root) is None  # ...and not blamed
+
+
+def test_the_threads_line_follows_a_switch_to_the_cpu_partway(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(machine, "cpu_count", lambda: 16)
+    pin_machine(monkeypatch, tmp_path / "laptop", supplies=ON_BATTERY)
+    monkeypatch.setattr(cli, "vulkan_possible", lambda: True)
+    FakeKokoro.oom_at = 2
+
+    assert cli.main(["convert", str(_epub(tmp_path))]) == 0
+
+    out = capsys.readouterr().out
+    threads = "Using 4 CPU threads (usually 8; fewer on battery).\n"
+    assert out.count(threads) == 1  # not at first: it began on the card
+    assert f"Note: {audiocpp.RAN_OUT_OF_MEMORY_NOTE}\n{threads}" in out  # right after the note
+    assert FakeKokoro.made[-1].kwargs["threads"] == 4

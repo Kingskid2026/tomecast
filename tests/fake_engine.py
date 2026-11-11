@@ -11,9 +11,21 @@ with it) change how it behaves:
 ``FAKE_REPORT_BACKEND``   the backend ``/health`` reports (default: the configured one)
 ``FAKE_LOADED_DEVICE``    the device ``/v1/models`` says the model is on (default: the config's)
 ``FAKE_SILENT``           voice silence instead of a tone
-``FAKE_DIE_AFTER``        crash mid-request after this many requests (``FAKE_SLOW_EXIT``: slowly)
+``FAKE_DIE_AFTER``        crash mid-request after this many requests (``FAKE_SLOW_EXIT``: slowly;
+                          ``FAKE_DIE_SAYING``: logging this first)
 ``FAKE_DELAY``            seconds each request takes
 ``FAKE_START_DELAY``      seconds before it starts serving (a slow first start)
+``FAKE_OOM_VULKAN_AFTER`` on the Vulkan backend, requests after this many log ggml's lines and
+                          fail with HTTP 500, and the server stays up: what Kokoro did when the
+                          graphics card was out of memory (``OOM_KOKORO_*``);
+                          ``FAKE_OOM_CPU_TOO``: on the CPU backend too; ``FAKE_OOM_MESSAGE``:
+                          another reply; ``FAKE_OOM_QUIET``: the reply alone, nothing logged
+``FAKE_OOM_VULKAN_START`` on the Vulkan backend, log what Ming did when it ran out while
+                          loading (``OOM_MING_START``) and exit; ``FAKE_OOM_HANG``: log it
+                          and keep running without ever serving
+``FAKE_OOM_LOG``          log this at start-up (a warning the engine carries on after)
+
+Each voiced request is logged with the backend that voiced it.
 """
 
 from __future__ import annotations
@@ -24,6 +36,23 @@ import sys
 import textwrap
 from collections.abc import Mapping
 from pathlib import Path
+
+# Copied from audio.cpp 0.9.4's own output on the maintainer's laptop, with 7.1 of the NVIDIA
+# card's 7.6 GiB in use by other programs (#49). Kokoro started, then answered every request
+# with HTTP 500 and this reply, logging these lines, and stayed up:
+OOM_KOKORO_REPLY = "failed to allocate Kokoro predictor tail tensors"
+OOM_KOKORO_LOG = (
+    "ggml_vulkan: Device memory allocation of size 186707936 failed.",
+    "ggml_vulkan: vk::Device::allocateMemory: ErrorOutOfDeviceMemory",
+    "alloc_tensor_range: failed to allocate Vulkan0 buffer of size 186707936",
+)
+# Ming exited (status 1) 0.9 s after starting, having logged:
+OOM_MING_START = (
+    "ggml_vulkan: Device memory allocation of size 652936336 failed.",
+    "ggml_vulkan: vk::Device::allocateMemory: ErrorOutOfDeviceMemory",
+    "alloc_tensor_range: failed to allocate Vulkan0 buffer of size 652936336",
+    "audiocpp_server failed: failed to allocate ming3_tts.ar.weights backend weight buffer",
+)
 
 FAKE_SERVER = textwrap.dedent(
     """
@@ -53,6 +82,13 @@ FAKE_SERVER = textwrap.dedent(
     ):
         print("model failed to load", flush=True)
         sys.exit(3)
+    if os.environ.get("FAKE_OOM_LOG"):
+        print(os.environ["FAKE_OOM_LOG"], file=sys.stderr, flush=True)
+    if os.environ.get("FAKE_OOM_VULKAN_START") and config["backend"] == "vulkan":
+        print("\\n".join(OOM_MING_START), file=sys.stderr, flush=True)
+        if os.environ.get("FAKE_OOM_HANG"):
+            time.sleep(60)
+        sys.exit(1)
 
     def wav_for(text):
         frames = max(1, int(len(text) / 15 * 24000))
@@ -95,6 +131,8 @@ FAKE_SERVER = textwrap.dedent(
             time.sleep(float(os.environ.get("FAKE_DELAY", "0")))
             die_after = os.environ.get("FAKE_DIE_AFTER")
             if die_after is not None and REQUESTS[0] > int(die_after):
+                if os.environ.get("FAKE_DIE_SAYING"):
+                    print(os.environ["FAKE_DIE_SAYING"], file=sys.stderr, flush=True)
                 if os.environ.get("FAKE_SLOW_EXIT"):
                     # The connection drops first, and the process only ends a bit later.
                     self.connection.shutdown(socket.SHUT_RDWR)
@@ -106,7 +144,19 @@ FAKE_SERVER = textwrap.dedent(
                 return self.fail("Kokoro phoneme string exceeds 510 symbols")
             if "EXPLODE" in text:
                 return self.fail("something broke")
-            log.write(json.dumps({"event": "voiced", "body": body}) + "\\n")
+            oom_after = os.environ.get("FAKE_OOM_VULKAN_AFTER")
+            if (
+                oom_after is not None
+                and (config["backend"] == "vulkan" or os.environ.get("FAKE_OOM_CPU_TOO"))
+                and REQUESTS[0] > int(oom_after)
+            ):
+                log.write(json.dumps({"event": "out of memory", "body": body}) + "\\n")
+                log.flush()
+                if not os.environ.get("FAKE_OOM_QUIET"):
+                    print("\\n".join(OOM_KOKORO_LOG), file=sys.stderr, flush=True)
+                return self.fail(os.environ.get("FAKE_OOM_MESSAGE", OOM_KOKORO_REPLY))
+            log.write(json.dumps(
+                {"event": "voiced", "body": body, "backend": config["backend"]}) + "\\n")
             log.flush()
             data = wav_for(text)
             self.send_response(200)
@@ -131,6 +181,10 @@ def write_fake_server(path: Path, env: Mapping[str, str] | None = None) -> Path:
     """Write the fake server to ``path`` as an executable script. ``env`` is set inside it,
     so a build made from it behaves that way whatever the test's environment says."""
     header = f"import os; os.environ.update({json.dumps(dict(env or {}))})\n" if env else ""
-    path.write_text(f"#!{sys.executable}\n{header}{FAKE_SERVER}")
+    messages = (
+        f"OOM_KOKORO_REPLY = {OOM_KOKORO_REPLY!r}\nOOM_KOKORO_LOG = {OOM_KOKORO_LOG!r}\n"
+        f"OOM_MING_START = {OOM_MING_START!r}\n"
+    )
+    path.write_text(f"#!{sys.executable}\n{header}{messages}{FAKE_SERVER}")
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
     return path

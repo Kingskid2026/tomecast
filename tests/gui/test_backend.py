@@ -42,6 +42,8 @@ from tomecast.engines.audiocpp import (
     AUDIOCPP_VULKAN,
     ESPEAK_NG,
     KOKORO_Q8,
+    OUT_OF_MEMORY_NOTE,
+    RAN_OUT_OF_MEMORY_NOTE,
     EngineError,
     split_speed,
 )
@@ -50,7 +52,7 @@ from tomecast.gui import fixes as fixes_module
 from tomecast.gui.backend import STOPPED_MESSAGE, Backend, safe_file_name, unique_output
 from tomecast.gui.models import DEFAULT_SPEEDUP, ChapterModel, display_title, summarize
 from tomecast.gui.worker import BookRead, SelfCheckFor, TimedControl, preview_file
-from tomecast.hardware import GpuDevice
+from tomecast.hardware import GpuDevice, short_name
 from tomecast.names import Name
 from tomecast.speed import Speeds
 from tomecast.textprep import TextPrep
@@ -96,6 +98,12 @@ class Engines:
         self.start_error: str | None = None
         self.gpu: str = "NVIDIA RTX PRO 1000 Blackwell Generation Laptop GPU"  # a use_gpu run
         self.gpu_warning: str | None = None  # set: a use_gpu run fell back to the CPU
+        # set: a use_gpu run starts on the card and runs out of memory on the Nth synthesize
+        # call (counting every engine's), then carries on on the CPU, as AutoKokoro does
+        self.oom_at: int | None = None
+        self.oom_at_start = False  # set: a use_gpu run runs out of memory as it starts
+        self.fail_once_at: int | None = None  # the Nth synthesize call fails, once
+        self.on_card: list[str] = []  # what was voiced on the graphics card
         self.before_start: Callable[[], None] | None = None  # runs as an engine starts
         self.after_close: Callable[[], None] | None = None  # runs once an engine has stopped
 
@@ -119,6 +127,8 @@ class FakeEngine:
         self.gpu_description = ""
         self.warning: str | None = None
         self.fell_back = False
+        self.out_of_memory = False
+        self._threads = machine.voice_threads()  # read when it's made, as AutoKokoro does
         self.started = False
         self.closed = False
         self.thread_id: int | None = None  # the OS thread that started it
@@ -126,6 +136,10 @@ class FakeEngine:
 
     def pin_builds(self, builds: Mapping[str, Path]) -> None:
         self.pinned = dict(builds)
+
+    @property
+    def threads(self) -> int:
+        return self._threads
 
     @property
     def voice_speed(self) -> float:
@@ -141,7 +155,10 @@ class FakeEngine:
             self._engines.before_start()
         if self._engines.start_error:
             raise EngineError(self._engines.start_error)
-        if self.use_gpu and self._engines.gpu_warning:
+        if self.use_gpu and self._engines.oom_at_start:
+            self.warning = OUT_OF_MEMORY_NOTE
+            self.fell_back = self.out_of_memory = True
+        elif self.use_gpu and self._engines.gpu_warning:
             self.warning = self._engines.gpu_warning
             self.fell_back = True
         elif self.use_gpu and self._engines.gpu:
@@ -158,6 +175,14 @@ class FakeEngine:
         engines = self._engines
         engines.texts.append(text)
         count = len(engines.texts)
+        if self.use_gpu and not self.fell_back and engines.oom_at == count:
+            self.warning = RAN_OUT_OF_MEMORY_NOTE  # and it carries on on the CPU
+            self.fell_back = self.out_of_memory = True
+            self.gpu_description, self.device_label = "", "CPU"
+        if self.use_gpu and not self.fell_back:
+            engines.on_card.append(text)
+        if engines.fail_once_at == count:
+            raise RuntimeError("the voice engine failed (HTTP 500): something broke")
         if engines.block_at == count:
             engines.blocked.set()
             engines.release.wait(timeout=10)
@@ -2698,3 +2723,177 @@ def test_the_start_up_scan_lists_the_cards_once(qtbot: QtBot, tmp_path: Path) ->
     assert scanned == [True]
     assert given == [[card]]  # the probe gets that list instead of asking again
     assert backend.gpuName == NVIDIA
+
+
+# --- The graphics card running out of memory (#49) --------------------------------------------
+
+
+def _planned_pieces(backend: Backend) -> list[str]:
+    assert backend._book is not None
+    return [
+        chunk.text
+        for chapter in plan_chunks(backend._book, FakeEngine.max_chars)
+        for chunk in chapter
+        if chunk.speakable
+    ]
+
+
+def test_running_out_of_graphics_memory_mid_book_is_in_the_banner_and_the_book_goes_on(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    engines = Engines()
+    engines.oom_at = 3  # another program takes the card's memory on the third piece
+    engines.block_at = 5  # hold a later piece, to look at the window mid-book
+    backend = make_backend(engines, gpu=True, scan=NVIDIA, speeds=Speeds(cpu=3.1))
+    qtbot.waitUntil(lambda: backend.gpuName != "")
+    _open(qtbot, backend, _short_book(tmp_path))
+    backend.goTo("voice")
+    backend.startConversion()
+
+    qtbot.waitUntil(engines.blocked.is_set, timeout=CONVERSION_TIMEOUT)
+    qtbot.waitUntil(lambda: backend.errorMessage != "")
+    assert backend.screen == "converting"  # still going
+    assert backend.errorMessage == RAN_OUT_OF_MEMORY_NOTE
+    assert backend.gpuName == ""
+    assert backend.hardwareLabel == "CPU · ABOUT 3.1× REAL TIME"
+    # The time left is the CPU's straight away, from the speed test's 3.1x.
+    qtbot.waitUntil(lambda: backend.timeLeft != "--:--:--")
+    assert backend.speedLabel == "3.1× REAL TIME"
+
+    engines.release.set()
+    qtbot.waitUntil(lambda: backend.screen == "done", timeout=CONVERSION_TIMEOUT)
+    assert backend.warnings == [RAN_OUT_OF_MEMORY_NOTE]
+    assert backend.errorMessage == ""  # the done screen's notes say it now, not twice
+    assert engines.texts == _planned_pieces(backend)  # each piece once, in order: nothing lost
+    assert engines.on_card == engines.texts[:2]  # the rest on the CPU
+    assert [engine.use_gpu for engine in engines.made] == [True]  # one engine, one book
+
+
+def test_running_out_of_graphics_memory_at_start_is_in_the_banner_too(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    engines = Engines()
+    engines.oom_at_start = True
+    engines.block_at = 1
+    backend = make_backend(engines, gpu=True, scan=NVIDIA)
+    qtbot.waitUntil(lambda: backend.gpuName != "")
+    _open(qtbot, backend, _short_book(tmp_path))
+    backend.goTo("voice")
+    backend.startConversion()
+
+    qtbot.waitUntil(engines.blocked.is_set, timeout=CONVERSION_TIMEOUT)
+    qtbot.waitUntil(lambda: backend.errorMessage != "")
+    assert backend.errorMessage == OUT_OF_MEMORY_NOTE
+    assert backend.gpuName == ""
+    engines.release.set()
+    qtbot.waitUntil(lambda: backend.screen == "done", timeout=CONVERSION_TIMEOUT)
+    assert backend.warnings == [OUT_OF_MEMORY_NOTE]
+    assert backend.errorMessage == ""
+
+
+def test_the_card_not_working_at_start_stays_off_the_banner(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    engines = Engines()
+    engines.gpu_warning = "The graphics card didn't work, so Tomecast used the CPU."
+    seen: list[str] = []
+    backend = make_backend(engines, gpu=True)
+    backend.errorMessageChanged.connect(lambda: seen.append(backend.errorMessage))
+    _open(qtbot, backend, _short_book(tmp_path))
+
+    _convert(qtbot, backend)
+
+    assert backend.screen == "done"
+    assert [message for message in seen if message] == []  # unchanged: the done screen only
+
+
+def test_a_book_that_ran_out_of_graphics_memory_doesnt_prove_the_build(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    asset, _ = _engine_update(tmp_path)
+    engines = Engines()
+    engines.oom_at = 2
+    backend = make_backend(
+        engines, gpu=True, assets=(asset,), engine_check=lambda r, g, c: lambda n, o: None
+    )
+    _open(qtbot, backend, _short_book(tmp_path))
+
+    _convert(qtbot, backend)
+
+    assert backend.screen == "done"
+    qtbot.wait(300)  # proving (which mustn't happen) comes after the done screen
+    slot = _installed_state(tmp_path)["slots"]["engine"]
+    assert slot["proven"] is False
+    assert slot["previous"] == "engines/engine-0.1"  # the build that worked is kept
+
+
+def test_a_failure_after_running_out_of_graphics_memory_doesnt_roll_back(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    asset, _ = _engine_update(tmp_path)
+    engines = Engines()
+    engines.oom_at = 2
+    engines.fail_from = 4  # then the CPU fails too (short of memory as well)
+    backend = make_backend(
+        engines, gpu=True, assets=(asset,), engine_check=lambda r, g, c: lambda n, o: None
+    )
+    _open(qtbot, backend, _short_book(tmp_path))
+
+    _convert(qtbot, backend)
+
+    assert backend.screen == "voice"
+    assert UPDATE_FAILED_NOTE not in backend.errorMessage
+    assert backend.errorMessage.endswith(
+        "The audio made so far is kept, so starting again continues from there."
+    )
+    new_build = tmp_path / "data" / asset.path / asset.sha256[:12]
+    assert build_in_use(asset, tmp_path / "data") == new_build  # not rolled back...
+    assert failure(asset, tmp_path / "data") is None  # ...and not blamed
+
+
+def test_the_switch_is_said_even_if_the_cpus_first_try_fails(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    engines = Engines()
+    engines.oom_at = 3  # the card runs out on the third piece...
+    engines.fail_once_at = 3  # ...and the CPU's first try at it fails too (retried after)
+    backend = make_backend(engines, gpu=True, scan=NVIDIA, speeds=Speeds(cpu=3.1))
+    qtbot.waitUntil(lambda: backend.gpuName != "")
+    seen: list[str] = []
+    backend.errorMessageChanged.connect(lambda: seen.append(backend.errorMessage))
+    _open(qtbot, backend, _short_book(tmp_path))
+
+    _convert(qtbot, backend)
+
+    assert backend.screen == "done"
+    assert seen == [RAN_OUT_OF_MEMORY_NOTE, ""]  # in the banner while it went on
+    assert backend.gpuName == ""
+    assert short_name(NVIDIA) not in backend._speeds  # the CPU's speed isn't filed as the card's
+    assert backend.warnings == [RAN_OUT_OF_MEMORY_NOTE]
+    pieces = _planned_pieces(backend)
+    assert engines.texts == [*pieces[:3], *pieces[2:]]  # the third tried once more, on the CPU
+
+
+def test_the_cpus_speed_after_the_switch_is_kept_under_the_engines_threads(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(machine, "cpu_count", lambda: 16)
+    pin_machine(monkeypatch, tmp_path / "plugged", supplies=PLUGGED_IN)  # 8 threads
+    engines = Engines()
+    engines.oom_at = 3
+    engines.block_at = 2
+    backend = make_backend(engines, gpu=True, scan=NVIDIA)
+    qtbot.waitUntil(lambda: backend.gpuName != "")
+    _open(qtbot, backend, _short_book(tmp_path))
+    backend.goTo("voice")
+    backend.startConversion()
+    qtbot.waitUntil(engines.blocked.is_set, timeout=CONVERSION_TIMEOUT)
+    assert engines.made[0].threads == 8
+
+    # The charger is pulled mid-book (the scan would now say 4), then the card runs out.
+    pin_machine(monkeypatch, tmp_path / "laptop", supplies=ON_BATTERY)
+    engines.release.set()
+    qtbot.waitUntil(lambda: backend.screen == "done", timeout=CONVERSION_TIMEOUT)
+
+    assert "CPU/8" in backend._speeds  # what the engine voiced with
+    assert "CPU/4" not in backend._speeds
