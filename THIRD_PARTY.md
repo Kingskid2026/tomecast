@@ -15,7 +15,7 @@ This list reflects the current design ([docs/architecture.md](docs/architecture.
 
 | Model | Used for | License | Source |
 |---|---|---|---|
-| Docling Heron | PDF page layout | Apache 2.0 | [docling-project/docling-layout-heron](https://huggingface.co/docling-project/docling-layout-heron) |
+| Docling Heron (43M) | PDF page layout (optional AI pass). Tomecast downloads the official FP32 ONNX export, pinned by commit and SHA-256 | Apache 2.0 | [docling-project/docling-layout-heron](https://huggingface.co/docling-project/docling-layout-heron), ONNX file from [docling-project/docling-layout-heron-onnx](https://huggingface.co/docling-project/docling-layout-heron-onnx) |
 | PaddleOCR-VL-1.6 | Scanned PDF pages | Apache 2.0 | [PaddlePaddle/PaddleOCR-VL-1.6-GGUF](https://huggingface.co/PaddlePaddle/PaddleOCR-VL-1.6-GGUF) |
 | LFM3-1.7B | Spotting front/back matter and chapter starts | LFM Open License v1.0 (free for personal use and for organizations under US$10M annual revenue) | [LiquidAI/LFM3-1.7B-GGUF](https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF) |
 | MiniCPM5-2B | Backup for LFM3 | Apache 2.0 | [openbmb/MiniCPM5-2B](https://huggingface.co/OpenBMB/MiniCPM5-2B) |
@@ -26,7 +26,7 @@ This list reflects the current design ([docs/architecture.md](docs/architecture.
 |---|---|---|---|
 | audio.cpp | Running the voice models: a CPU build, and a Vulkan build for graphics cards (through the installed driver; downloaded only when the graphics card is used) | Apache 2.0 | Built by Tomecast from [0xShug0/audio.cpp](https://github.com/0xShug0/audio.cpp), see [below](#audiocpp-builds-distributed-by-tomecast) |
 | llama.cpp | Running the text and OCR models | MIT | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) |
-| ONNX Runtime | Running Docling Heron | MIT | [microsoft/onnxruntime](https://github.com/microsoft/onnxruntime) |
+| ONNX Runtime 1.31+ (with numpy, protobuf, flatbuffers, packaging) | Running Docling Heron. Python dependencies of the optional `layout` extra only (`tomecast[layout]`), not of the base install | ONNX Runtime: MIT. numpy: BSD-3-Clause. protobuf: BSD-3-Clause. flatbuffers: Apache 2.0. packaging: Apache 2.0 or BSD-2-Clause | [microsoft/onnxruntime](https://github.com/microsoft/onnxruntime) |
 | python-docx | Reading DOCX documents (it also installs typing-extensions, PSF-2.0) | MIT | [python-openxml/python-docx](https://github.com/python-openxml/python-docx) |
 | pypdfium2 5.14+ / PDFium | Reading PDFs. A Python dependency, installed from PyPI; its wheel carries a PDFium build | pypdfium2: Apache 2.0 or BSD-3-Clause. PDFium: BSD-3-Clause. The PDFium build also includes FreeType (FreeType License), ICU (Unicode License v3), libjpeg-turbo, OpenJPEG, libpng, Little CMS, zlib, Abseil and others under permissive licences, listed in the wheel's `licenses` folder | [pypdfium2](https://github.com/pypdfium2-team/pypdfium2), [PDFium](https://pdfium.googlesource.com/pdfium/), [pdfium-binaries](https://github.com/bblanchon/pdfium-binaries) |
 | FFmpeg (via imageio-ffmpeg) | Building M4B/MP3 files; runs as a separate program | LGPL/GPL | [imageio-ffmpeg](https://github.com/imageio/imageio-ffmpeg) |

@@ -43,7 +43,7 @@ from collections import Counter
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import pypdfium2 as pdfium
 import pypdfium2.raw as pdfium_c
@@ -96,8 +96,21 @@ _JUNK_TITLE = re.compile(
 )
 
 
-def read_pdf(path: Path) -> Book:
+class PageLayout(Protocol):
+    """Lays out one page from its characters instead of the rules below: the optional AI pass
+    (:class:`tomecast.readers.pdf_layout.HeronLayout`). It returns the page's blocks in reading
+    order, or None to leave the page to the rules (for example when its own check fails)."""
+
+    def page_blocks(
+        self, page: Any, index: int, chars: list[_Char], width: float, height: float
+    ) -> list[_PageBlock] | None: ...
+
+
+def read_pdf(path: Path, layout: PageLayout | None = None) -> Book:
     """Read a PDF book into a :class:`~tomecast.book.Book`.
+
+    ``layout`` is the optional AI pass for page layout. Without it (the default) every page
+    is read by the rules in this module.
 
     Raises:
         InvalidEbookError: if the file isn't a PDF or is damaged, needs a password, is a
@@ -111,7 +124,7 @@ def read_pdf(path: Path) -> Book:
     except pdfium.PdfiumError as error:
         raise InvalidEbookError(_open_error(path, error)) from error
     try:
-        return _read_document(document, path)
+        return _read_document(document, path, layout)
     finally:
         document.close()
 
@@ -125,7 +138,7 @@ def _open_error(path: Path, error: Any) -> str:
     return f"{path.name} isn't a PDF, or it's damaged"
 
 
-def _read_document(document: Any, path: Path) -> Book:
+def _read_document(document: Any, path: Path, layout: PageLayout | None = None) -> Book:
     pages: list[_Page] = []
     for index in range(len(document)):
         try:
@@ -133,7 +146,7 @@ def _read_document(document: Any, path: Path) -> Book:
         except pdfium.PdfiumError as error:
             raise InvalidEbookError(f"page {index + 1} of {path.name} can't be read") from error
         try:
-            pages.append(_read_page(page, index))
+            pages.append(_read_page(page, index, layout))
         finally:
             page.close()
 
@@ -373,6 +386,7 @@ class _PageBlock:
     band: Band | None = None
     continues: bool = False
     role: Role = Role.BODY
+    furniture: bool = False  # a layout model marked it as a page header or footer
 
     @property
     def size(self) -> float:
@@ -400,9 +414,10 @@ class _Page:
     sideways: int
     picture_share: float
     sizes: Counter[float]
+    labelled: bool = False  # laid out by the AI pass (``PageLayout``), not by the rules
 
 
-def _read_page(page: Any, index: int) -> _Page:
+def _read_page(page: Any, index: int, layout: PageLayout | None = None) -> _Page:
     width, height = (float(value) for value in page.get_size())
     textpage = page.get_textpage()
     try:
@@ -410,7 +425,10 @@ def _read_page(page: Any, index: int) -> _Page:
     finally:
         textpage.close()
     sizes: Counter[float] = Counter(round(char.size, 1) for char in chars)
-    blocks = _page_blocks(_segments(chars), index, width, height)
+    blocks = layout.page_blocks(page, index, chars, width, height) if layout and chars else None
+    labelled = blocks is not None
+    if blocks is None:
+        blocks = _page_blocks(_segments(chars), index, width, height)
     return _Page(
         index=index,
         width=width,
@@ -420,6 +438,7 @@ def _read_page(page: Any, index: int) -> _Page:
         sideways=sideways,
         picture_share=_picture_share(page, width, height) if len(chars) < 200 else 0.0,
         sizes=sizes,
+        labelled=labelled,
     )
 
 
@@ -689,10 +708,14 @@ def _classify(pages: Sequence[_Page], body: float) -> list[_PageBlock]:
     unfinished_note = False  # the last page's last footnote ran on to this page
     result: list[_PageBlock] = []
     for page in pages:
-        for block in page.blocks:
-            if block.band is not None and block.size > HEADING_RATIO * body:
-                block.band = None  # big text at the top of a page is a heading, not a header
-        unfinished_note = _mark_footnotes(page, body, unfinished_note)
+        if page.labelled:
+            # The layout model already found the headers, footers and footnotes.
+            unfinished_note = False
+        else:
+            for block in page.blocks:
+                if block.band is not None and block.size > HEADING_RATIO * body:
+                    block.band = None  # big text at the top of a page is a heading
+            unfinished_note = _mark_footnotes(page, body, unfinished_note)
         for block in page.blocks:
             if block.role is Role.BODY and _is_heading(block, body):
                 block.role = Role.HEADING
@@ -919,6 +942,7 @@ def _block(block: _PageBlock) -> Block:
         page=block.page,
         band=block.band,
         continues=block.continues,
+        furniture=block.furniture,
     )
 
 

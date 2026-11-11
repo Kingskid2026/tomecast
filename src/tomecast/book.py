@@ -65,6 +65,9 @@ class Block:
     # The block starts flush at the top of a column (or in lowercase), so it may carry on a
     # paragraph from the previous column or page.
     continues: bool = False
+    # A layout model (the optional AI pass) marked it as a page header or footer, so cleanup
+    # treats it as page furniture whether or not it repeats.
+    furniture: bool = False
 
 
 @dataclass(frozen=True, slots=True)

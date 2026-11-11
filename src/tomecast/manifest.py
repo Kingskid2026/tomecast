@@ -86,5 +86,22 @@ KOKORO_Q8 = Asset(
     path="models/kokoro-82m-q8_0.gguf",
 )
 
+# The optional AI pass for PDF page layout (issue #12): Docling Heron, the official ONNX
+# export of docling-project/docling-layout-heron (Apache 2.0), FP32. Downloaded only when the
+# user turns the AI pass on, and only needed with the "layout" extra (onnxruntime). Not in
+# ASSETS yet: `tomecast doctor` and the hardware scan don't know about the AI pass.
+HERON_LAYOUT = Asset(
+    id="docling-layout-heron",
+    name="Docling Heron page layout model (43M, FP32 ONNX)",
+    url=(
+        "https://huggingface.co/docling-project/docling-layout-heron-onnx/resolve/"
+        "40bde044036bb181c130ddf6c51792187268748f/model.onnx"
+    ),
+    sha256="59c81a3a2923042d85034ffc487f8f47e4854117e879aef89b2b9f728fb4922a",
+    size=171_220_471,
+    path="models/docling-layout-heron.onnx",
+    opt_in=True,
+)
+
 # Everything pinned, in the order `tomecast doctor` lists it.
 ASSETS: tuple[Asset, ...] = (AUDIOCPP_CPU, AUDIOCPP_VULKAN, ESPEAK_NG, KOKORO_Q8)
