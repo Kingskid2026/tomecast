@@ -25,6 +25,7 @@ from tomecast.book import Cover
 from tomecast.packaging import (
     AudiobookInfo,
     ChapterAudio,
+    OutputExistsError,
     PackagedChapter,
     PackagingError,
     cover_is_usable,
@@ -449,6 +450,48 @@ def test_no_overwrite_without_hard_links_still_never_replaces(
     assert (out / "book.m4b").read_bytes() == b"mine"
     assert len(probe(book.output).audio) == 1
     assert sorted(p.name for p in out.iterdir()) == ["book (2).m4b", "book.m4b"]
+
+
+@pytest.mark.parametrize("hard_links", [True, False])
+def test_no_overwrite_no_rename_refuses_a_file_that_appeared_while_encoding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hard_links: bool
+) -> None:
+    """The command line's mode: the name was free when the encode started, but taken by the
+    time it finished, so nothing is written (and nothing replaced)."""
+    out = tmp_path / "out"
+    out.mkdir()
+    target = out / "book.m4b"
+    real = packaging._encode
+
+    def encode_then_someone_saves(*args: Any, **kwargs: Any) -> None:
+        real(*args, **kwargs)
+        target.write_bytes(b"saved by someone else meanwhile")
+
+    def no_links(src: object, dst: object) -> None:
+        raise PermissionError("hard links aren't supported here")
+
+    monkeypatch.setattr(packaging, "_encode", encode_then_someone_saves)
+    if not hard_links:
+        monkeypatch.setattr("os.link", no_links)
+    with pytest.raises(OutputExistsError, match=r"book\.m4b already exists"):
+        write_m4b(
+            [chapter(tmp_path, "Only", [(0.3, 0.1)])], INFO, target, workdir=tmp_path / "w",
+            overwrite=False, rename=False,
+        )  # fmt: skip
+
+    assert target.read_bytes() == b"saved by someone else meanwhile"
+    assert [p.name for p in out.iterdir()] == ["book.m4b"]  # no partial file left behind
+
+
+def test_no_overwrite_no_rename_uses_the_wanted_name_when_it_is_free(tmp_path: Path) -> None:
+    output = tmp_path / "out" / "book.m4b"
+    output.parent.mkdir()
+    book = write_m4b(
+        [chapter(tmp_path, "Only", [(0.3, 0.1)])], INFO, output, workdir=tmp_path / "w",
+        overwrite=False, rename=False,
+    )  # fmt: skip
+    assert book.output == output
+    assert len(probe(output).audio) == 1
 
 
 # --- Covers and titles --------------------------------------------------------------------

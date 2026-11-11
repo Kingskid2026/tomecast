@@ -221,6 +221,7 @@ def convert_book(
     retries: int = 1,
     chapters: Sequence[int] | None = None,
     overwrite: bool = True,
+    rename: bool = True,
     format: Literal["m4b", "mp3"] = "m4b",
     prep: TextPrep | None = None,
 ) -> ConversionResult:
@@ -240,7 +241,9 @@ def convert_book(
 
     ``overwrite=False`` never replaces an existing file: if ``output`` is taken, even by a
     file that appeared while voicing, the book is written to "name (2).m4b" and so on. The
-    path used is in the result.
+    path used is in the result. With ``rename=False`` as well, a taken ``output`` raises
+    :class:`~tomecast.packaging.OutputExistsError` instead (the voiced chunks stay in
+    ``workdir``, so a run with another name or ``overwrite=True`` reuses them).
 
     ``format="mp3"`` writes a folder of MP3 files, one per chapter, at ``output`` (which is
     then the folder's name) instead of an M4B file. Everything else is the same.
@@ -317,7 +320,9 @@ def convert_book(
     )
     tempo = getattr(engine, "tempo", 1.0)
     write = write_mp3s if format == "mp3" else write_m4b
-    packaged = write(audio, info, output, workdir=workdir, overwrite=overwrite, tempo=tempo)
+    packaged = write(
+        audio, info, output, workdir=workdir, overwrite=overwrite, rename=rename, tempo=tempo
+    )
     return ConversionResult(packaged.chapters, reused, tuple(warnings), packaged.output)
 
 

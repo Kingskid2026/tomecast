@@ -1,6 +1,6 @@
 # Tomecast architecture
 
-*How Tomecast is designed, and why. Kept up to date as the design changes. Last updated 2026-11-10.*
+*How Tomecast is designed, and why. Kept up to date as the design changes. Last updated 2026-11-11.*
 
 ## Goal
 
@@ -39,7 +39,7 @@ book file
   → Cleanup (rules, optional AI)      → only the text that should be spoken
   → Text prep                         → pronunciation list, numbers, abbreviations, sentence chunks
   → Voice engine (Kokoro or Ming)     → audio per chunk, cached on disk (this is what makes resume work)
-  → Checks                            → every sentence has audio of the right length, or it's regenerated
+  → Checks                            → every sentence has audio of the right length, or it's voiced again, or the run stops
   → Packager (ffmpeg)                 → M4B with chapters + cover + title/author, or MP3 per chapter
 ```
 
@@ -52,8 +52,8 @@ The app is written in **Python 3.12+** (uv downloads it if the system's Python i
 1. **Small pieces only.** Text goes to the voice in sentence-sized chunks, with a hard size cap for each engine, set well under that model's limit. Long sentences are split at commas or semicolons. A page or chapter is never sent in one call.
 2. **Nothing left behind before the voice.** The splitter always emits the final fragment of a chapter, even without closing punctuation. That's a classic bug: splitters wait for a period that never comes. Readers keep the text after the last page break of a document.
 3. **Every sentence is accounted for.** Each sentence gets an ID that follows it from the reader to the final file. Before packaging, the app checks that every ID has audio. A gap means regenerate, never ship.
-4. **Length check.** Each chunk's audio length is compared with what its text should take to say. Audio that's too short, or silence where words should be, gets regenerated, split smaller on retry.
-5. **Optional listen-back check.** A small speech-recognition model (audio.cpp runs several) transcribes the end of each chunk and compares it to the text. That catches dropped words that timing alone would miss. On by default with a graphics card, optional on CPU.
+4. **Length check** (`audio_problem`). Each chunk's audio must be a mono 16-bit WAV, at least one second long per 40 characters of text (quicker than any voice speaks; proportionally less at a faster voice speed), and not silent (its loudest 50 ms at least 1% of full scale). A chunk that fails, or that the engine fails on, is voiced once more with the same text; if that fails too, the conversion stops with an error naming the chunk (`MissingAudioError`) instead of leaving a gap, and the chunks already voiced are kept for the next run. The retry sends the same text with the same seed, so it gets past a one-off failure (a crashed engine, a bad reply), not a sentence the voice always gets wrong. The only splitting is for audio.cpp's 510-phoneme limit: a request it refuses for that is halved (again if needed) and the parts joined. The check catches audio that's cut off well short, or missing; a chunk that loses only its last few words can still pass it, which is what the listen-back check below is for.
+5. **Listen-back check (planned, not built yet).** A small speech-recognition model (audio.cpp runs several) would transcribe the end of each chunk and compare it to the text, to catch dropped words that timing alone misses. The plan is to have it on by default with a graphics card and optional on the CPU.
 6. **Tests that prove it:** fixture documents whose last page ends mid-sentence, a chapter with no final period, and a 2,000-word paragraph. The tests check that every sentence of the cleaned text reached the audio.
 
 ## Components
@@ -249,6 +249,7 @@ Both sit behind one small interface (`voices()`, `languages()`, `synthesize(chun
   - The audio of each chapter is exactly what the M4B has for it: the same segments, gaps, titles and `atempo`. The test suite checks every chunk is in exactly one file.
   - ID3v2.3 tags: title = chapter, album = book, artist and album artist = authors, track = `n/total`, composer = narrator, genre "Audiobook", plus the validated cover as the front-cover picture in every file.
   - Written to a hidden temporary folder, then moved into place. With `overwrite=False` the name is claimed with `mkdir` ("Title", then "Title (2)"...) so an existing folder is never touched, even one that appears while encoding. With `overwrite=True` (the command line's `--force`) only the old numbered MP3s in an existing folder are replaced.
+- **Taken names.** Both formats are written under a hidden temporary name next to the output and get their real name only at the end. The window passes `overwrite=False` and takes the next free name ("Title (2).m4b"). The command line checks the output before it reads the book: it refuses a name that exists (without `--force`), a folder for an M4B, a file for MP3s (`--force` doesn't change those two), an M4B name ending in `.mp3`, and a folder that doesn't exist. It then passes `overwrite=` whether `--force` was given and `rename=False`, so without `--force` a name that was taken while the book was made (by another run with another voice, say) stops the run with `OutputExistsError` at that last step: nothing is replaced or renamed, and the voiced chunks stay in the work folder, so running it again with another `-o` only packages.
 
 ### 8. Window and terminal command
 - **Window (PySide6 / Qt):** works on KDE, GNOME and tiling setups.
@@ -258,7 +259,7 @@ Both sit behind one small interface (`voices()`, `languages()`, `synthesize(chun
   4. Names: the name finder's list, with a fix and a play button for each name, and Try any word (only when the finder found something).
   5. Convert, with progress, time left, and Pause/Resume.
   6. "Open output folder".
-- **Terminal:** `tomecast convert book.epub --voice UK_George --format m4b`, plus `tomecast voices`, `tomecast preview "text"`, `tomecast names book.epub`, `tomecast scan`. Easy for a techy user to script over a folder of books.
+- **Terminal:** `tomecast convert book.epub --voice bm_george --format m4b`, plus `tomecast voices`, `tomecast preview "text"`, `tomecast names book.epub`, `tomecast scan`. Easy for a techy user to script over a folder of books.
 
 ### 9. Install: the app sets everything up itself
 Users paste **one line** into a terminal: `curl -fsSL https://raw.githubusercontent.com/Kingskid2026/tomecast/main/install.sh | sh`. No `sudo`: everything goes into the user's home folder.
@@ -299,7 +300,7 @@ On first launch the app runs the hardware scan, lists what it needs to download 
 
 | System | Result |
 |---|---|
-| Distros with glibc 2.34+: Ubuntu 22.04 and newer, Debian 12 and newer, Fedora 35 and newer (including Bazzite), RHEL/Alma/Rocky 9 and newer, Arch-based ones, openSUSE Tumbleweed | **Everything works.** Pull requests that change the engine, the conversion or the packaging convert a real book on Ubuntu 22.04/24.04, Debian 12/13, Fedora 43/44 and Arch, and voice sentences with the Vulkan build on Mesa's software Vulkan driver ([`integration.yml`](../.github/workflows/integration.yml)). Each engine build is also started on AlmaLinux 8 and 9, Debian 11, Ubuntu 22.04 and Arch ([`engine-build.yml`](../.github/workflows/engine-build.yml)) |
+| Distros with glibc 2.34+: Ubuntu 22.04 and newer, Debian 12 and newer, Fedora 35 and newer (including Bazzite), RHEL/Alma/Rocky 9 and newer, Arch-based ones, openSUSE Tumbleweed | **Everything works.** Pull requests that change the engine, the conversion or the packaging (any of `src/tomecast` but the window's own `gui/` code, and `install.sh`) convert a real book on Ubuntu 22.04/24.04, Debian 12/13, Fedora 43/44 and Arch, and voice sentences with the Vulkan build on Mesa's software Vulkan driver ([`integration.yml`](../.github/workflows/integration.yml)). Each engine build is also started on AlmaLinux 8 and 9, Debian 11, Ubuntu 22.04 and Arch ([`engine-build.yml`](../.github/workflows/engine-build.yml)) |
 | Older ones, like Ubuntu 20.04, Debian 11 or RHEL 8 | **Not supported.** Tomecast doesn't install there, because its window library needs glibc 2.34 |
 | Alpine (musl) or NixOS | The engines don't run as-is. Possible with extra setup, but not a first target |
 | ARM Linux (Raspberry Pi, ARM laptops) | **Not supported yet.** audio.cpp has no Linux ARM build. llama.cpp does have ARM builds |
@@ -400,11 +401,11 @@ Rough totals for a **CPU-only machine** (estimates, to be measured in build step
 | **Licenses** | `LICENSE` for our code. `THIRD_PARTY.md` lists every model and engine the app downloads, with its license (Kokoro Apache 2.0, Ming MIT, LFM3 LFM Open License, …) |
 | **Community files** | `CONTRIBUTING.md` (how to set up, test, and send a pull request), `SECURITY.md` plus GitHub's private vulnerability reporting |
 | **Issue templates** | The bug form asks for `tomecast doctor` output (distro, GPU, versions), so reports are useful from the first message |
-| **Automatic checks on every pull request** | `ruff` (style and lint), `pyright` (type checks), `pytest` (readers and cleanup rules on public-domain sample books), and **the install script run inside Ubuntu 22.04/24.04, Debian 12/13, Fedora and Arch containers**. That last one proves the "works on any distro" promise on every change. Pull requests that touch the engine, the conversion or the packaging also run a **real conversion** in each of those containers (plus Fedora 43): install with `install.sh`, turn a short public-domain EPUB into an M4B with Kokoro on the CPU, and check its length and chapters with ffmpeg. One more job voices sentences with the Vulkan build on Mesa's software Vulkan driver and checks them against the CPU build |
+| **Automatic checks on every pull request** | `ruff` (style and lint), `mypy` (strict type checks), `pytest` (readers and cleanup rules on public-domain sample books), and **the install script run inside Ubuntu 22.04/24.04, Debian 12/13, Fedora and Arch containers**. That last one proves the "works on any distro" promise on every change. Pull requests that touch the engine, the conversion or the packaging also run a **real conversion** in each of those containers (plus Fedora 43): install with `install.sh`, turn a short public-domain EPUB into an M4B with Kokoro on the CPU, and check its length and chapters with ffmpeg. One more job voices sentences with the Vulkan build on Mesa's software Vulkan driver and checks them against the CPU build |
 | **Protected main branch** | Changes only land through pull requests with passing checks, ours included |
 | **Dependabot** | Opens pull requests when Python packages or GitHub Actions have updates, and the checks show whether anything broke |
 | **Docs** | `CHANGELOG.md` (generated), `docs/architecture.md` (this plan, cleaned up), `docs/models.md` (why each model and quantization), and how to add a new voice engine |
-| **Real-hardware testing** | GitHub's free test machines have no graphics card, so each release has a short checklist: run `tomecast selftest --gpu` on the maintainer's NVIDIA laptop (RTX PRO 1000, 8 GB). Volunteers test AMD and old laptops on preview releases (`0.2.0rc1`) |
+| **Real-hardware testing** | GitHub's free test machines have no graphics card, so each release has a short checklist on the maintainer's NVIDIA laptop (RTX PRO 1000, 8 GB): `tomecast doctor` (the card and the installed builds are listed), `tomecast scan` (the CPU's and the card's speeds are measured) and `tomecast convert BOOK --gpu` (a book is made on the card). Volunteers test AMD and old laptops on preview releases (`0.2.0rc1`) |
 | **House rules** | Never commit copyrighted books (test files come only from Project Gutenberg and Standard Ebooks). Built-in voices only, with no cloning of real people's voices |
 
 ## Build order

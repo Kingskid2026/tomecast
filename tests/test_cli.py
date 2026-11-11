@@ -224,6 +224,119 @@ def test_convert_refuses_to_overwrite_without_force(
     assert (tmp_path / "story.m4b").read_bytes() != b"keep me"
 
 
+@pytest.mark.parametrize("force", [[], ["--force"]])
+@pytest.mark.parametrize(
+    ("options", "taken", "message"),
+    [
+        (["-o", "{tmp}/Audiobooks"], "folder", "Audiobooks is a folder. Give the audiobook"),
+        (["--format", "mp3", "-o", "{tmp}/mine"], "file", "mine is a file, but --format mp3"),
+        (["-o", "{tmp}/story.mp3"], None, "story.mp3 ends in .mp3, but the audiobook is an M4B"),
+    ],
+)
+def test_convert_refuses_an_output_that_cant_work_before_voicing_anything(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    force: list[str],
+    options: list[str],
+    taken: str | None,
+    message: str,
+) -> None:
+    book = _epub(tmp_path)
+    options = [option.format(tmp=tmp_path) for option in options]
+    output = Path(options[-1])
+    if taken == "folder":
+        output.mkdir()
+    elif taken == "file":
+        output.write_bytes(b"keep me")
+
+    assert cli.main(["convert", str(book), *options, *force]) == 1
+
+    err = capsys.readouterr().err
+    assert message in err
+    assert "Run the same command again" not in err
+    assert FakeKokoro.voiced == 0  # refused in the first second, not after the whole book
+    if taken == "folder":
+        assert list(output.iterdir()) == []
+    elif taken == "file":
+        assert output.read_bytes() == b"keep me"
+    else:
+        assert not output.exists()
+
+
+def test_convert_mp3_of_a_book_without_an_extension_doesnt_aim_at_the_book(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    book = _epub(tmp_path).rename(tmp_path / "story")  # the reader sniffs it as an EPUB
+    original = book.read_bytes()
+
+    assert cli.main(["convert", str(book), "--format", "mp3", "--force"]) == 1
+
+    assert "story is a file, but --format mp3" in capsys.readouterr().err
+    assert FakeKokoro.voiced == 0
+    assert book.read_bytes() == original
+    assert cli.main(["convert", str(book), "--format", "mp3", "-o", str(tmp_path / "s")]) == 0
+
+
+@pytest.mark.parametrize("output_format", ["m4b", "mp3"])
+def test_convert_never_replaces_an_output_that_appears_while_voicing(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    output_format: str,
+) -> None:
+    """Two runs with different voices aim at the same story.m4b: the one that finishes
+    second doesn't replace the first one's book, though both passed the check at the start."""
+    book = _epub(tmp_path)
+    target = tmp_path / ("story" if output_format == "mp3" else "story.m4b")
+    real = FakeKokoro.synthesize
+
+    def another_run_finishes_first(self: FakeKokoro, text: str, output: Path) -> None:
+        if output_format == "mp3":
+            target.mkdir(exist_ok=True)
+            (target / "01 - Chapter One.mp3").write_bytes(b"another run's book")
+        else:
+            target.write_bytes(b"another run's book")
+        real(self, text, output)
+
+    monkeypatch.setattr(FakeKokoro, "synthesize", another_run_finishes_first)
+    arguments = ["convert", str(book), "--format", output_format]
+
+    assert cli.main(arguments) == 1
+
+    err = capsys.readouterr().err
+    assert "appeared while this book was being made, so it wasn't replaced" in err
+    theirs = target / "01 - Chapter One.mp3" if output_format == "mp3" else target
+    assert theirs.read_bytes() == b"another run's book"
+    assert sorted(p.name for p in tmp_path.iterdir()) == sorted(["data", "story.epub", target.name])
+
+    # Its audio is kept, so another name carries on from there without voicing again.
+    monkeypatch.setattr(FakeKokoro, "synthesize", real)
+    voiced = FakeKokoro.voiced
+    mine = tmp_path / ("mine" if output_format == "mp3" else "mine.m4b")
+    assert cli.main([*arguments, "-o", str(mine)]) == 0
+    assert "Picked up where the last run stopped (5 pieces)" in capsys.readouterr().out
+    assert FakeKokoro.voiced == voiced
+    assert mine.exists()
+    assert theirs.read_bytes() == b"another run's book"
+
+
+def test_convert_with_force_replaces_an_output_that_appears_while_voicing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    book = _epub(tmp_path)
+    target = tmp_path / "story.m4b"
+    real = FakeKokoro.synthesize
+
+    def another_run_finishes_first(self: FakeKokoro, text: str, output: Path) -> None:
+        target.write_bytes(b"another run's book")
+        real(self, text, output)
+
+    monkeypatch.setattr(FakeKokoro, "synthesize", another_run_finishes_first)
+
+    assert cli.main(["convert", str(book), "--force"]) == 0
+    assert target.read_bytes() != b"another run's book"
+
+
 @pytest.mark.parametrize(
     ("name", "content", "message"),
     [
