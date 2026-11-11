@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import contextlib
 import math
-import os
 import platform
 import re
 import shutil
@@ -58,11 +57,19 @@ from tomecast.engines.audiocpp import (
     AutoKokoro,
     EngineError,
     check_system,
-    default_threads,
     glibc_version,
     prepare_voice,
 )
 from tomecast.hardware import list_devices, vulkan_possible
+from tomecast.machine import (
+    LOW_MEMORY,
+    ON_BATTERY,
+    Machine,
+    Recommendation,
+    memory_note,
+    recommend,
+    scan_machine,
+)
 from tomecast.manifest import ASSETS
 from tomecast.names import DEFAULT_MIN_COUNT, find_book_names
 from tomecast.packaging import PackagingError
@@ -380,6 +387,10 @@ def _convert(args: argparse.Namespace) -> int:
     if prep.pronunciations:
         count = len(prep.pronunciations)
         print(f"Using {count} pronunciation {'fix' if count == 1 else 'fixes'}.")
+    machine = scan_machine()
+    choice = recommend(machine)
+    if note := memory_note(machine):
+        print(f"Note: {note}")
     progress = _ProgressPrinter(sys.stderr)
     started = time.monotonic()
     with contextlib.ExitStack() as stack:
@@ -389,9 +400,16 @@ def _convert(args: argparse.Namespace) -> int:
             raise CliError(str(error)) from None
         try:
             with AutoKokoro(
-                root, voice=args.voice, speed=args.speed, use_gpu=use_gpu, builds=builds
+                root,
+                voice=args.voice,
+                speed=args.speed,
+                use_gpu=use_gpu,
+                builds=builds,
+                threads=choice.threads,
             ) as engine:
                 print(_hardware_line(engine, args.gpu))
+                if not engine.gpu_description and choice.fewer_because:
+                    print(f"Using {_plural(choice.threads, 'CPU thread')}{_fewer_text(choice)}.")
                 if engine.warning:
                     print(f"Note: {engine.warning}")
                 speedup = engine_speed(root, engine, measuring=_measuring)
@@ -502,8 +520,12 @@ def _doctor() -> int:
     print(f"Distro: {_distro()}")
     glibc = glibc_version()
     print(f"glibc: {f'{glibc[0]}.{glibc[1]}' if glibc else 'not found'}")
-    threads = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count()
-    print(f"CPU threads: {threads}")
+    machine = scan_machine()
+    choice = recommend(machine)
+    print(f"CPU threads: {machine.cpus}")
+    print(f"Memory: {_memory_text(machine)}")
+    print(f"Power: {_power_text(machine)}")
+    print(f"Voice threads: {choice.threads}{_fewer_text(choice)}")
     print(f"Python: {platform.python_version()}")
     print(f"Vulkan possible: {'yes' if vulkan_possible() else 'no'}")
     vulkan = build_in_use(AUDIOCPP_VULKAN, root)
@@ -552,14 +574,19 @@ def _scan(args: argparse.Namespace) -> int:
         raise CliError(str(error)) from error
     root = data_dir()
     use_gpu = _wants_gpu(args.gpu)
+    machine = scan_machine()
+    print(f"This computer: {_machine_summary(machine)}.")
+    if note := memory_note(machine):
+        print(f"Note: {note}")
     forget_failures(root)
     forget_speeds(root)
     _prepare(use_gpu, root, assume_yes=args.yes, take_over=True)
     print("Measuring how fast this computer voices (a few seconds each)…")
     speeds = probe(root, gpu=use_gpu)
-    threads = default_threads()
+    choice = recommend(scan_machine())
+    threads = f"{_plural(choice.threads, 'thread')}{_fewer_text(choice)}"
     if speeds.cpu is not None:
-        print(f"CPU, {_plural(threads, 'thread')}: about {speeds.cpu:.1f}\u00d7 real time.")
+        print(f"CPU, {threads}: about {speeds.cpu:.1f}\u00d7 real time.")
     else:
         print("CPU: the speed test didn't work (see `tomecast doctor`).")
     if use_gpu:
@@ -571,6 +598,55 @@ def _scan(args: argparse.Namespace) -> int:
             )
             print(f"{speeds.gpu_description}: about {speeds.gpu:.1f}\u00d7 real time{faster}.")
     return 0
+
+
+_FEWER = {ON_BATTERY: "on battery", LOW_MEMORY: "with little memory"}
+
+
+def _fewer_text(choice: Recommendation) -> str:
+    """``" (usually 8; fewer on battery)"`` if the scan picked fewer threads than usual."""
+    if not choice.fewer_because:
+        return ""
+    why = " and ".join(_FEWER.get(reason, reason) for reason in choice.fewer_because)
+    return f" (usually {choice.usual_threads}; fewer {why})"
+
+
+def _memory_text(machine: Machine) -> str:
+    """For ``tomecast doctor``: ``"31.0 GiB, 8.1 GiB available"`` (or what's known)."""
+    total, free = machine.memory.total_bytes, machine.memory.available_bytes
+    if total is None:
+        return "unknown"
+    available = "unknown" if free is None else f"{free / 2**30:.1f} GiB"
+    return f"{total / 2**30:.1f} GiB, {available} available"
+
+
+def _power_text(machine: Machine) -> str:
+    """For ``tomecast doctor``: ``"on battery (a laptop)"``, ``"no battery (a desktop)"``…"""
+    power = machine.power
+    if power.battery is None:
+        return "unknown"
+    if not power.battery:
+        return "no battery (a desktop)"
+    if power.on_battery is None:
+        return "a laptop; couldn't tell whether it's plugged in"
+    return "on battery (a laptop)" if power.on_battery else "plugged in (a laptop)"
+
+
+def _machine_summary(machine: Machine) -> str:
+    """``"16 CPU threads, 32.8 GB of memory (8.7 GB free), plugged in"``."""
+    parts = [_plural(machine.cpus, "CPU thread")]
+    total, free = machine.memory.total_bytes, machine.memory.available_bytes
+    if total is not None:
+        parts.append(
+            f"{total / 1e9:.1f} GB of memory"
+            + (f" ({free / 1e9:.1f} GB free)" if free is not None else "")
+        )
+    power = machine.power
+    if power.battery is False:
+        parts.append("no battery")
+    elif power.on_battery is not None:
+        parts.append("on battery" if power.on_battery else "plugged in")
+    return ", ".join(parts)
 
 
 def _distro() -> str:

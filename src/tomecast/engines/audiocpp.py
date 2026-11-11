@@ -55,6 +55,7 @@ from tomecast.downloads import (
     prepare,
 )
 from tomecast.hardware import GpuDevice, list_devices, pick_device, short_name
+from tomecast.machine import voice_threads
 
 # The pins live in tomecast.manifest; they're re-exported so callers can import them here.
 from tomecast.manifest import AUDIOCPP_BUILD as AUDIOCPP_BUILD
@@ -234,9 +235,10 @@ def check_system() -> None:
 
 
 def default_threads() -> int:
-    """Physical cores, roughly: audio.cpp was slower with every hyperthread in use."""
-    logical = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count()
-    return max(1, min(8, (logical or 2) // 2))
+    """The threads the hardware scan picks now: physical cores, roughly (audio.cpp was slower
+    with every hyperthread in use), and fewer on battery or with little memory (see
+    :func:`tomecast.machine.recommend`)."""
+    return voice_threads()
 
 
 MIN_SPEED, MAX_SPEED = 0.5, 3.0
