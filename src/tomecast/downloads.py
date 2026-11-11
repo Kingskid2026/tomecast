@@ -17,9 +17,9 @@ There are two kinds of asset:
   which build of each archive is in use. :func:`prepare` switches to a new build only after
   the self-checks of the voices that use it have passed; until then, and if one fails, the
   build in use stays in use. A switched-to build that then fails a real run is rolled back
-  (:func:`roll_back`) until it has finished one (:func:`mark_proven`). Each archive keeps at
-  most two builds: the one in use, plus either the new one (if it is waiting or failed its
-  check) or the previous one (to go back to).
+  (:func:`roll_back`) until it has finished one (:func:`mark_proven`). Each archive usually
+  keeps two builds: the one in use, plus either the new one (if it is waiting or failed its
+  check) or the previous one (to go back to); see :func:`_clean_up` for when it keeps three.
 
 Builds that Tomecast 0.1.x extracted into ``engines/audiocpp-0.9.4-vulkan`` and the like are
 adopted where they are (see :attr:`Asset.replaces`), so upgrading never deletes them before
@@ -260,13 +260,16 @@ def is_usable(asset: Asset, root: Path) -> bool:
     return build_in_use(asset, root) is not None
 
 
-def needs_download(asset: Asset, root: Path, *, verify: bool = True) -> bool:
+def needs_download(
+    asset: Asset, root: Path, *, verify: bool = True, take_over: bool = False
+) -> bool:
     """True if :func:`prepare` would download ``asset``: its pinned version isn't on disk,
     and (for an archive) it hasn't already failed its check while an older build is there to
     use, and no newer Tomecast has chosen the build in use.
 
     ``verify=False`` never hashes: a file of the pinned size that hasn't been verified yet
     counts as there (``prepare`` verifies it before use). For the window's GUI thread.
+    ``take_over`` ignores a newer Tomecast's choice (see :func:`prepare`).
     """
     if not asset.archive:
         return not _file_verified(asset, root, hash_if_unsure=verify)
@@ -274,15 +277,16 @@ def needs_download(asset: Asset, root: Path, *, verify: bool = True) -> bool:
     if slot.current and (
         build_sha256(root / slot.current) == asset.sha256
         or _failed_here(asset.sha256, slot)
-        or _chosen_by_newer(slot)
+        or (_chosen_by_newer(slot) and not take_over)
     ):
         return False
     return build_sha256(build_folder(asset, root)) != asset.sha256
 
 
-def waiting_check(asset: Asset, root: Path) -> bool:
+def waiting_check(asset: Asset, root: Path, *, take_over: bool = False) -> bool:
     """True if the pinned build of an archive is on disk but not in use yet, because the
-    build in use stays until the new one has passed a self-check."""
+    build in use stays until the new one has passed a self-check. ``take_over`` ignores a
+    newer Tomecast's choice (see :func:`prepare`)."""
     if not asset.archive:
         return False
     slot = _effective(asset, root, _load(root))
@@ -291,7 +295,7 @@ def waiting_check(asset: Asset, root: Path) -> bool:
         and build_sha256(root / slot.current) != asset.sha256
         and build_sha256(build_folder(asset, root)) == asset.sha256
         and not _failed_here(asset.sha256, slot)
-        and not _chosen_by_newer(slot)
+        and not (_chosen_by_newer(slot) and not take_over)
     )
 
 
@@ -376,6 +380,7 @@ def prepare(
     on_download: DownloadReporter | None = None,
     on_check: Callable[[], None] | None = None,
     cancelled: IsCancelled | None = None,
+    take_over: bool = False,
 ) -> Prepared:
     """Make sure everything in ``assets`` is installed and that new engine builds work here.
 
@@ -393,11 +398,18 @@ def prepare(
        A first install has nothing to fall back to, so it isn't checked here: the run itself
        shows whether it works (and a switched-to build that fails its first run is rolled
        back, see :func:`roll_back`).
-    4. Builds no longer needed are deleted: each archive keeps at most two.
+    4. Builds no longer needed are deleted: each archive usually keeps two (see
+       :func:`_clean_up`).
 
     Holds a lock on the data folder throughout, so two Tomecast processes don't install at
     once. While waiting for it, and during the checks, ``cancelled`` is asked whether the user
     has stopped; if so this raises :class:`Cancelled` and records nothing.
+
+    Normally an older Tomecast leaves a build a newer one chose alone (``chosen_by``), so two
+    installed versions don't take turns switching. ``take_over`` (``tomecast scan``, run by
+    the user) lets this one download and check its own build anyway, and switch to it if it
+    passes, which then records this version as the one that chose it. So a Tomecast that was
+    downgraded gets back onto the build it was tested with, and no choice is ever wiped.
     """
     checks = _as_checks(check, assets)
     notes: list[str] = []
@@ -405,7 +417,7 @@ def prepare(
     switched: list[Asset] = []
     with _locked(root, cancelled):
         _tidy(assets, root)
-        missing = [asset for asset in assets if needs_download(asset, root)]
+        missing = [a for a in assets if needs_download(a, root, take_over=take_over)]
         if missing:
             updates = all(_is_update(asset, root) for asset in missing)
             if not consent(missing, updates):
@@ -422,7 +434,7 @@ def prepare(
                     raise
                 notes.append(UPDATE_NOT_DOWNLOADED_NOTE)
                 held_back.append(asset)
-        waiting = [asset for asset in assets if waiting_check(asset, root)]
+        waiting = [a for a in assets if waiting_check(a, root, take_over=take_over)]
         if waiting:
             if on_check:
                 on_check()
@@ -445,11 +457,19 @@ def prepare(
     return Prepared(tuple(dict.fromkeys(notes)), tuple(switched), tuple(held_back), builds)
 
 
+# How long recording a finished or failed run waits for another Tomecast that is installing:
+# the user has their book (or their error) already, and the next run can record it instead.
+PROVE_WAIT = 2.0
+ROLL_BACK_WAIT = 10.0
+
+
 def roll_back(
     root: Path,
     used: Mapping[str, Path],
     reason: str,
     cancelled: IsCancelled | None = None,
+    *,
+    wait: float = ROLL_BACK_WAIT,
 ) -> bool:
     """A run with the builds ``used`` (``Prepared.builds``) failed: go back to the previous
     build of each archive that this Tomecast switched to and that hasn't finished a real run
@@ -457,9 +477,11 @@ def roll_back(
     one isn't picked again (for :data:`FAILURE_DAYS` days). True if anything was rolled back.
 
     A build that has finished a run before isn't blamed: the problem is more likely the book,
-    the computer or the card."""
+    the computer or the card. If another Tomecast holds the install lock for more than
+    ``wait`` seconds, nothing is rolled back this time (False): the build is still unproven,
+    so its next failure rolls it back."""
     rolled = False
-    with _locked(root, cancelled):
+    with contextlib.suppress(_Busy), _locked(root, cancelled, wait):
         slots = _load(root)
         for name, folder in used.items():
             slot = slots.get(name)
@@ -483,10 +505,21 @@ def roll_back(
     return rolled
 
 
-def mark_proven(root: Path, used: Mapping[str, Path], cancelled: IsCancelled | None = None) -> None:
+def mark_proven(
+    root: Path,
+    used: Mapping[str, Path],
+    cancelled: IsCancelled | None = None,
+    *,
+    wait: float = PROVE_WAIT,
+) -> bool:
     """A run with the builds ``used`` (``Prepared.builds``) finished: they have proven
-    themselves on this computer, so a later failure won't roll them back."""
-    with _locked(root, cancelled):
+    themselves on this computer, so a later failure won't roll them back. Only call this for a
+    run that used them as intended (not one that fell back from the graphics card to the
+    CPU). Call it after telling the user the book is done: if another Tomecast holds the
+    install lock for more than ``wait`` seconds this gives up quietly (False), and the next
+    finished book proves them instead."""
+    proven = False
+    with contextlib.suppress(_Busy), _locked(root, cancelled, wait):
         slots = _load(root)
         changed = False
         for name, folder in used.items():
@@ -495,12 +528,16 @@ def mark_proven(root: Path, used: Mapping[str, Path], cancelled: IsCancelled | N
                 slot.proven = changed = True
         if changed:
             _save(root, slots)
+        proven = True
+    return proven
 
 
-def forget_failures(root: Path) -> None:
+def forget_failures(root: Path, cancelled: IsCancelled | None = None) -> None:
     """Forget every failed self-check and run, so the next :func:`prepare` tries those builds
-    again (``tomecast scan`` does this)."""
-    with _locked(root):
+    again (``tomecast scan`` does this). Which Tomecast chose each build in use is kept: a
+    scan takes a build back through a checked switch (``prepare(take_over=True)``), never by
+    wiping that record."""
+    with _locked(root, cancelled):
         slots = _load(root)
         for slot in slots.values():
             slot.failed = {}
@@ -575,7 +612,9 @@ def _is_update(asset: Asset, root: Path) -> bool:
 
 
 def _failed_here(sha256: str, slot: _Slot) -> bool:
-    """The build failed with this Tomecast version, less than FAILURE_DAYS days ago."""
+    """The build failed with this Tomecast version, less than FAILURE_DAYS days ago. A record
+    with no time, or a time in the future (the clock was wrong when it was written), counts as
+    expired: being tried again is better than being blocked for good."""
     record = slot.failed.get(sha256)
     if record is None or record.get("tomecast") != __version__:
         return False
@@ -583,7 +622,14 @@ def _failed_here(sha256: str, slot: _Slot) -> bool:
         when = float(record.get("at", "0"))
     except ValueError:
         return False
-    return time.time() - when < FAILURE_DAYS * 86400
+    return recent(when)
+
+
+def recent(when: float) -> bool:
+    """``when`` (seconds since 1970) was less than FAILURE_DAYS days ago, and isn't in the
+    future (allowing a minute for clocks that disagree slightly)."""
+    age = time.time() - when
+    return -60 <= age < FAILURE_DAYS * 86400
 
 
 def _chosen_by_newer(slot: _Slot) -> bool:
@@ -617,14 +663,22 @@ def _failure_record(reason: str, *, during: str) -> dict[str, str]:
 
 
 def _promote(asset: Asset, root: Path, *, proven: bool) -> None:
-    """Make the pinned build of ``asset`` the one in use; the one it replaces is kept."""
+    """Make the pinned build of ``asset`` the one in use. The one to go back to is kept: the
+    build being replaced if it had finished a book, else the one before it (so replacing a
+    just-switched build that never ran never loses the last build known to work). It is never
+    the new build itself: going "back" to the build in use would roll back nowhere."""
     slots = _load(root)
     old = _effective(asset, root, slots)
     new = _relative(build_folder(asset, root), root)
     old.failed.pop(asset.sha256, None)
+    preferred = old.current if old.proven else old.previous
+    fallback = next(
+        (folder for folder in (preferred, old.current, old.previous) if folder and folder != new),
+        None,
+    )
     slots[asset.slot] = _Slot(
         current=new,
-        previous=old.current if old.current != new else old.previous,
+        previous=fallback,
         chosen_by=__version__,
         proven=proven,
         failed=old.failed,
@@ -657,10 +711,14 @@ def _tidy(assets: Sequence[Asset], root: Path) -> None:
 
 
 def _clean_up(assets: Sequence[Asset], root: Path) -> None:
-    """Delete builds that aren't needed. Each archive keeps the build in use, plus the pinned
+    """Delete builds that aren't needed. Each archive keeps the build in use; the pinned
     build if that isn't the one in use (waiting, failed and kept for a retry, or this
-    version's own while a newer one's is in use), else the previous build. Only called with
-    the lock held."""
+    version's own while a newer one's is in use); and the previous build, unless a pinned one
+    is kept and the build in use has already finished a book. So there are at most two,
+    except while a just-switched build hasn't finished a book yet and a newer one is waiting
+    (three: the build to go back to is never deleted before then), or while a newer Tomecast
+    owns the build in use (its fallback isn't ours to delete). Only called with the lock
+    held."""
     slots = _load(root)
     for asset in assets:
         if not asset.archive or asset.slot not in slots:
@@ -670,14 +728,12 @@ def _clean_up(assets: Sequence[Asset], root: Path) -> None:
             continue
         keep = {slot.current}
         pinned = _relative(build_folder(asset, root), root)
-        if pinned != slot.current and build_sha256(root / pinned) == asset.sha256:
+        other_kept = pinned != slot.current and build_sha256(root / pinned) == asset.sha256
+        if other_kept:
             keep.add(pinned)
-            if _chosen_by_newer(slot) and slot.previous:
-                keep.add(slot.previous)  # the newer Tomecast's fallback: not ours to delete
-            else:
-                slot.previous = None
-        elif slot.previous and build_sha256(root / slot.previous):
-            keep.add(slot.previous)
+        has_previous = bool(slot.previous) and build_sha256(root / str(slot.previous)) is not None
+        if has_previous and (not other_kept or not slot.proven or _chosen_by_newer(slot)):
+            keep.add(str(slot.previous))
         else:
             slot.previous = None
         folder = root / asset.path
@@ -853,11 +909,19 @@ def _relative(path: Path, root: Path) -> str:
     return path.relative_to(root).as_posix()
 
 
+class _Busy(Exception):
+    """Another Tomecast held the install lock for longer than the caller would wait."""
+
+
 @contextlib.contextmanager
-def _locked(root: Path, cancelled: IsCancelled | None = None) -> Iterator[None]:
+def _locked(
+    root: Path, cancelled: IsCancelled | None = None, wait: float | None = None
+) -> Iterator[None]:
     """Hold the install lock, waiting while another Tomecast installs. The wait never blocks
-    for good: it asks ``cancelled`` between tries, and raises :class:`Cancelled`."""
+    for good: it asks ``cancelled`` between tries (raising :class:`Cancelled`), and gives up
+    after ``wait`` seconds if that's set (raising :class:`_Busy`)."""
     root.mkdir(parents=True, exist_ok=True)
+    deadline = None if wait is None else time.monotonic() + wait
     with (root / _LOCK).open("w") as handle:
         while True:
             try:
@@ -866,6 +930,8 @@ def _locked(root: Path, cancelled: IsCancelled | None = None) -> Iterator[None]:
             except BlockingIOError:
                 if cancelled is not None and cancelled():
                     raise Cancelled from None
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise _Busy from None
                 time.sleep(_LOCK_POLL)
         yield
 

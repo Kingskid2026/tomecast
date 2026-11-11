@@ -3,6 +3,7 @@ import glob
 import stat
 import sys
 import textwrap
+import time
 from pathlib import Path
 
 import pytest
@@ -120,22 +121,38 @@ def test_lists_only_the_vulkan_devices(tmp_path: Path) -> None:
         "print('no json at all')",
         "print('[1, 2, 3]')",
         "print('{\"devices\": 5}')",
-        'print(\'{"devices": [5, {"backend": "vulkan"}, {"backend": "vulkan", "index": 1}]}\')',
         "import os, signal; os.kill(os.getpid(), signal.SIGKILL)",
         "",
     ],
 )
-def test_odd_output_gives_no_devices(tmp_path: Path, body: str) -> None:
-    assert list_devices(_executable(tmp_path, body)) == []
+def test_a_crash_or_odd_output_is_not_knowing_not_no_card(tmp_path: Path, body: str) -> None:
+    assert list_devices(_executable(tmp_path, body)) is None  # "couldn't tell", not "none"
 
 
-def test_a_missing_executable_gives_no_devices(tmp_path: Path) -> None:
-    assert list_devices(tmp_path / "nothing-here") == []
+def test_an_answer_with_nothing_usable_is_no_card(tmp_path: Path) -> None:
+    junk = '{"devices": [5, {"backend": "vulkan"}, {"backend": "vulkan", "index": 1}]}'
+    assert list_devices(_executable(tmp_path, f"print({junk!r})")) == []
+    assert list_devices(_executable(tmp_path, "print('{\"devices\": []}')")) == []
 
 
-def test_a_hung_executable_times_out_and_gives_no_devices(tmp_path: Path) -> None:
+def test_a_missing_executable_cant_tell(tmp_path: Path) -> None:
+    assert list_devices(tmp_path / "nothing-here") is None
+
+
+def test_a_hung_executable_times_out_and_cant_tell(tmp_path: Path) -> None:
     script = _executable(tmp_path, "import time; time.sleep(30)")
-    assert list_devices(script, timeout=0.5) == []
+    started = time.monotonic()
+    assert list_devices(script, timeout=0.5) is None  # a stalled card isn't "no card"
+    assert time.monotonic() - started < 5
+
+
+def test_listing_stops_early_when_the_user_stops(tmp_path: Path) -> None:
+    script = _executable(tmp_path, "import time; time.sleep(30)")
+    started = time.monotonic()
+    stop_at = started + 0.3
+
+    assert list_devices(script, cancelled=lambda: time.monotonic() > stop_at) is None
+    assert time.monotonic() - started < 3  # not the 20 s time limit
 
 
 def test_missing_memory_counts_as_zero(tmp_path: Path) -> None:

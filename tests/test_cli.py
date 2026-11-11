@@ -2,10 +2,13 @@ import array
 import fcntl
 import hashlib
 import io
+import json
 import math
 import tarfile
+import threading
+import time
 import wave
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from types import TracebackType
 from typing import ClassVar
@@ -34,6 +37,7 @@ class FakeKokoro:
     gpu_description = "NVIDIA RTX PRO 1000 Blackwell Generation Laptop GPU"
     gpu_warning: str | None = None  # set: a use_gpu run falls back to the CPU
     texts: ClassVar[list[str]] = []  # everything the voice was asked to say, across all instances
+    on_exit: ClassVar[Callable[[], None] | None] = None  # runs when the engine stops
 
     def __init__(
         self, root: Path, *, voice: str, speed: float, use_gpu: bool = False, **kwargs: object
@@ -44,12 +48,14 @@ class FakeKokoro:
         self.sample_rate = 24000
         self.use_gpu = use_gpu
         self.warning: str | None = None
+        self.fell_back = False
         self.gpu_description = ""
         FakeKokoro.made.append(self)
 
     def __enter__(self) -> "FakeKokoro":
         if self.use_gpu and FakeKokoro.gpu_warning:
             self.warning = FakeKokoro.gpu_warning
+            self.fell_back = True
         elif self.use_gpu:
             self.gpu_description = FakeKokoro.gpu_description
         return self
@@ -60,7 +66,8 @@ class FakeKokoro:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
-        pass
+        if FakeKokoro.on_exit is not None:
+            FakeKokoro.on_exit()
 
     def synthesize(self, text: str, output: Path) -> None:
         if self.fail_with:
@@ -92,6 +99,7 @@ def no_real_engine(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     FakeKokoro.made = []
     FakeKokoro.gpu_warning = None
     FakeKokoro.texts = []
+    FakeKokoro.on_exit = None
 
 
 def _epub(tmp_path: Path) -> Path:
@@ -984,3 +992,118 @@ def test_a_finished_book_proves_the_new_build(
 
     assert not roll_back(root, builds, "a later failure is the book's fault, not the build's")
     assert build_in_use(asset, root) == builds["audiocpp-cpu"]
+
+
+# --- Second review: Done first, fallbacks prove nothing, scans keep the choice ----------------
+
+
+def _slot(tmp_path: Path, name: str) -> dict[str, object]:
+    state = json.loads((tmp_path / "data" / "installed.json").read_text())
+    slot: dict[str, object] = state["slots"][name]
+    return slot
+
+
+def test_done_doesnt_wait_for_another_tomecasts_install(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    asset, _ = _engine_update(tmp_path)
+    monkeypatch.setattr(audiocpp, "required_assets", lambda use_gpu: (asset,))
+    monkeypatch.setattr(audiocpp, "self_check", lambda root, gpu, cancelled: lambda n, o: None)
+    held: list[object] = []
+
+    def another_tomecast_starts_installing() -> None:  # as the book is being packaged
+        lock = (tmp_path / "data" / ".install.lock").open("w")
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        held.append(lock)
+        threading.Timer(8, lock.close).start()  # it holds the lock for 8 s
+
+    FakeKokoro.on_exit = another_tomecast_starts_installing
+    started = time.monotonic()
+
+    assert cli.main(["convert", str(_epub(tmp_path)), "--yes"]) == 0
+
+    assert time.monotonic() - started < 6  # not held up by the other install
+    assert "Done: " in capsys.readouterr().out
+    assert held and _slot(tmp_path, "audiocpp-cpu")["proven"] is False  # proven next time
+
+
+def test_a_book_made_on_the_cpu_fallback_doesnt_prove_a_card_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    asset, legacy = _engine_update(tmp_path, gpu=True)
+    monkeypatch.setattr(cli, "vulkan_possible", lambda: True)
+    monkeypatch.setattr(audiocpp, "required_assets", lambda use_gpu: (asset,))
+    monkeypatch.setattr(audiocpp, "self_check", lambda root, gpu, cancelled: lambda n, o: None)
+    FakeKokoro.gpu_warning = "The graphics card didn't work, so Tomecast used the CPU."
+
+    assert cli.main(["convert", str(_epub(tmp_path)), "--yes"]) == 0
+
+    slot = _slot(tmp_path, "audiocpp-vulkan")
+    assert slot["proven"] is False  # the card was never tried with the new build...
+    assert slot["previous"] == "engines/engine-0.1"  # ...so the one that worked is kept
+    builds = {"audiocpp-vulkan": tmp_path / "data" / asset.path / asset.sha256[:12]}
+    assert roll_back(tmp_path / "data", builds, "it later failed on the card")
+    assert build_in_use(asset, tmp_path / "data") == legacy
+
+
+def _newer_tomecasts_build(tmp_path: Path) -> Path:
+    """The build in use was chosen by a newer Tomecast (since uninstalled)."""
+    root = tmp_path / "data"
+    theirs = root / "engines" / "engine" / ("9" * 12)
+    theirs.mkdir(parents=True)
+    (theirs / ".tomecast-sha256").write_text("9" * 64 + "\n")
+    (root / "installed.json").write_text(
+        json.dumps(
+            {
+                "format": 2,
+                "slots": {
+                    "audiocpp-cpu": {
+                        "current": "engines/engine/" + "9" * 12,
+                        "previous": None,
+                        "chosen_by": "9.9.9",
+                        "proven": True,
+                    }
+                },
+            }
+        )
+    )
+    return theirs
+
+
+def test_scan_takes_the_build_back_for_a_downgraded_tomecast(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    asset, _ = _engine_update(tmp_path)
+    theirs = _newer_tomecasts_build(tmp_path)
+    monkeypatch.setattr(audiocpp, "required_assets", lambda use_gpu: (asset,))
+    checked: list[bool] = []
+
+    def passes(new: object, old: object) -> None:
+        checked.append(True)
+
+    monkeypatch.setattr(audiocpp, "self_check", lambda root, gpu, cancelled: passes)
+    monkeypatch.setattr(cli, "probe", lambda root, gpu, cancelled=None: Speeds(cpu=4.6))
+    root = tmp_path / "data"
+    assert cli.main(["convert", str(_epub(tmp_path)), "--yes"]) == 0
+    assert build_in_use(asset, root) == theirs  # a normal run leaves the newer choice alone
+
+    assert cli.main(["scan", "--no-gpu", "--yes"]) == 0
+
+    assert checked == [True]  # its own build was checked first
+    assert build_in_use(asset, root) == root / asset.path / asset.sha256[:12]
+    assert _slot(tmp_path, "audiocpp-cpu")["chosen_by"] == __version__  # the new choice
+
+
+def test_scan_keeps_the_choice_when_its_own_build_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    asset, _ = _engine_update(tmp_path)
+    theirs = _newer_tomecasts_build(tmp_path)
+    monkeypatch.setattr(audiocpp, "required_assets", lambda use_gpu: (asset,))
+    monkeypatch.setattr(audiocpp, "self_check", lambda root, gpu, c: lambda n, o: "broken here")
+    monkeypatch.setattr(cli, "probe", lambda root, gpu, cancelled=None: Speeds(cpu=4.6))
+
+    assert cli.main(["scan", "--no-gpu", "--yes"]) == 0
+
+    assert build_in_use(asset, tmp_path / "data") == theirs
+    assert _slot(tmp_path, "audiocpp-cpu")["chosen_by"] == "9.9.9"  # never wiped

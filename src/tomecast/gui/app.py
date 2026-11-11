@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import os
 import signal
 import socket
 import sys
@@ -120,12 +121,27 @@ def run(argv: Sequence[str] | None = None) -> int:
     if not engine.rootObjects():
         print(f"tomecast: error: couldn't load the window from {QML_MAIN}", file=sys.stderr)
         del engine
-        backend.shutdown()
-        return 1
+        return finish(backend, 1)
     if args.book is not None:
         backend.openBook(QUrl.fromLocalFile(str(args.book.expanduser().resolve())))
     with quit_on_signals(app):
         code = app.exec()
     del engine  # the QML engine goes first, while the backend it uses still exists
+    return finish(backend, code)
+
+
+def finish(backend: Backend, code: int) -> int:
+    """Shut ``backend`` down and return ``code``. If its worker is still busy even so (an
+    engine stuck in a graphics driver, a download read that stalled), leave the process at
+    once instead: returning would let Qt destroy a running thread, which aborts with a core
+    dump. Settings and output are written first; the engines get SIGTERM anyway, from the
+    parent-death signal each one was started with."""
     backend.shutdown()
+    if backend.worker_thread.isRunning():
+        with contextlib.suppress(Exception):
+            backend.save_settings()
+        for stream in (sys.stdout, sys.stderr):
+            with contextlib.suppress(Exception):
+                stream.flush()
+        os._exit(code)
     return code

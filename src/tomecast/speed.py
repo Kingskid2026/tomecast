@@ -28,12 +28,12 @@ from tomecast import __version__
 from tomecast.audio import wav_info
 from tomecast.book import Book, Chapter
 from tomecast.downloads import (
-    FAILURE_DAYS,
     Cancelled,
     IsCancelled,
     build_in_use,
     build_sha256,
     local_path,
+    recent,
 )
 from tomecast.engines.audiocpp import (
     AUDIOCPP_CPU,
@@ -47,7 +47,7 @@ from tomecast.engines.audiocpp import (
     default_threads,
     split_speed,
 )
-from tomecast.hardware import list_devices, pick_device
+from tomecast.hardware import GpuDevice, list_devices, pick_device
 
 # Narration speed used for estimates (Kokoro at speed 1.0 reads about this fast).
 WORDS_PER_MINUTE = 158
@@ -162,7 +162,7 @@ def failed_recently(root: Path, key: str) -> bool:
     it isn't tried again yet (a card that crashes isn't started on every launch)."""
     entry = _load(root).get(key)
     when = entry.get("failed_at") if isinstance(entry, dict) else None
-    return isinstance(when, int | float) and time.time() - when < FAILURE_DAYS * 86400
+    return isinstance(when, int | float) and recent(when)  # a future time counts as expired
 
 
 def remember_speed(root: Path, key: str, speedup: float) -> None:
@@ -219,7 +219,14 @@ def engine_speed(
     return value
 
 
-def probe(root: Path, *, gpu: bool, cancelled: IsCancelled | None = None) -> Speeds:
+def probe(
+    root: Path,
+    *,
+    gpu: bool,
+    cancelled: IsCancelled | None = None,
+    devices: Sequence[GpuDevice] | None = None,
+    listed: bool = False,
+) -> Speeds:
     """The CPU's speed, and with ``gpu`` the graphics card's, using the builds in use. Each is
     the one measured before, or measured now (starting the engine, a few seconds, with short
     time limits). A failed measurement is remembered too, so it isn't tried again for a few
@@ -228,14 +235,19 @@ def probe(root: Path, *, gpu: bool, cancelled: IsCancelled | None = None) -> Spe
     working, is left out. With ``gpu`` false it doesn't touch the graphics card at all.
 
     The CPU speed is the CPU build's, or the graphics-card build's CPU backend if that is the
-    only one installed (they are the same code).
+    only one installed (they are the same code; a CPU run hides the card from it).
+
+    With ``listed``, ``devices`` is what the Vulkan build already said it sees (``None``: it
+    didn't answer), so they aren't listed twice in one scan.
     """
     if not (local_path(KOKORO_Q8, root).is_file() and build_in_use(ESPEAK_NG, root)):
         return Speeds()
     cpu_build = build_in_use(AUDIOCPP_CPU, root) or build_in_use(AUDIOCPP_VULKAN, root)
     cpu = _speed_on(root, cpu_build, "cpu", None, "", cancelled) if cpu_build else None
     vulkan = build_in_use(AUDIOCPP_VULKAN, root) if gpu else None
-    device = pick_device(list_devices(vulkan / EXECUTABLE)) if vulkan else None
+    if vulkan is not None and not listed:
+        devices = list_devices(vulkan / EXECUTABLE, cancelled=cancelled)
+    device = pick_device(devices or []) if vulkan else None
     if vulkan is None or device is None:
         return Speeds(cpu=cpu)
     on_card = _speed_on(root, vulkan, "vulkan", device.index, device.description, cancelled)
