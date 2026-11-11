@@ -323,6 +323,7 @@ class Backend(QObject):
     # To the worker (queued: the worker lives on its own thread).
     _jobRequested = Signal(object)
     _shutdownRequested = Signal()
+    _leaveCardRequested = Signal()
 
     def __init__(
         self,
@@ -452,6 +453,7 @@ class Backend(QObject):
         self._worker.moveToThread(self._thread)
         self._jobRequested.connect(self._worker.run)
         self._shutdownRequested.connect(self._worker.shutdown)
+        self._leaveCardRequested.connect(self._worker.leave_card)
         self._worker.bookRead.connect(self._on_book_read)
         self._worker.previewReady.connect(self._on_preview_ready)
         self._worker.stageChanged.connect(self._on_stage)
@@ -590,6 +592,10 @@ class Backend(QObject):
         if on == self._useGpu:
             return
         self._stop_preview()  # a preview made on the other hardware shouldn't keep playing
+        if not on:
+            # With the switch off, nothing of Tomecast's stays on the card: the preview engine
+            # kept running between previews would otherwise hold its memory until the next one.
+            self._leaveCardRequested.emit()
         self._rescan_machine()
         self._update("useGpu", on)
         self._settings.setValue("useGpu", on)

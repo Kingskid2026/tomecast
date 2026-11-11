@@ -23,7 +23,8 @@ import pytest
 from PySide6.QtCore import QSettings, QUrl
 from pytestqt.qtbot import QtBot
 
-from tomecast import machine, pronunciations
+from tomecast import convert as convert_module
+from tomecast import machine, packaging, pronunciations
 from tomecast.audio import wav_info
 from tomecast.book import Book, Chapter
 from tomecast.cleanup import is_numbered_chapter
@@ -1019,6 +1020,37 @@ def test_previews_need_an_audio_player(
     assert engines.made == []
 
 
+@pytest.mark.parametrize("speed", [1.75, 2.0])
+def test_a_fast_book_from_the_window_keeps_its_time_stretch(
+    qtbot: QtBot,
+    make_backend: MakeBackend,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    speed: float,
+) -> None:
+    """Above 1.5x the voice speaks at 1.5x and the packager stretches the rest, as the command
+    line does. The worker wraps the engine to measure it, and the wrapper must pass the speed
+    split on, or the book comes out at 1.5x whatever was chosen."""
+    packaged: list[float] = []
+    write_m4b = packaging.write_m4b  # what convert_book calls
+
+    def recording(*args: Any, tempo: float = 1.0, **kwargs: Any) -> Any:
+        packaged.append(tempo)
+        return write_m4b(*args, tempo=tempo, **kwargs)
+
+    monkeypatch.setattr(convert_module, "write_m4b", recording)
+    backend = make_backend(Engines())
+    _open(qtbot, backend, _short_book(tmp_path))
+    backend.setSpeed(speed)
+    _convert(qtbot, backend)
+
+    assert backend.screen == "done"
+    voice_speed, tempo = split_speed(speed)
+    assert voice_speed == 1.5
+    assert packaged == [pytest.approx(tempo)]
+    assert tempo > 1.0
+
+
 def test_a_fast_preview_is_time_stretched_like_the_book(
     qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
 ) -> None:
@@ -1861,6 +1893,33 @@ def test_the_preview_follows_the_hardware_choice(
 
     assert [engine.use_gpu for engine in engines.made] == [True, False]
     assert engines.made[0].closed
+
+
+def test_switching_the_card_off_stops_the_preview_engine_on_it(
+    qtbot: QtBot, make_backend: MakeBackend, tmp_path: Path
+) -> None:
+    """With "Use graphics card" off, nothing of Tomecast's stays on the card: the preview
+    engine left running there stops now, not at the next preview, conversion or scan."""
+    engines = Engines()
+    backend = make_backend(engines, gpu=True, scan=NVIDIA, player="true")
+    qtbot.waitUntil(lambda: backend.gpuName != "")  # the start-up scan is done
+    _open(qtbot, backend, _short_book(tmp_path))
+    backend.goTo("voice")
+    backend.togglePreview()
+    qtbot.waitUntil(lambda: not backend.previewPlaying)
+    assert backend.errorMessage == ""
+    [engine] = engines.made
+    assert engine.use_gpu and engine.started and not engine.closed  # kept between previews
+
+    backend.setUseGpu(False)
+    qtbot.waitUntil(lambda: engine.closed)
+    assert len(engines.made) == 1  # and nothing was started on the CPU in its place
+
+    backend.setSpeed(1.2)  # not in the preview cache
+    backend.togglePreview()  # the next preview starts on the CPU, as before
+    qtbot.waitUntil(lambda: len(engines.made) == 2)
+    qtbot.waitUntil(lambda: not backend.previewPlaying)
+    assert engines.made[1].use_gpu is False
 
 
 # --- PDF books and the skip switches ---------------------------------------------------------

@@ -38,20 +38,32 @@ from tomecast.speed import (
 )
 
 
-class TimedEngine:
-    """A voice that makes one second of audio per sentence and takes ``seconds`` to do it
-    (the warm-up takes much longer, as a real engine's first request can)."""
+class FakeClock:
+    """Stands in for the ``time`` module in :mod:`tomecast.speed`, so the speed test's timing
+    is exactly what the engine says it took, however busy the computer is."""
 
-    def __init__(self, seconds: float, warm_up: float = 0.3) -> None:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+class TimedEngine:
+    """A voice that makes one second of audio per sentence and takes ``seconds`` to do it on
+    ``clock`` (the warm-up takes much longer, as a real engine's first request can)."""
+
+    def __init__(self, seconds: float, clock: FakeClock, warm_up: float = 0.3) -> None:
         self.voice = "bf_emma"
         self.speed = 1.25
         self.seconds = seconds
+        self.clock = clock
         self.warm_up = warm_up
         self.asked: list[tuple[str, str, float]] = []
 
     def synthesize(self, text: str, output: Path) -> None:
         self.asked.append((text, self.voice, self.speed))
-        time.sleep(self.warm_up if text == WARM_UP else self.seconds)
+        self.clock.now += self.warm_up if text == WARM_UP else self.seconds
         with wave.open(str(output), "wb") as wav:
             wav.setnchannels(1)
             wav.setsampwidth(2)
@@ -61,14 +73,20 @@ class TimedEngine:
             )
 
 
-def test_the_speed_test_divides_audio_by_time_and_leaves_out_the_warm_up() -> None:
-    engine = TimedEngine(seconds=0.05)
+def test_the_speed_test_divides_audio_by_time_and_leaves_out_the_warm_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = FakeClock()
+    monkeypatch.setattr(speed_module, "time", clock)
+    engine = TimedEngine(seconds=0.05, clock=clock)
 
     speedup = measure(engine)
 
-    # Two sentences, one second of audio each, 0.05 s each: about 20x real time. With the
-    # 0.3 s warm-up counted it would be under 6x.
-    assert 10 < speedup < 21
+    # Two sentences, one second of audio each, 0.05 s each: 20x real time. With the 0.3 s
+    # warm-up counted it would be 5x. The clock is the engine's, so a busy computer (which
+    # once made it 9.7x) can't change it.
+    assert len(SAMPLE) == 2
+    assert speedup == pytest.approx(20.0)
     assert [text for text, _, _ in engine.asked] == [WARM_UP, *SAMPLE]
     assert {(voice, speed) for _, voice, speed in engine.asked} == {("af_heart", 1.0)}
     assert (engine.voice, engine.speed) == ("bf_emma", 1.25)  # put back afterwards
@@ -79,7 +97,7 @@ def test_a_speed_test_that_makes_no_audio_is_an_engine_error(tmp_path: Path) -> 
         def synthesize(self, text: str, output: Path) -> None:
             output.write_bytes(b"not a wav")
 
-    engine = Silent(0)
+    engine = Silent(0, FakeClock())
     with pytest.raises(EngineError, match="speed test"):
         measure(engine)
     assert (engine.voice, engine.speed) == ("bf_emma", 1.25)

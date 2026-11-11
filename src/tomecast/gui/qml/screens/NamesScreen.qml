@@ -27,6 +27,25 @@ ScreenPage {
         return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
     }
 
+    // A fix row's pill or Remove was clicked. Its buttons don't take focus on the press: a
+    // name being typed is saved when focus leaves its field, saving rebuilds the list, and a
+    // press and release that land on different rows make no click. So focus moves now, which
+    // saves the name first, and then the fix that was clicked changes. Done here, not in the
+    // row, since the save may already have replaced the row.
+    function fixClicked(button, kind, scope, word) {
+        const keyboard = button.visualFocus
+        button.forceActiveFocus(Qt.MouseFocusReason)
+        const now = Backend.fixes.findIndex(fix => fix.word === word && fix.scope === scope)
+        if (now < 0)
+            return  // the save removed this fix (its name's field was emptied)
+        refocus = {word: word, kind: kind, index: now, keyboard: keyboard}
+        if (kind === "scope")
+            Backend.toggleFixScope(scope, word)
+        else
+            Backend.removeFix(scope, word)
+        refocus = null  // the rebuilt row took it; if nothing changed, no later rebuild should
+    }
+
     objectName: "namesScreen"
     designHeight: 960
     Accessible.role: Accessible.Pane
@@ -195,10 +214,8 @@ ScreenPage {
             text: fixRow.scope === "all" ? "Every book" : "This book"
             Accessible.name: fixRow.scope === "all" ? "Use the " + fixRow.word + " fix for this book only"
                                                     : "Use the " + fixRow.word + " fix for every book"
-            onClicked: {
-                page.refocus = {word: fixRow.word, kind: "scope", index: fixRow.index, keyboard: visualFocus}
-                Backend.toggleFixScope(fixRow.scope, fixRow.word)
-            }
+            focusPolicy: Qt.TabFocus  // focus moves on the click (see page.fixClicked)
+            onClicked: page.fixClicked(scopeButton, "scope", fixRow.scope, fixRow.word)
         }
 
         TagButton {
@@ -209,10 +226,8 @@ ScreenPage {
             y: scopeButton.y
             text: "Remove"
             Accessible.name: "Remove the fix for " + fixRow.word
-            onClicked: {
-                page.refocus = {word: fixRow.word, kind: "remove", index: fixRow.index, keyboard: visualFocus}
-                Backend.removeFix(fixRow.scope, fixRow.word)
-            }
+            focusPolicy: Qt.TabFocus  // focus moves on the click (see page.fixClicked)
+            onClicked: page.fixClicked(removeButton, "remove", fixRow.scope, fixRow.word)
         }
 
         Rectangle {

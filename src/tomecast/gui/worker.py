@@ -329,6 +329,19 @@ class _Meter:
     def sample_rate(self) -> int:
         return self._engine.sample_rate
 
+    # convert_book reads these from what it's given (this wrapper), so they're passed on:
+    # without them a book above 1.5x lost its time-stretch and came out at the voice's 1.5x.
+
+    @property
+    def voice_speed(self) -> float:
+        """The speed the voice itself speaks at, which the length check allows for."""
+        return float(getattr(self._engine, "voice_speed", 1.0))
+
+    @property
+    def tempo(self) -> float:
+        """The time-stretch the packager applies to the whole book."""
+        return float(getattr(self._engine, "tempo", 1.0))
+
     def synthesize(self, text: str, output: Path) -> None:
         if self._started is None:
             self._started = time.monotonic()
@@ -481,6 +494,14 @@ class ConversionWorker(QObject):
         thread = QThread.currentThread()
         if thread is not None:
             thread.quit()
+
+    @Slot()
+    def leave_card(self) -> None:
+        """The window's "Use graphics card" was switched off: stop a preview engine started on
+        the card, so it doesn't hold the card's memory until the next preview (on the worker's
+        thread, after the job in hand, which may be a preview starting one)."""
+        if self._preview_gpu:
+            self._close_preview_engine()
 
     # --- Start-up scan --------------------------------------------------------------------
 
